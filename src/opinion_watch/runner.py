@@ -289,6 +289,41 @@ async def _run_scan_locked(
                     )
                 )
                 continue
+            ready_accounts = storage.list_scan_accounts(platform.value)
+            if len(ready_accounts) > 1:
+                selected_account: dict[str, object] | None = None
+                for candidate_account in ready_accounts:
+                    try:
+                        async with BrowserSession(
+                            settings.account_profile_dir(platform, int(candidate_account["id"])),
+                            channel=settings.browser_channel,
+                            headless=options.headless,
+                            artifact_dir=settings.artifact_dir / platform.value,
+                        ) as probe_session:
+                            probe_page = await probe_session.page()
+                            probe_status = await collector.session_status(
+                                probe_page, probe_session.active_context
+                            )
+                    except Exception:
+                        storage.update_account_status(int(candidate_account["id"]), "error")
+                        continue
+                    if probe_status is SessionStatus.HEALTHY:
+                        selected_account = candidate_account
+                        break
+                    storage.update_account_status(
+                        int(candidate_account["id"]), _account_status(probe_status)
+                    )
+                if selected_account is None:
+                    totals.failed += 1
+                    storage.create_alert(
+                        run_id=run_id,
+                        platform=platform.value,
+                        kind="account_not_ready",
+                        severity="error",
+                        message=f"{platform.value} 的可用账号均未通过登录态检查。",
+                    )
+                    continue
+                account = selected_account
             try:
                 async with BrowserSession(
                     settings.account_profile_dir(platform, int(account["id"])),

@@ -2085,13 +2085,20 @@ class Storage:
         return [{**dict(row), "enabled": bool(row["enabled"])} for row in rows]
 
     def get_scan_account(self, platform: str) -> dict[str, object] | None:
+        accounts = self.list_scan_accounts(platform)
+        return accounts[0] if accounts else None
+
+    def list_scan_accounts(self, platform: str) -> list[dict[str, object]]:
+        """Return healthy accounts in least-recently-checked order."""
         accounts = [
             item
             for item in self.list_accounts(enabled_only=True)
-            if str(item["platform"]) == platform
+            if str(item["platform"]) == platform and str(item["status"]) == "ready"
         ]
-        ready = [item for item in accounts if str(item["status"]) == "ready"]
-        return ready[0] if ready else None
+        return sorted(
+            accounts,
+            key=lambda item: (str(item.get("last_checked_at") or ""), int(item["id"])),
+        )
 
     def set_account_enabled(self, account_id: int, enabled: bool) -> bool:
         now = datetime.now(UTC).isoformat()
