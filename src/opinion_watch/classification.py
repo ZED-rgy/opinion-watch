@@ -99,7 +99,7 @@ _ORDINARY_NEGATIVE_SIGNALS = (
 )
 
 
-def classify_content(content: dict[str, object]) -> AssessmentResult:
+def classify_content(content: dict[str, Any]) -> AssessmentResult:
     text = _content_text(content)
     brands = [str(item) for item in content.get("brand_names", [])]
     relevant_signals = (
@@ -113,7 +113,7 @@ def classify_content(content: dict[str, object]) -> AssessmentResult:
     )
     if (
         brands
-        and not any(brand in text for brand in brands)
+        and not any(brand.lower() in text for brand in brands)
         and not _matched_signals(text, relevant_signals)
     ):
         return AssessmentResult(
@@ -206,7 +206,7 @@ def classify_batch(
     limit: int = 100,
     force: bool = False,
     run_id: int | None = None,
-) -> dict[str, object]:
+) -> dict[str, Any]:
     contents = storage.list_contents_for_assessment(
         limit=limit,
         include_assessed=force,
@@ -234,7 +234,7 @@ def classify_batch(
     }
 
 
-def _content_text(content: dict[str, object]) -> str:
+def _content_text(content: dict[str, Any]) -> str:
     raw_data = content.get("raw_data")
     raw: dict[str, Any] = raw_data if isinstance(raw_data, dict) else {}
     parts = [

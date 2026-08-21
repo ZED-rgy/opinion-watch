@@ -4,6 +4,8 @@ import asyncio
 import json
 import re
 from dataclasses import dataclass
+from enum import Enum
+from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -23,6 +25,7 @@ class LLMConfigurationError(LLMError):
 
 _API_KEY_PATTERN = re.compile(r"(?i)sk-[a-z0-9_*.-]{8,}")
 _REQUEST_TIMEOUT_SECONDS = 30
+_BATCH_TIMEOUT_SECONDS = 240
 _MAX_PARALLEL_REQUESTS = 3
 
 
@@ -66,7 +69,7 @@ class LLMCapabilities:
     multimodal_messages: bool
     error: str = ""
 
-    def as_dict(self) -> dict[str, object]:
+    def as_dict(self) -> dict[str, Any]:
         return {
             "chat_completions": self.chat_completions,
             "text_messages": self.text_messages,
@@ -94,7 +97,7 @@ class LLMClient:
         if not settings.api_key.strip():
             raise LLMConfigurationError("未找到大模型 API Key")
 
-    async def assess(self, content: dict[str, object]) -> LLMAssessment:
+    async def assess(self, content: dict[str, Any]) -> LLMAssessment:
         message = build_assessment_message(content)
         messages = [
             {"role": "system", "content": _SYSTEM_PROMPT},
@@ -141,7 +144,7 @@ class LLMClient:
             return LLMCapabilities(False, False, False, str(exc)[:300])
         return LLMCapabilities(True, True, False)
 
-    async def _complete(self, messages: list[dict[str, object]]) -> str:
+    async def _complete(self, messages: list[dict[str, Any]]) -> str:
         payload = {
             "model": self.settings.model,
             "messages": messages,
@@ -153,7 +156,7 @@ class LLMClient:
         }
         return await asyncio.to_thread(self._request, payload)
 
-    def _request(self, payload: dict[str, object]) -> str:
+    def _request(self, payload: dict[str, Any]) -> str:
         endpoint = self.settings.base_url.rstrip("/") + "/chat/completions"
         request = Request(
             endpoint,
@@ -207,7 +210,7 @@ _SYSTEM_PROMPT = (
 )
 
 
-def build_assessment_prompt(content: dict[str, object]) -> str:
+def build_assessment_prompt(content: dict[str, Any]) -> str:
     raw_data = content.get("raw_data")
     raw = raw_data if isinstance(raw_data, dict) else {}
     comments = raw.get("comments")
@@ -233,7 +236,7 @@ def build_assessment_prompt(content: dict[str, object]) -> str:
     )[:12_000]
 
 
-def build_assessment_message(content: dict[str, object]) -> str:
+def build_assessment_message(content: dict[str, Any]) -> str:
     """Build the only message format supported by the text-only provider."""
     return build_assessment_prompt(content)
 
@@ -307,7 +310,7 @@ def parse_assessment(raw_response: str) -> LLMAssessment:
     )
 
 
-def _decode_json(raw_response: str) -> dict[str, object]:
+def _decode_json(raw_response: str) -> dict[str, Any]:
     text = re.sub(r"<think>.*?</think>", "", raw_response, flags=re.IGNORECASE | re.DOTALL).strip()
     if text.startswith("```"):
         text = text[3:]
@@ -340,7 +343,7 @@ def _redact_api_key(text: str) -> str:
     return _API_KEY_PATTERN.sub("[已脱敏 API Key]", text)
 
 
-def _enum_or_default(value: object, enum_type: type, default: object) -> object:
+def _enum_or_default[E: Enum](value: object, enum_type: type[E], default: E) -> E:
     try:
         return enum_type(str(value))
     except (TypeError, ValueError):
@@ -360,7 +363,7 @@ def _settings_from_storage(storage: Storage) -> LLMSettings | None:
     )
 
 
-def _content_key(content: dict[str, object]) -> str:
+def _content_key(content: dict[str, Any]) -> str:
     platform = str(content.get("platform") or "")
     content_id = str(content.get("platform_content_id") or content.get("content_id") or "")
     return f"{platform}:{content_id}"
@@ -368,24 +371,37 @@ def _content_key(content: dict[str, object]) -> str:
 
 async def _assess_many(
     client: LLMClient,
-    contents: list[dict[str, object]],
+    contents: list[dict[str, Any]],
 ) -> list[LLMAssessment | Exception]:
     """评估候选内容并发执行，避免一个慢请求拖住整批巡检。"""
+    if not contents:
+        return []
     semaphore = asyncio.Semaphore(min(_MAX_PARALLEL_REQUESTS, max(1, len(contents))))
 
-    async def assess_one(content: dict[str, object]) -> LLMAssessment | Exception:
+    async def assess_one(content: dict[str, Any]) -> LLMAssessment | Exception:
         try:
             async with semaphore:
                 return await client.assess(content)
         except Exception as exc:
             return exc
 
-    return list(await asyncio.gather(*(assess_one(content) for content in contents)))
+    try:
+        # 单个请求有 socket 级超时，但慢速滴流的服务端可以绕过它。
+        # 整批再设一个硬上限，保证巡检不会被复判阶段无限拖住。
+        return list(
+            await asyncio.wait_for(
+                asyncio.gather(*(assess_one(content) for content in contents)),
+                timeout=_BATCH_TIMEOUT_SECONDS,
+            )
+        )
+    except TimeoutError:
+        error = LLMError(f"大模型批量复判超过 {_BATCH_TIMEOUT_SECONDS} 秒未完成，本批请求已放弃。")
+        return [error for _ in contents]
 
 
 async def screen_items_with_llm(
     storage: Storage,
-    contents: list[dict[str, object]],
+    contents: list[dict[str, Any]],
     *,
     budget: LLMCallBudget | None = None,
 ) -> tuple[dict[str, LLMAssessment], list[str], int]:
@@ -417,7 +433,7 @@ async def classify_with_llm(
     *,
     run_id: int | None = None,
     budget: LLMCallBudget | None = None,
-) -> dict[str, object]:
+) -> dict[str, Any]:
     settings = _settings_from_storage(storage)
     if settings is None:
         return {"enabled": False, "processed": 0, "failed": 0}
@@ -428,7 +444,7 @@ async def classify_with_llm(
     )
     candidates = storage.list_model_candidates(limit=candidate_limit, run_id=run_id)
     if budget is not None:
-        budget.used += len(candidates)
+        budget.take(len(candidates))
     processed = 0
     failed = 0
     errors: list[str] = []
@@ -453,7 +469,7 @@ async def classify_with_llm(
             failed += 1
             if len(errors) < 3:
                 errors.append(str(exc)[:300])
-    result: dict[str, object] = {
+    result: dict[str, Any] = {
         "enabled": True,
         "candidates": len(candidates),
         "processed": processed,

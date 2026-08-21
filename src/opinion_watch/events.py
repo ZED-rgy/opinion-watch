@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
+from typing import Any
 
 EVENT_VERSION = 1
 
@@ -20,7 +21,7 @@ def serialize_event(
     )
 
 
-def parse_event(line: str) -> dict[str, object] | None:
+def parse_event(line: str) -> dict[str, Any] | None:
     """Parse one stdout line, returning None for ordinary logs or old output."""
     try:
         value = json.loads(line)

@@ -8,6 +8,7 @@ from contextlib import suppress
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from playwright.async_api import BrowserContext, Page
@@ -33,6 +34,9 @@ class BaseCollector(ABC):
     description_selectors: tuple[str, ...] = ()
     author_selectors: tuple[str, ...] = ()
     comment_selectors: tuple[str, ...] = ()
+    _dom_evaluation_timeout_seconds = 6
+    _search_scroll_rounds = 12
+    _search_unchanged_rounds = 3
     content_link_selector = "a[href]"
     verification_phrases = (
         "请完成验证",
@@ -123,7 +127,7 @@ class BaseCollector(ABC):
                     f"{self.platform.value} 搜索结果页状态：{status.value}",
                 )
 
-        for _ in range(8):
+        for _ in range(self._search_scroll_rounds):
             before = len(results)
             for item in self.items_from_anchors(anchors, keyword):
                 if item.content_id in seen_ids:
@@ -134,10 +138,14 @@ class BaseCollector(ABC):
                     return results
 
             unchanged_rounds = unchanged_rounds + 1 if len(results) == before else 0
-            if unchanged_rounds >= 2:
+            if unchanged_rounds >= self._search_unchanged_rounds:
                 break
             await page.mouse.wheel(0, 1_200)
-            await page.wait_for_timeout(1_200)
+            # Some platform pages render the next batch asynchronously after
+            # the scroll event. Give the DOM a little more time before taking
+            # the next snapshot, otherwise a quick scan can stop at 9-10 cards
+            # even though more public results are available.
+            await page.wait_for_timeout(1_800)
             anchors = await self._extract_anchors(page)
 
         return results
@@ -148,9 +156,16 @@ class BaseCollector(ABC):
             with suppress(PlaywrightTimeoutError):
                 await page.goto(self.home_url, wait_until="domcontentloaded", timeout=30_000)
             await page.wait_for_timeout(1_000)
-        # 页面超时时也可能已经渲染出可用内容，因此继续执行状态检查和抽取。
-        with suppress(PlaywrightTimeoutError):
+        try:
             await page.goto(search_url, wait_until="domcontentloaded", timeout=30_000)
+        except PlaywrightTimeoutError as exc:
+            # 页面超时时也可能已经完成跳转并渲染出可用内容。但如果地址栏仍停留在
+            # 旧页面，继续抽取会把上一个关键词的结果记到当前关键词名下。
+            if page.url != search_url:
+                raise CollectorRuntimeError(
+                    SessionStatus.ERROR,
+                    f"{self.platform.value} 搜索页导航超时，未能进入目标搜索结果页。",
+                ) from exc
 
     async def enrich_items(
         self,
@@ -176,12 +191,17 @@ class BaseCollector(ABC):
             ][:detail_limit]
             for index in candidate_indexes:
                 item = items[index]
-                with suppress(PlaywrightTimeoutError):
+                try:
                     await detail_page.goto(
                         item.url,
                         wait_until="domcontentloaded",
                         timeout=60_000,
                     )
+                except PlaywrightTimeoutError:
+                    # 超时后详情页可能仍停留在上一条内容上；此时抽取会把别人的
+                    # 正文、评论和媒体写进当前条目。跳过详情补充，保留浅层结果。
+                    if self.canonical_url(detail_page.url) != self.canonical_url(item.url):
+                        continue
                 await detail_page.wait_for_timeout(1_500)
                 status = await self.session_status(detail_page, context)
                 if status is not SessionStatus.HEALTHY:
@@ -228,28 +248,40 @@ class BaseCollector(ABC):
         *,
         artifact_dir: Path | None,
         content_id: str,
-    ) -> list[dict[str, object]]:
+    ) -> list[dict[str, Any]]:
         """Capture public image/video DOM evidence without downloading arbitrary files."""
-        media_nodes = await self._evaluate_elements(
-            page,
-            "img, video",
-            """
-            nodes => nodes.map(node => ({
-                kind: node.tagName.toLowerCase(),
-                src: node.currentSrc || node.src || '',
-                poster: node.poster || '',
-                alt: node.alt || node.getAttribute('aria-label') || '',
-                width: node.naturalWidth || node.videoWidth || 0,
-                height: node.naturalHeight || node.videoHeight || 0
-            }))
-            """,
-        )
-        evidence: list[dict[str, object]] = []
-        for index, node in enumerate(media_nodes[:8]):
+        # 元数据和截图必须来自同一个元素句柄。懒加载页面的 DOM 顺序会变，
+        # 先快照再按下标重新定位会把截图挂到别的媒体条目上。
+        try:
+            handles = await page.locator("img, video").element_handles()
+        except PlaywrightError:
+            return []
+        evidence: list[dict[str, Any]] = []
+        for index, handle in enumerate(handles[:8]):
+            try:
+                node = await asyncio.wait_for(
+                    handle.evaluate(
+                        """
+                        node => ({
+                            kind: node.tagName.toLowerCase(),
+                            src: node.currentSrc || node.src || '',
+                            poster: node.poster || '',
+                            alt: node.alt || node.getAttribute('aria-label') || '',
+                            width: node.naturalWidth || node.videoWidth || 0,
+                            height: node.naturalHeight || node.videoHeight || 0
+                        })
+                        """
+                    ),
+                    timeout=self._dom_evaluation_timeout_seconds,
+                )
+            except (TimeoutError, PlaywrightError):
+                continue
+            if not isinstance(node, dict):
+                continue
             kind = str(node.get("kind") or "")
             if kind not in {"img", "video"}:
                 continue
-            entry: dict[str, object] = {
+            entry: dict[str, Any] = {
                 "kind": "image" if kind == "img" else "video_keyframe",
                 "url": str(node.get("src") or "")[:2000],
                 "poster": str(node.get("poster") or "")[:2000],
@@ -261,10 +293,9 @@ class BaseCollector(ABC):
                 safe_id = re.sub(r"[^a-zA-Z0-9_-]+", "-", content_id)[:80] or "content"
                 timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
                 path = artifact_dir / f"{timestamp}-{safe_id}-{index}.png"
-                locator = page.locator("img, video").nth(index)
                 with suppress(Exception):
                     artifact_dir.mkdir(parents=True, exist_ok=True)
-                    await locator.screenshot(path=str(path), timeout=5_000)
+                    await handle.screenshot(path=str(path), timeout=5_000)
                     entry["evidence_path"] = str(path)
             evidence.append(entry)
         return evidence
@@ -320,13 +351,15 @@ class BaseCollector(ABC):
         page: Page,
         selector: str,
         expression: str,
-    ) -> list[dict[str, object]]:
-        raw_items: list[dict[str, object]] = []
+    ) -> list[dict[str, Any]]:
+        raw_items: list[dict[str, Any]] = []
         for attempt in range(4):
+            # 指数退避：持续跳转的页面在固定短间隔内往往仍不稳定。
+            backoff_ms = 750 * (2**attempt)
             try:
                 raw_items = await asyncio.wait_for(
                     page.locator(selector).evaluate_all(expression),
-                    timeout=3,
+                    timeout=self._dom_evaluation_timeout_seconds,
                 )
                 break
             except TimeoutError as exc:
@@ -335,7 +368,7 @@ class BaseCollector(ABC):
                         SessionStatus.ERROR,
                         "页面 DOM 抽取多次超时，可能正在持续跳转或加载。",
                     ) from exc
-                await page.wait_for_timeout(750)
+                await page.wait_for_timeout(backoff_ms)
             except PlaywrightError as exc:
                 message = str(exc).lower()
                 navigation_changed_context = (
@@ -349,7 +382,7 @@ class BaseCollector(ABC):
                         SessionStatus.ERROR,
                         "页面持续跳转，无法获得稳定的搜索结果 DOM。",
                     ) from exc
-                await page.wait_for_timeout(750)
+                await page.wait_for_timeout(backoff_ms)
         return raw_items
 
     async def _wait_for_content_anchors(

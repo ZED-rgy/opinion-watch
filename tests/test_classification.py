@@ -34,6 +34,18 @@ def test_rule_classifier_flags_suspected_false_information_for_review() -> None:
     assert result.matched_signals == ["虚假宣传"]
 
 
+def test_rule_classifier_matches_latin_brand_names_case_insensitively() -> None:
+    result = classify_content(
+        {
+            "title": "UShopfy 发货太慢体验差",
+            "brand_names": ["UShopfy"],
+            "raw_data": {},
+        }
+    )
+
+    assert result.category is not OpinionCategory.IRRELEVANT
+
+
 def test_rule_classifier_distinguishes_consumer_complaint() -> None:
     result = classify_content(
         {

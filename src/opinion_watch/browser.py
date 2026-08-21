@@ -52,10 +52,12 @@ class BrowserSession:
         return self
 
     async def __aexit__(self, exc_type: object, exc: object, traceback: object) -> None:
-        if self.context is not None:
-            await self.context.close()
-        if self.playwright is not None:
-            await self.playwright.stop()
+        try:
+            if self.context is not None:
+                await self.context.close()
+        finally:
+            if self.playwright is not None:
+                await self.playwright.stop()
 
     @property
     def active_context(self) -> BrowserContext:

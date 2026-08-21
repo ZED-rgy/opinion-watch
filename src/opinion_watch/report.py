@@ -142,6 +142,10 @@ def build_daily_report(storage: Storage, report_date: str | None = None) -> str:
             title = " ".join(str(row["title"] or "无标题").split())[:120]
             title = title.replace("[", "（").replace("]", "）")
             brands = str(row["brands"] or "未归属品牌")
-            lines.append(f"- **{row['severity']}** · {brands} · {title} [打开原帖]({row['url']})")
+            brands = brands.replace("[", "（").replace("]", "）").replace("*", "")
+            # 抓取到的 URL 属于不可信输入：括号会提前闭合 Markdown 链接，
+            # 让页面内容注入到日报正文里。
+            url = str(row["url"] or "").replace("(", "%28").replace(")", "%29")
+            lines.append(f"- **{row['severity']}** · {brands} · {title} [打开原帖]({url})")
     lines.extend(("", "本日报由品牌舆情监控系统自动生成；风险判断均为待人工核验的线索。"))
     return "\n".join(lines)[:19_000]
