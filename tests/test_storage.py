@@ -768,6 +768,20 @@ def test_finish_scan_run_preserves_manual_note_when_no_new_note(tmp_path: Path) 
     assert storage.get_scan_run(run_id)["note"] == "覆盖备注"
 
 
+def test_mark_all_notifications_read_is_a_single_batch_update(tmp_path: Path) -> None:
+    storage = make_storage(tmp_path)
+    for index in range(3):
+        storage.create_notification(
+            severity="P3", title=f"播报 {index}", message="测试内容"
+        )
+    storage.create_notification(severity="P3", title="已读", message="测试内容", read=True)
+
+    assert storage.count_unread_notifications() == 3
+    assert storage.mark_all_notifications_read() == 3
+    assert storage.count_unread_notifications() == 0
+    assert storage.mark_all_notifications_read() == 0
+
+
 def test_initialize_recovers_from_interrupted_migration(tmp_path: Path) -> None:
     storage = make_storage(tmp_path)
     with storage.connect() as connection:

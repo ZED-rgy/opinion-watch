@@ -1838,6 +1838,15 @@ class Storage:
             )
         return cursor.rowcount > 0
 
+    def mark_all_notifications_read(self) -> int:
+        now = datetime.now(UTC).isoformat()
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "UPDATE app_notifications SET read_at = ? WHERE read_at IS NULL",
+                (now,),
+            )
+        return cursor.rowcount
+
     def get_schedule_config(self) -> dict[str, Any]:
         with self.connect() as connection:
             row = connection.execute("SELECT * FROM schedule_config WHERE id = 1").fetchone()
