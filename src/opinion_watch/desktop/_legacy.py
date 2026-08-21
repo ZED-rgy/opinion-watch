@@ -13,7 +13,6 @@ from typing import Any
 
 import qtawesome as qta
 from PySide6.QtCore import (
-    QByteArray,
     QProcess,
     QSettings,
     QSize,
@@ -59,49 +58,33 @@ from PySide6.QtWidgets import (
 
 from opinion_watch.config import DEFAULT_BRANDS, Settings
 from opinion_watch.credentials import CredentialStore
+from opinion_watch.desktop.constants import (
+    ACCOUNT_STATUS_NAMES,
+    ASSET_DIR,
+    CATEGORY_NAMES,
+    PLATFORM_NAMES,
+    REVIEW_STATUS_NAMES,
+    RUN_STATUS_NAMES,
+)
+from opinion_watch.desktop.constants import (
+    assessment_source_name as _assessment_source_name,
+)
+from opinion_watch.desktop.theme import build_stylesheet
+from opinion_watch.desktop.utils import (
+    decode_process_output as _decode_process_output,
+)
+from opinion_watch.desktop.utils import (
+    format_timestamp as _format_timestamp,
+)
+from opinion_watch.desktop.utils import (
+    process_json_result as _process_json_result,
+)
 from opinion_watch.events import parse_event
 from opinion_watch.models import OpinionCategory, Platform, RiskSeverity
 from opinion_watch.services import ScheduleService
 from opinion_watch.storage import Storage
 
-ASSET_DIR = Path(__file__).with_name("assets")
 AUTOSTART_REGISTRY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
-
-PLATFORM_NAMES = {
-    Platform.DOUYIN.value: "抖音",
-    Platform.XIAOHONGSHU.value: "小红书",
-}
-HOME_URLS = {
-    Platform.DOUYIN.value: "https://www.douyin.com/",
-    Platform.XIAOHONGSHU.value: "https://www.xiaohongshu.com/",
-}
-ACCOUNT_STATUS_NAMES = {
-    "not_logged_in": "未登录",
-    "ready": "可用",
-    "login_required": "需要登录",
-    "verification_required": "需要验证",
-    "rate_limited": "访问受限",
-    "error": "异常",
-}
-RUN_STATUS_NAMES = {
-    "running": "巡检中",
-    "interrupted": "已中断",
-    "succeeded": "已完成",
-    "partial": "部分完成",
-    "failed": "失败",
-    "cancelled": "已取消",
-}
-REVIEW_STATUS_NAMES = {
-    "pending": "待复核",
-    "reviewed": "已复核",
-    "not_required": "无需复核",
-}
-
-ASSESSMENT_SOURCE_NAMES = {"rules": "规则", "model": "大模型", "manual": "人工"}
-
-
-def _assessment_source_name(source: str) -> str:
-    return ASSESSMENT_SOURCE_NAMES.get(source, source)
 
 
 def _windows_autostart_enabled() -> bool:
@@ -141,117 +124,7 @@ def _set_windows_autostart(enabled: bool, runtime_dir: Path | None = None) -> No
                 winreg.DeleteValue(key, "OpinionWatch")
 
 
-CATEGORY_NAMES = {
-    OpinionCategory.SUSPECTED_FALSE_INFORMATION.value: "疑似虚假信息",
-    OpinionCategory.SUSPECTED_DEFAMATION.value: "疑似恶意诽谤",
-    OpinionCategory.COORDINATED_COMPLAINT.value: "集中投诉",
-    OpinionCategory.SUSPECTED_ASTROTURFING.value: "疑似水军攻击",
-    OpinionCategory.REASONABLE_CONSUMER_COMPLAINT.value: "合理消费者投诉",
-    OpinionCategory.ORDINARY_GRIEVANCE.value: "普通吐槽",
-    OpinionCategory.IRRELEVANT.value: "无关内容",
-    OpinionCategory.OTHER.value: "其他",
-}
-
-APP_STYLE = """
-QMainWindow, QWidget {
-    background: #F7F8FA;
-    color: #182033;
-    font-size: 14px;
-}
-QWidget#page { background: #F7F8FA; }
-QWidget#emptyState, QWidget#surfaceRow, QLabel, QCheckBox { background: transparent; }
-QStackedWidget#surfaceStack { background: transparent; }
-QFrame#sidebar { background: #FFFFFF; border-right: 1px solid #E8EAF0; }
-QLabel#brandName { color: #14213D; font-size: 17px; font-weight: 700; }
-QLabel#eyebrow { color: #71798A; font-size: 12px; font-weight: 600; }
-QLabel#pageTitle { color: #10182B; font-size: 28px; font-weight: 700; }
-QLabel#pageSubtitle { color: #697386; font-size: 14px; }
-QLabel#sectionTitle { color: #172033; font-size: 17px; font-weight: 700; }
-QLabel#muted { color: #778095; }
-QLabel#heroTime { color: #10182B; font-size: 34px; font-weight: 700; }
-QLabel#metric { color: #10182B; font-size: 24px; font-weight: 700; }
-QFrame#surface, QFrame#hero {
-    background: #FFFFFF;
-    border: 1px solid #E5E8EF;
-    border-radius: 14px;
-}
-QFrame#hero { border: 1px solid #DFE5F2; }
-QFrame#statusPill { background: #EAF8F1; border: 1px solid #CDEEDD; border-radius: 16px; }
-QFrame#notice { background: #FFF9E9; border: 1px solid #F4E4AF; border-radius: 10px; }
-QFrame#divider { background: #E7EAF0; border: 0; }
-QPushButton {
-    min-height: 36px;
-    padding: 0 15px;
-    background: #2F5BEA;
-    color: #FFFFFF;
-    border: 1px solid #2F5BEA;
-    border-radius: 8px;
-    font-weight: 600;
-}
-QPushButton:hover { background: #244DD0; border-color: #244DD0; }
-QPushButton:pressed { background: #1F43B8; }
-QPushButton:focus { border: 2px solid #8DA8FF; }
-QPushButton[role="secondary"] { background: #FFFFFF; color: #293248; border-color: #D9DEE8; }
-QPushButton[role="secondary"]:hover { background: #F2F4F8; }
-QPushButton[role="danger"] { background: #FFFFFF; color: #C93642; border-color: #F0C8CC; }
-QPushButton[role="danger"]:hover { background: #FFF2F3; }
-QComboBox, QSpinBox, QTimeEdit, QLineEdit, QTextEdit {
-    min-height: 36px;
-    background: #FFFFFF;
-    color: #20283B;
-    border: 1px solid #D8DDE7;
-    border-radius: 8px;
-    padding: 0 10px;
-    selection-background-color: #DDE6FF;
-}
-QComboBox:focus, QSpinBox:focus, QTimeEdit:focus, QLineEdit:focus,
-QTextEdit:focus { border: 2px solid #2F5BEA; }
-QTextEdit { padding: 8px; }
-QCheckBox { spacing: 8px; color: #313A4D; }
-QCheckBox::indicator { width: 34px; height: 18px; border-radius: 9px; background: #C9CFDA; }
-QCheckBox::indicator:checked { background: #2F5BEA; }
-QTableWidget {
-    background: #FFFFFF;
-    alternate-background-color: #FAFBFC;
-    border: 0;
-    gridline-color: transparent;
-    selection-background-color: #EEF3FF;
-    selection-color: #182033;
-    outline: 0;
-}
-QTableWidget::item { border-bottom: 1px solid #EDF0F4; padding: 8px; }
-QTableWidget::item:selected {
-    background: #DCE7FF; color: #102A72; border-left: 3px solid #2F5BEA;
-    font-weight: 600;
-}
-QHeaderView::section {
-    background: #F6F7F9;
-    color: #5D667A;
-    border: 0;
-    border-bottom: 1px solid #E5E8EE;
-    padding: 10px 8px;
-    font-weight: 600;
-}
-QListWidget#navigation { background: #FFFFFF; border: 0; outline: 0; padding: 6px 12px; }
-QListWidget#navigation::item {
-    color: #596277; padding: 11px 12px; border-radius: 8px; margin: 2px 0;
-}
-QListWidget#navigation::item:hover { background: #F3F5F9; color: #26334D; }
-QListWidget#navigation::item:selected { background: #EAF0FF; color: #244BC5; font-weight: 600; }
-QWidget#notificationNavRow, QWidget#notificationNavRow QLabel { background: transparent; }
-QListWidget#timeline { background: transparent; border: 0; outline: 0; }
-QListWidget#timeline::item {
-    background: #F8F9FB; border: 1px solid #EAEDF2;
-    border-radius: 8px; margin: 3px 0; padding: 10px;
-}
-QListWidget#timeline::item:selected {
-    background: #DCE7FF; color: #102A72; border: 2px solid #2F5BEA;
-    font-weight: 600;
-}
-QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
-QScrollBar::handle:vertical { background: #C9CFDA; border-radius: 5px; min-height: 30px; }
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-"""
+APP_STYLE = build_stylesheet()
 
 
 def _icon(name: str, color: str = "#5D667A"):
@@ -306,10 +179,6 @@ def _new_table(headers: list[str], *, multi_select: bool = False) -> QTableWidge
     return table
 
 
-def _decode_process_output(data: QByteArray) -> str:
-    return bytes(data.data()).decode("utf-8", "replace")
-
-
 def _selected_id(table: QTableWidget) -> int | None:
     row = table.currentRow()
     cell = table.item(row, 0) if row >= 0 else None
@@ -345,39 +214,8 @@ def _toggle_all(table: QTableWidget, checked: bool) -> None:
             cell.setCheckState(state)
 
 
-def _format_timestamp(value: object) -> str:
-    if not value:
-        return "—"
-    try:
-        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-        if parsed.tzinfo is not None:
-            parsed = parsed.astimezone()
-        return parsed.strftime("%Y-%m-%d %H:%M")
-    except ValueError:
-        return str(value)
-
-
 def _show_error(parent: QWidget, exc: Exception) -> None:
     QMessageBox.critical(parent, "操作失败", str(exc))
-
-
-def _process_json_result(output: str) -> dict[str, Any] | None:
-    for line in reversed(output.splitlines()):
-        try:
-            candidate = json.loads(line.strip())
-        except json.JSONDecodeError:
-            continue
-        if isinstance(candidate, dict) and candidate.get("status"):
-            return candidate
-    decoder = json.JSONDecoder()
-    for start in (index for index, value in enumerate(output) if value == "{"):
-        try:
-            candidate, _ = decoder.raw_decode(output[start:])
-        except json.JSONDecodeError:
-            continue
-        if isinstance(candidate, dict) and candidate.get("status"):
-            return candidate
-    return None
 
 
 class EmptyState(QWidget):
