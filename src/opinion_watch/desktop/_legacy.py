@@ -17,32 +17,24 @@ from PySide6.QtCore import (
     Qt,
     QTime,
     QTimer,
-    QUrl,
     Signal,
 )
-from PySide6.QtGui import QColor, QDesktopServices, QFont, QTextCursor
+from PySide6.QtGui import QFont, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
-    QDialog,
-    QDialogButtonBox,
-    QFormLayout,
     QFrame,
     QGridLayout,
     QHBoxLayout,
-    QHeaderView,
     QLabel,
-    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
     QMenu,
-    QMessageBox,
     QSpinBox,
     QStackedWidget,
     QSystemTrayIcon,
-    QTableWidgetItem,
     QTextEdit,
     QTimeEdit,
     QVBoxLayout,
@@ -53,19 +45,9 @@ from opinion_watch.config import DEFAULT_BRANDS, Settings
 from opinion_watch.desktop import components as _components
 from opinion_watch.desktop.components import (
     EmptyState,
-    TablePanel,
-)
-from opinion_watch.desktop.components import (
-    checked_ids as _checked_ids,
 )
 from opinion_watch.desktop.components import (
     icon as _icon,
-)
-from opinion_watch.desktop.components import (
-    make_table as _new_table,
-)
-from opinion_watch.desktop.components import (
-    set_check_cell as _set_check_cell,
 )
 from opinion_watch.desktop.components import (
     surface as _surface,
@@ -73,32 +55,22 @@ from opinion_watch.desktop.components import (
 from opinion_watch.desktop.components import (
     title as _title,
 )
-from opinion_watch.desktop.components import (
-    toggle_all as _toggle_all,
-)
 from opinion_watch.desktop.constants import (
     ACCOUNT_STATUS_NAMES,
-    CATEGORY_NAMES,
     PLATFORM_NAMES,
-    REVIEW_STATUS_NAMES,
     RUN_STATUS_NAMES,
-)
-from opinion_watch.desktop.constants import (
-    assessment_source_name as _assessment_source_name,
 )
 from opinion_watch.desktop.dialogs import (
     RunDetailDialog,
     delete_scan_run_with_confirmation,
     edit_scan_run_metadata,
 )
-from opinion_watch.desktop.dialogs import (
-    show_error as _show_error,
-)
 from opinion_watch.desktop.login_window import BrowserLoginWindow
 from opinion_watch.desktop.pages import (
     AccountsPage,
     KeywordsPage,
     NotificationsPage,
+    OpinionsPage,
     SettingsPage,
 )
 from opinion_watch.desktop.theme import build_stylesheet
@@ -109,7 +81,7 @@ from opinion_watch.desktop.utils import (
     format_timestamp as _format_timestamp,
 )
 from opinion_watch.events import parse_event
-from opinion_watch.models import OpinionCategory, Platform, RiskSeverity
+from opinion_watch.models import Platform
 from opinion_watch.services import ScheduleService
 from opinion_watch.storage import Storage
 
@@ -732,400 +704,6 @@ class SchedulerPage(QWidget):
         self.detail_button.setVisible(has_runs)
         self.edit_run_button.setVisible(has_runs)
         self.delete_run_button.setVisible(has_runs)
-
-
-class OpinionsPage(QWidget):
-    changed = Signal()
-
-    def __init__(self, storage: Storage) -> None:
-        super().__init__()
-        self.storage = storage
-        self.rows: dict[int, dict[str, Any]] = {}
-        self.setObjectName("page")
-        root = QVBoxLayout(self)
-        root.setContentsMargins(30, 26, 30, 28)
-        root.setSpacing(18)
-        header = QHBoxLayout()
-        heading = QVBoxLayout()
-        heading.addWidget(_title("舆情中心"))
-        subtitle = QLabel("集中查看、判断和复核巡检发现的内容")
-        subtitle.setObjectName("pageSubtitle")
-        heading.addWidget(subtitle)
-        header.addLayout(heading)
-        header.addStretch()
-        header.addWidget(_button("刷新", self.refresh, icon="fa6s.rotate", role="secondary"))
-        root.addLayout(header)
-        surface, layout = _surface()
-        actions = QHBoxLayout()
-        actions.addWidget(
-            _button("打开原帖", self.open_source, icon="fa6s.arrow-up-right-from-square")
-        )
-        actions.addWidget(_button("新增舆情", self.add_assessment, icon="fa6s.plus"))
-        actions.addWidget(_button("编辑选中", self.edit_assessment, role="secondary"))
-        actions.addWidget(_button("删除选中", self.delete_selected, role="danger"))
-        actions.addWidget(_button("查看判断依据", self.show_detail, role="secondary"))
-        actions.addWidget(_button("人工复核", self.review, role="secondary"))
-        self.select_all_button = _button("全选", self.select_all, role="secondary")
-        actions.addWidget(self.select_all_button)
-        actions.addStretch()
-        layout.addLayout(actions)
-        filters = QHBoxLayout()
-        filters.addWidget(QLabel("巡检批次"))
-        self.run_filter = QComboBox()
-        self.run_filter.currentIndexChanged.connect(self.refresh)
-        filters.addWidget(self.run_filter, 1)
-        self.edit_run_button = _button(
-            "编辑记录", self.edit_selected_run, icon="fa6s.pen-to-square", role="secondary"
-        )
-        self.delete_run_button = _button(
-            "删除记录", self.delete_selected_run, icon="fa6s.trash", role="danger"
-        )
-        filters.addWidget(self.edit_run_button)
-        filters.addWidget(self.delete_run_button)
-        filters.addWidget(QLabel("平台"))
-        self.platform_filter = QComboBox()
-        self.platform_filter.addItem("全部平台", "")
-        for value, name in PLATFORM_NAMES.items():
-            self.platform_filter.addItem(name, value)
-        self.platform_filter.currentIndexChanged.connect(self.refresh)
-        filters.addWidget(self.platform_filter)
-        filters.addWidget(QLabel("来源"))
-        self.source_filter = QComboBox()
-        self.source_filter.addItem("全部来源", "")
-        self.source_filter.addItem("规则", "rules")
-        self.source_filter.addItem("大模型", "model")
-        self.source_filter.addItem("人工", "manual")
-        self.source_filter.currentIndexChanged.connect(self.refresh)
-        filters.addWidget(self.source_filter)
-        filters.addWidget(QLabel("等级"))
-        self.severity_filter = QComboBox()
-        self.severity_filter.addItem("全部等级", "")
-        for value in RiskSeverity:
-            self.severity_filter.addItem(value.value, value.value)
-        self.severity_filter.currentIndexChanged.connect(self.refresh)
-        filters.addWidget(self.severity_filter)
-        layout.addLayout(filters)
-        self.scope_label = QLabel()
-        self.scope_label.setObjectName("muted")
-        layout.addWidget(self.scope_label)
-        self.table = _new_table(
-            [
-                "选择",
-                "内容ID",
-                "等级",
-                "类型",
-                "平台",
-                "品牌",
-                "标题",
-                "首次发现",
-                "最近发现",
-                "判定来源",
-                "复核状态",
-            ],
-            multi_select=True,
-        )
-        self.table.setColumnHidden(1, True)
-        self.table.horizontalHeader().setSectionResizeMode(
-            0, QHeaderView.ResizeMode.ResizeToContents
-        )
-        self.panel = TablePanel(
-            self.table,
-            EmptyState(
-                "暂未发现舆情",
-                "完成巡检后，命中品牌关键词的公开内容会在这里归档。",
-                image_name="empty-scan.png",
-            ),
-        )
-        layout.addWidget(self.panel, 1)
-        root.addWidget(surface, 1)
-
-    def refresh(self) -> None:
-        previous_run = self.run_filter.currentData() if self.run_filter.count() else None
-        runs = self.storage.list_scan_runs(limit=30)
-        self.run_filter.blockSignals(True)
-        self.run_filter.clear()
-        linked_runs = [run for run in runs if int(run.get("linked_content_count") or 0) > 0]
-        self.run_filter.addItem("全部历史", -1)
-        for run in linked_runs:
-            title = str(run.get("title") or f"巡检记录 #{run['id']}")
-            self.run_filter.addItem(
-                f"{title} · #{run['id']} · {_format_timestamp(run.get('started_at'))} · "
-                f"{RUN_STATUS_NAMES.get(str(run['status']), run['status'])}",
-                int(run["id"]),
-            )
-        if previous_run is None and linked_runs:
-            self.run_filter.setCurrentIndex(1)
-        else:
-            index = self.run_filter.findData(previous_run)
-            self.run_filter.setCurrentIndex(index if index >= 0 else 0)
-        self.run_filter.blockSignals(False)
-        selected_run = self.run_filter.currentData()
-        run_id = int(selected_run) if selected_run not in (None, -1) else None
-        rows = self.storage.list_assessments(
-            limit=1000,
-            run_id=run_id,
-            source=self.source_filter.currentData() or None,
-            platform=self.platform_filter.currentData() or None,
-            severity=self.severity_filter.currentData() or None,
-        )
-        self.rows = {int(item["content_item_id"]): item for item in rows}
-        self.table.setRowCount(len(rows))
-        self.scope_label.setText(
-            f"当前显示巡检 #{run_id} 的数据，共 {len(rows)} 条"
-            if run_id is not None
-            else f"当前显示全部历史数据，共 {len(rows)} 条"
-        )
-        for row, item in enumerate(rows):
-            values = (
-                item["content_item_id"],
-                item["severity"],
-                CATEGORY_NAMES.get(str(item["category"]), item["category"]),
-                PLATFORM_NAMES.get(str(item["platform"]), item["platform"]),
-                "、".join(str(value) for value in item["brand_names"]),
-                item["title"] or "（无标题）",
-                _format_timestamp(item.get("discovered_at")),
-                _format_timestamp(item.get("last_seen_at")),
-                {"rules": "规则", "model": "大模型", "manual": "人工"}.get(
-                    str(item["source"]), str(item["source"])
-                ),
-                REVIEW_STATUS_NAMES.get(str(item["review_status"]), item["review_status"]),
-            )
-            _set_check_cell(self.table, row)
-            for column, value in enumerate(values, start=1):
-                cell = QTableWidgetItem(str(value))
-                if column == 2:
-                    cell.setForeground(
-                        QColor(
-                            {"P0": "#C93642", "P1": "#D46B22", "P2": "#A06B00"}.get(
-                                str(value), "#667085"
-                            )
-                        )
-                    )
-                self.table.setItem(row, column, cell)
-        self.panel.show_count(len(rows))
-        has_selected_run = run_id is not None
-        self.edit_run_button.setEnabled(has_selected_run)
-        self.delete_run_button.setEnabled(has_selected_run)
-
-    def selected_run_id(self) -> int | None:
-        value = self.run_filter.currentData()
-        return int(value) if value not in (None, -1) else None
-
-    def edit_selected_run(self) -> None:
-        run_id = self.selected_run_id()
-        if run_id is not None and edit_scan_run_metadata(self.storage, run_id, self):
-            self.refresh()
-            self.changed.emit()
-
-    def delete_selected_run(self) -> None:
-        run_id = self.selected_run_id()
-        if run_id is None:
-            return
-        if delete_scan_run_with_confirmation(self.storage, run_id, self):
-            self.refresh()
-            self.changed.emit()
-
-    def selected(self) -> dict[str, Any] | None:
-        content_id = self._selected_assessment_id()
-        return self.rows.get(content_id) if content_id is not None else None
-
-    def _selected_assessment_id(self) -> int | None:
-        row = self.table.currentRow()
-        cell = self.table.item(row, 1) if row >= 0 else None
-        return int(cell.text()) if cell is not None else None
-
-    def select_all(self) -> None:
-        should_check = any(
-            (cell := self.table.item(row, 0)) is not None
-            and cell.checkState() != Qt.CheckState.Checked
-            for row in range(self.table.rowCount())
-        )
-        _toggle_all(self.table, should_check)
-        self.select_all_button.setText("取消全选" if should_check else "全选")
-
-    def add_assessment(self) -> None:
-        dialog = QDialog(self)
-        dialog.setWindowTitle("新增舆情记录")
-        dialog.resize(560, 460)
-        form = QFormLayout(dialog)
-        platform = QComboBox()
-        for value, name in PLATFORM_NAMES.items():
-            platform.addItem(name, value)
-        brand = QLineEdit()
-        brand.setPlaceholderText("例如：速探长")
-        title = QLineEdit()
-        url = QLineEdit()
-        url.setPlaceholderText("原帖链接")
-        category = QComboBox()
-        for option in OpinionCategory:
-            category.addItem(CATEGORY_NAMES[option.value], option.value)
-        severity = QComboBox()
-        for option in RiskSeverity:
-            severity.addItem(option.value)
-        rationale = QTextEdit()
-        rationale.setPlaceholderText("填写人工判断依据")
-        rationale.setMaximumHeight(110)
-        form.addRow("平台", platform)
-        form.addRow("品牌", brand)
-        form.addRow("标题", title)
-        form.addRow("链接", url)
-        form.addRow("分类", category)
-        form.addRow("等级", severity)
-        form.addRow("判断依据", rationale)
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        form.addRow(buttons)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        try:
-            self.storage.create_manual_assessment(
-                platform=str(platform.currentData()),
-                title=title.text(),
-                url=url.text(),
-                brand_name=brand.text(),
-                category=str(category.currentData()),
-                severity=severity.currentText(),
-                rationale=rationale.toPlainText(),
-            )
-        except Exception as exc:
-            _show_error(self, exc)
-            return
-        self.refresh()
-        self.changed.emit()
-
-    def edit_assessment(self) -> None:
-        item = self.selected()
-        if item is None:
-            QMessageBox.information(self, "提示", "请先选择一条舆情记录。")
-            return
-        dialog = QDialog(self)
-        dialog.setWindowTitle("编辑舆情记录")
-        form = QFormLayout(dialog)
-        category = QComboBox()
-        for option in OpinionCategory:
-            category.addItem(CATEGORY_NAMES[option.value], option.value)
-        category.setCurrentIndex(category.findData(str(item["category"])))
-        severity = QComboBox()
-        for option in RiskSeverity:
-            severity.addItem(option.value)
-        severity.setCurrentText(str(item["severity"]))
-        status = QComboBox()
-        for value, name in REVIEW_STATUS_NAMES.items():
-            status.addItem(name, value)
-        status.setCurrentIndex(status.findData(str(item["review_status"])))
-        reviewer = QLineEdit(str(item.get("reviewed_by") or "运营人员"))
-        rationale = QTextEdit(str(item.get("rationale") or ""))
-        rationale.setMaximumHeight(120)
-        form.addRow("分类", category)
-        form.addRow("等级", severity)
-        form.addRow("复核状态", status)
-        form.addRow("审核人", reviewer)
-        form.addRow("判断依据", rationale)
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        form.addRow(buttons)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        try:
-            self.storage.update_assessment(
-                int(item["content_item_id"]),
-                category=str(category.currentData()),
-                severity=severity.currentText(),
-                rationale=rationale.toPlainText(),
-                review_status=str(status.currentData()),
-                reviewer=reviewer.text(),
-            )
-        except Exception as exc:
-            _show_error(self, exc)
-            return
-        self.refresh()
-        self.changed.emit()
-
-    def delete_selected(self) -> None:
-        ids = _checked_ids(self.table, 1)
-        if not ids:
-            QMessageBox.information(self, "提示", "请先勾选要删除的舆情记录。")
-            return
-        answer = QMessageBox.question(
-            self,
-            "删除舆情记录",
-            f"确定删除选中的 {len(ids)} 条舆情记录吗？原始采集内容仍会保留。",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if answer == QMessageBox.StandardButton.Yes:
-            self.storage.delete_assessments(ids)
-            self.refresh()
-            self.changed.emit()
-
-    def open_source(self) -> None:
-        item = self.selected()
-        if item:
-            QDesktopServices.openUrl(QUrl(str(item["url"])))
-
-    def show_detail(self) -> None:
-        item = self.selected()
-        if item:
-            QMessageBox.information(
-                self,
-                (
-                    f"{item['severity']} · "
-                    f"{CATEGORY_NAMES.get(str(item['category']), item['category'])}"
-                ),
-                f"首次发现：{_format_timestamp(item.get('discovered_at'))}\n"
-                f"最近发现：{_format_timestamp(item.get('last_seen_at'))}\n"
-                f"判定来源：{_assessment_source_name(str(item['source']))}\n"
-                f"命中关键词：{'、'.join(item.get('observed_keywords', [])) or '未记录'}\n\n"
-                f"{item['rationale']}\n\n命中信号：{'、'.join(item['matched_signals']) or '无'}",
-            )
-
-    def review(self) -> None:
-        item = self.selected()
-        if item is None:
-            QMessageBox.information(self, "提示", "请先选择一条舆情记录。")
-            return
-        dialog = QDialog(self)
-        dialog.setWindowTitle("人工复核舆情")
-        form = QFormLayout(dialog)
-        category = QComboBox()
-        for option in OpinionCategory:
-            category.addItem(CATEGORY_NAMES[option.value], option.value)
-        category.setCurrentIndex(category.findData(str(item["category"])))
-        severity = QComboBox()
-        for option in RiskSeverity:
-            severity.addItem(option.value)
-        severity.setCurrentText(str(item["severity"]))
-        reviewer = QLineEdit("运营人员")
-        note = QTextEdit()
-        note.setPlaceholderText("填写人工核查结论和依据")
-        note.setMaximumHeight(120)
-        form.addRow("分类", category)
-        form.addRow("等级", severity)
-        form.addRow("审核人", reviewer)
-        form.addRow("审核备注", note)
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        form.addRow(buttons)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        self.storage.review_assessment(
-            int(item["content_item_id"]),
-            category=str(category.currentData()),
-            severity=severity.currentText(),
-            note=note.toPlainText().strip(),
-            reviewer=reviewer.text().strip() or "运营人员",
-        )
-        self.refresh()
-        self.changed.emit()
 
 
 class MainWindow(QMainWindow):
