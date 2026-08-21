@@ -175,7 +175,13 @@ class WeComClient:
         return frame if isinstance(frame, dict) else None
 
 
-async def send_daily_report_if_due(storage: Storage, *, scan_run_id: int) -> bool:
+async def send_daily_report_if_due(
+    storage: Storage,
+    *,
+    scan_run_id: int,
+    force: bool = False,
+) -> bool:
+    """Send scheduled reports once per day and every successful manual run."""
     config = storage.get_wecom_config()
     if not bool(config.get("enabled")):
         return False
@@ -185,13 +191,14 @@ async def send_daily_report_if_due(storage: Storage, *, scan_run_id: int) -> boo
     if not secret:
         raise WeComConfigurationError("未找到企微机器人 Secret，请在设置中重新保存")
     content = build_daily_report(storage, report_date)
-    claimed = storage.claim_daily_report(
-        report_date=report_date,
-        scan_run_id=scan_run_id,
-        content=content,
-    )
-    if not claimed:
-        return False
+    if not force:
+        claimed = storage.claim_daily_report(
+            report_date=report_date,
+            scan_run_id=scan_run_id,
+            content=content,
+        )
+        if not claimed:
+            return False
     try:
         client = WeComClient(
             bot_id=str(config.get("bot_id") or ""),
@@ -200,7 +207,9 @@ async def send_daily_report_if_due(storage: Storage, *, scan_run_id: int) -> boo
         )
         await client.send_markdown(str(config.get("chat_id") or ""), content)
     except Exception as exc:
-        storage.mark_daily_report_failed(report_date, str(exc))
+        if not force:
+            storage.mark_daily_report_failed(report_date, str(exc))
         raise
-    storage.mark_daily_report_sent(report_date)
+    if not force:
+        storage.mark_daily_report_sent(report_date)
     return True

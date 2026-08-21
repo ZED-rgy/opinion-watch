@@ -164,8 +164,30 @@ def test_manual_scan_can_send_daily_report(tmp_path: Path, monkeypatch: object) 
     monkeypatch.setattr(CredentialStore, "get_wecom_secret", classmethod(lambda cls: "secret"))
     monkeypatch.setattr(WeComClient, "send_markdown", fake_send)
 
-    assert asyncio.run(send_daily_report_if_due(storage, scan_run_id=run_id))
+    assert asyncio.run(send_daily_report_if_due(storage, scan_run_id=run_id, force=True))
     assert calls == ["chat"]
+
+
+def test_manual_reports_send_every_time_without_consuming_scheduled_slot(
+    tmp_path: Path, monkeypatch: object
+) -> None:
+    storage = make_storage(tmp_path)
+    storage.save_wecom_config(enabled=True, bot_id="bot", chat_id="chat")
+    run_id = storage.create_scan_run(
+        trigger="manual", platforms=["douyin"], brands=["速探长"], options={}
+    )
+    calls: list[str] = []
+
+    async def fake_send(self: WeComClient, chat_id: str, content: str) -> None:
+        calls.append(chat_id)
+
+    monkeypatch.setattr(CredentialStore, "get_wecom_secret", classmethod(lambda cls: "secret"))
+    monkeypatch.setattr(WeComClient, "send_markdown", fake_send)
+
+    assert asyncio.run(send_daily_report_if_due(storage, scan_run_id=run_id, force=True))
+    assert asyncio.run(send_daily_report_if_due(storage, scan_run_id=run_id, force=True))
+    assert asyncio.run(send_daily_report_if_due(storage, scan_run_id=run_id))
+    assert calls == ["chat", "chat", "chat"]
 
 
 def test_daily_report_claim_prevents_duplicate_senders(tmp_path: Path) -> None:

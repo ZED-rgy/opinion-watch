@@ -798,7 +798,11 @@ async def _run_scan_locked(
         ScanRunStatus.PARTIAL,
     }:
         try:
-            wecom_report_sent = await send_daily_report_if_due(storage, scan_run_id=run_id)
+            wecom_report_sent = await send_daily_report_if_due(
+                storage,
+                scan_run_id=run_id,
+                force=trigger == "manual",
+            )
         except Exception as exc:
             storage.create_alert(
                 run_id=run_id,
