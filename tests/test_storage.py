@@ -546,6 +546,10 @@ def test_scan_lease_and_stale_run_recovery(tmp_path: Path) -> None:
             "UPDATE scan_runs SET started_at = '2000-01-01T00:00:00+00:00' WHERE id = ?",
             (run_id,),
         )
+    # 只要还有未过期的巡检租约，说明有进程在跑，不能把慢任务误判成中断。
+    assert storage.recover_stale_scan_runs(timeout_minutes=1) == 0
+    assert storage.get_scan_run(run_id)["status"] == "running"
+    assert storage.release_task_lease("scan", "owner-b")
     assert storage.recover_stale_scan_runs(timeout_minutes=1) == 1
     assert storage.get_scan_run(run_id)["status"] == "interrupted"
 
@@ -659,3 +663,120 @@ def test_event_clusters_only_include_suspected_content(tmp_path: Path) -> None:
     assert storage.rebuild_event_clusters() == 1
     clusters = storage.list_event_clusters()
     assert clusters[0]["content_count"] == 2
+
+
+def test_event_cluster_keeps_brand_name_containing_comma(tmp_path: Path) -> None:
+    storage = make_storage(tmp_path)
+    storage.add_brand("示例,品牌")
+    storage.upsert_contents(
+        [
+            CollectedContent(
+                platform=Platform.DOUYIN,
+                content_id="comma-1",
+                url="https://example.test/comma-1",
+                title="示例品牌售后拒绝退款引发争议",
+                source_keyword="示例,品牌",
+                brand_name="示例,品牌",
+            ),
+        ]
+    )
+    content_rows = {
+        row["platform_content_id"]: int(row["id"]) for row in storage.list_contents_for_assessment()
+    }
+    storage.upsert_assessment(
+        content_item_id=content_rows["comma-1"],
+        category=OpinionCategory.SUSPECTED_FALSE_INFORMATION.value,
+        severity=RiskSeverity.P1.value,
+        confidence=0.9,
+        rationale="测试判断",
+        matched_signals=["售后"],
+        requires_review=True,
+    )
+
+    assert storage.rebuild_event_clusters() == 1
+    clusters = storage.list_event_clusters()
+    assert clusters[0]["brand_names"] == ["示例,品牌"]
+
+
+def test_model_assessment_is_not_downgraded_by_rule_reclassification(tmp_path: Path) -> None:
+    storage = make_storage(tmp_path)
+    storage.add_brand("示例品牌")
+    storage.upsert_contents(
+        [
+            CollectedContent(
+                platform=Platform.DOUYIN,
+                content_id="model-guard",
+                url="https://example.test/model-guard",
+                title="示例品牌虚假宣传曝光",
+                source_keyword="示例品牌",
+                brand_name="示例品牌",
+            ),
+        ]
+    )
+    content_id = int(storage.list_contents_for_assessment()[0]["id"])
+    storage.upsert_assessment(
+        content_item_id=content_id,
+        category=OpinionCategory.SUSPECTED_FALSE_INFORMATION.value,
+        severity=RiskSeverity.P1.value,
+        confidence=0.9,
+        rationale="模型复判结论",
+        matched_signals=["虚假宣传"],
+        requires_review=True,
+        source="model",
+    )
+    storage.upsert_assessment(
+        content_item_id=content_id,
+        category=OpinionCategory.OTHER.value,
+        severity=RiskSeverity.P3.value,
+        confidence=0.6,
+        rationale="规则重刷",
+        matched_signals=[],
+        requires_review=False,
+        source="rules",
+    )
+
+    assessment = storage.get_assessment(content_id)
+    assert assessment is not None
+    assert assessment["source"] == "model"
+    assert assessment["severity"] == RiskSeverity.P1.value
+
+    storage.upsert_assessment(
+        content_item_id=content_id,
+        category=OpinionCategory.SUSPECTED_DEFAMATION.value,
+        severity=RiskSeverity.P2.value,
+        confidence=0.8,
+        rationale="新一轮模型复判",
+        matched_signals=[],
+        requires_review=True,
+        source="model",
+    )
+    assessment = storage.get_assessment(content_id)
+    assert assessment is not None
+    assert assessment["severity"] == RiskSeverity.P2.value
+
+
+def test_finish_scan_run_preserves_manual_note_when_no_new_note(tmp_path: Path) -> None:
+    storage = make_storage(tmp_path)
+    run_id = storage.create_scan_run(
+        trigger="manual", platforms=["douyin"], brands=["示例品牌"], options={}
+    )
+    assert storage.update_scan_run_metadata(run_id, title="手动巡检", note="人工备注")
+    storage.finish_scan_run(run_id, status="succeeded", collected=1)
+    assert storage.get_scan_run(run_id)["note"] == "人工备注"
+
+    storage.finish_scan_run(run_id, status="succeeded", collected=1, note="覆盖备注")
+    assert storage.get_scan_run(run_id)["note"] == "覆盖备注"
+
+
+def test_initialize_recovers_from_interrupted_migration(tmp_path: Path) -> None:
+    storage = make_storage(tmp_path)
+    with storage.connect() as connection:
+        # 模拟上一次迁移中途崩溃：中间表已提交，但迁移版本未写入。
+        connection.execute("DELETE FROM schema_migrations WHERE version = 2")
+        connection.execute("CREATE TABLE content_matches_v2 (id INTEGER PRIMARY KEY)")
+
+    reopened = Storage(tmp_path / "test.db")
+    reopened.initialize()
+    with reopened.connect() as connection:
+        version = connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
+    assert int(version) == 2

@@ -8,6 +8,8 @@ import uuid
 from collections.abc import Iterable
 from datetime import UTC, datetime
 from pathlib import Path
+from types import TracebackType
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 from opinion_watch.models import CollectedContent, Platform, UpsertStats
@@ -16,9 +18,15 @@ from opinion_watch.models import CollectedContent, Platform, UpsertStats
 class _ManagedConnection(sqlite3.Connection):
     """Close SQLite connections after the standard commit/rollback context."""
 
-    def __exit__(self, *args: object) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None = None,
+        exc_value: BaseException | None = None,
+        traceback: TracebackType | None = None,
+        /,
+    ) -> Literal[False]:
         try:
-            super().__exit__(*args)
+            return super().__exit__(exc_type, exc_value, traceback)
         finally:
             self.close()
 
@@ -263,6 +271,8 @@ class Storage:
                     ON scan_attempts(run_id, id);
                 CREATE INDEX IF NOT EXISTS idx_alerts_unacknowledged
                     ON alerts(acknowledged_at, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_alerts_run
+                    ON alerts(run_id, id);
 
                 CREATE TABLE IF NOT EXISTS opinion_assessments (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -621,6 +631,9 @@ class Storage:
 
     @staticmethod
     def _migrate_content_match_keys(connection: sqlite3.Connection) -> None:
+        # DDL 在 sqlite3 里逐条自动提交，上一次迁移中途失败可能留下这张中间表；
+        # 不清理的话每次启动都会因 "table already exists" 直接失败。
+        connection.execute("DROP TABLE IF EXISTS content_matches_v2")
         connection.execute("DROP INDEX IF EXISTS idx_match_brand")
         connection.execute(
             """
@@ -661,7 +674,7 @@ class Storage:
         limit: int = 100,
         include_assessed: bool = False,
         run_id: int | None = None,
-    ) -> list[dict[str, object]]:
+    ) -> list[dict[str, Any]]:
         assessed_filter = "" if include_assessed else "AND oa.id IS NULL"
         run_filter = ""
         parameters: list[object] = []
@@ -692,7 +705,7 @@ class Storage:
 
     def list_model_candidates(
         self, *, limit: int = 20, run_id: int | None = None
-    ) -> list[dict[str, object]]:
+    ) -> list[dict[str, Any]]:
         run_filter = ""
         parameters: list[object] = []
         if run_id is not None:
@@ -764,6 +777,9 @@ class Storage:
                     review_status = excluded.review_status,
                     updated_at = excluded.updated_at
                 WHERE opinion_assessments.source <> 'manual'
+                  AND NOT (
+                    opinion_assessments.source = 'model' AND excluded.source = 'rules'
+                  )
                 """,
                 (
                     content_item_id,
@@ -811,7 +827,7 @@ class Storage:
         run_id: int | None = None,
         source: str | None = None,
         platform: str | None = None,
-    ) -> list[dict[str, object]]:
+    ) -> list[dict[str, Any]]:
         conditions: list[str] = ["NOT (oa.source = 'rules' AND oa.category = 'irrelevant')"]
         parameters: list[object] = []
         if severity is not None:
@@ -876,7 +892,7 @@ class Storage:
             rows = connection.execute(query, parameters).fetchall()
         return [self._assessment_dict(row) for row in rows]
 
-    def get_assessment(self, content_item_id: int) -> dict[str, object] | None:
+    def get_assessment(self, content_item_id: int) -> dict[str, Any] | None:
         with self.connect() as connection:
             row = connection.execute(
                 """
@@ -937,7 +953,7 @@ class Storage:
             rows = connection.execute(
                 f"""
                 SELECT ci.id, ci.platform, ci.title,
-                       GROUP_CONCAT(DISTINCT b.name) AS brand_names
+                       GROUP_CONCAT(b.name, char(31)) AS brand_names
                 FROM content_items ci
                 JOIN opinion_assessments oa ON oa.content_item_id = ci.id
                 LEFT JOIN content_matches cm ON cm.content_item_id = ci.id
@@ -949,9 +965,13 @@ class Storage:
                 """,
                 parameters,
             ).fetchall()
-            groups: dict[str, dict[str, object]] = {}
+            groups: dict[str, dict[str, Any]] = {}
             for row in rows:
-                brand_names = [value for value in str(row["brand_names"] or "").split(",") if value]
+                # 与其余查询保持一致使用单元分隔符，品牌名里的逗号不会被拆开；
+                # 一个品牌多个关键词会产生重复行，这里去重。
+                brand_names = sorted(
+                    {value for value in str(row["brand_names"] or "").split("\x1f") if value}
+                )
                 title = str(row["title"] or "").strip()
                 fingerprint = self._event_cluster_fingerprint(
                     str(row["platform"]), brand_names, title
@@ -991,7 +1011,7 @@ class Storage:
                         now,
                     ),
                 )
-                cluster_id = int(cursor.lastrowid)
+                cluster_id = int(cursor.lastrowid or 0)
                 for content_id in group["content_ids"]:
                     connection.execute(
                         """
@@ -1002,7 +1022,7 @@ class Storage:
                     )
         return len(groups)
 
-    def list_event_clusters(self, *, limit: int = 20) -> list[dict[str, object]]:
+    def list_event_clusters(self, *, limit: int = 20) -> list[dict[str, Any]]:
         with self.connect() as connection:
             rows = connection.execute(
                 """
@@ -1019,7 +1039,7 @@ class Storage:
                 """,
                 (max(1, min(limit, 100)),),
             ).fetchall()
-        result: list[dict[str, object]] = []
+        result: list[dict[str, Any]] = []
         for row in rows:
             item = dict(row)
             try:
@@ -1037,35 +1057,35 @@ class Storage:
         items: Iterable[CollectedContent],
     ) -> None:
         observed_at = datetime.now(UTC).isoformat()
+        rows = [
+            (
+                run_id,
+                attempt_id,
+                item.platform.value,
+                item.source_keyword,
+                observed_at,
+                item.platform.value,
+                item.content_id,
+            )
+            for item in items
+        ]
+        if not rows:
+            return
         with self.connect() as connection:
-            for item in items:
-                row = connection.execute(
-                    """
-                    SELECT id FROM content_items
-                    WHERE platform = ? AND platform_content_id = ?
-                    """,
-                    (item.platform.value, item.content_id),
-                ).fetchone()
-                if row is None:
-                    continue
-                connection.execute(
-                    """
-                    INSERT INTO scan_run_contents(
-                        run_id, attempt_id, content_item_id, platform,
-                        source_keyword, observed_at
-                    ) VALUES (?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(attempt_id, content_item_id, source_keyword) DO UPDATE SET
-                        observed_at = excluded.observed_at
-                    """,
-                    (
-                        run_id,
-                        attempt_id,
-                        row["id"],
-                        item.platform.value,
-                        item.source_keyword,
-                        observed_at,
-                    ),
+            connection.executemany(
+                """
+                INSERT INTO scan_run_contents(
+                    run_id, attempt_id, content_item_id, platform,
+                    source_keyword, observed_at
                 )
+                SELECT ?, ?, ci.id, ?, ?, ?
+                FROM content_items ci
+                WHERE ci.platform = ? AND ci.platform_content_id = ?
+                ON CONFLICT(attempt_id, content_item_id, source_keyword) DO UPDATE SET
+                    observed_at = excluded.observed_at
+                """,
+                rows,
+            )
 
     def review_assessment(
         self,
@@ -1242,7 +1262,7 @@ class Storage:
         return cursor.rowcount
 
     @staticmethod
-    def _content_for_assessment_dict(row: sqlite3.Row) -> dict[str, object]:
+    def _content_for_assessment_dict(row: sqlite3.Row) -> dict[str, Any]:
         result = dict(row)
         result["brand_names"] = str(result.get("brand_names") or "").split("\x1f")
         result["metrics"] = json.loads(str(result.pop("metrics_json")))
@@ -1250,7 +1270,7 @@ class Storage:
         return result
 
     @staticmethod
-    def _assessment_dict(row: sqlite3.Row) -> dict[str, object]:
+    def _assessment_dict(row: sqlite3.Row) -> dict[str, Any]:
         result = dict(row)
         result["brand_names"] = str(result.get("brand_names") or "").split("\x1f")
         result["matched_signals"] = json.loads(str(result.pop("matched_signals_json")))
@@ -1266,7 +1286,7 @@ class Storage:
         trigger: str,
         platforms: list[str],
         brands: list[str],
-        options: dict[str, object],
+        options: dict[str, Any],
         title: str | None = None,
         note: str = "",
     ) -> int:
@@ -1294,7 +1314,7 @@ class Storage:
                     now,
                 ),
             )
-        return int(cursor.lastrowid)
+        return int(cursor.lastrowid or 0)
 
     def recover_stale_scan_runs(self, *, timeout_minutes: int = 30) -> int:
         """Close abandoned runs left by a crashed worker or desktop process."""
@@ -1309,8 +1329,12 @@ class Storage:
                     error_message = CASE WHEN error_message = ''
                         THEN '任务进程中断，未完成部分未继续执行' ELSE error_message END
                 WHERE status = 'running' AND started_at < ?
+                  AND NOT EXISTS (
+                    SELECT 1 FROM task_leases
+                    WHERE name = 'scan' AND expires_at > ?
+                  )
                 """,
-                (now, cutoff_iso),
+                (now, cutoff_iso, now),
             )
         return cursor.rowcount
 
@@ -1399,10 +1423,12 @@ class Storage:
         detailed: int = 0,
         media_items: int = 0,
         error_message: str = "",
-        classification_summary: dict[str, object] | None = None,
-        model_summary: dict[str, object] | None = None,
+        note: str = "",
+        classification_summary: dict[str, Any] | None = None,
+        model_summary: dict[str, Any] | None = None,
     ) -> None:
         now = datetime.now(UTC).isoformat()
+        clean_note = note.strip()[:2000]
         with self.connect() as connection:
             connection.execute(
                 """
@@ -1411,6 +1437,7 @@ class Storage:
                     scanned_count = ?, filtered_count = ?, inserted_count = ?,
                     updated_count = ?, succeeded_count = ?, failed_count = ?, error_message = ?,
                     suspected_count = ?, detailed_count = ?, media_count = ?,
+                    note = CASE WHEN ? = '' THEN note ELSE ? END,
                     classification_json = ?, model_summary_json = ?
                 WHERE id = ?
                 """,
@@ -1428,6 +1455,8 @@ class Storage:
                     suspected,
                     detailed,
                     media_items,
+                    clean_note,
+                    clean_note,
                     json.dumps(classification_summary or {}, ensure_ascii=False),
                     json.dumps(model_summary or {}, ensure_ascii=False),
                     run_id,
@@ -1452,7 +1481,7 @@ class Storage:
                 """,
                 (run_id, platform, keyword, attempt_no, now),
             )
-        return int(cursor.lastrowid)
+        return int(cursor.lastrowid or 0)
 
     def finish_scan_attempt(
         self,
@@ -1509,34 +1538,37 @@ class Storage:
     ) -> int:
         """Persist lightweight search hits before admission filtering."""
         now = datetime.now(UTC).isoformat()
-        count = 0
+        rows = [
+            (
+                run_id,
+                attempt_id,
+                item.platform.value,
+                item.source_keyword,
+                item.content_id,
+                item.url,
+                item.title,
+                item.author_name,
+                json.dumps(item.raw_data, ensure_ascii=False, sort_keys=True),
+                now,
+            )
+            for item in items
+        ]
+        if not rows:
+            return 0
         with self.connect() as connection:
-            for item in items:
-                connection.execute(
-                    """
-                    INSERT INTO scan_candidates(
-                        run_id, attempt_id, platform, keyword, platform_content_id,
-                        url, title, author_name, raw_json, status, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'discovered', ?)
-                    ON CONFLICT(attempt_id, platform_content_id) DO UPDATE SET
-                        url = excluded.url, title = excluded.title,
-                        author_name = excluded.author_name, raw_json = excluded.raw_json
-                    """,
-                    (
-                        run_id,
-                        attempt_id,
-                        item.platform.value,
-                        item.source_keyword,
-                        item.content_id,
-                        item.url,
-                        item.title,
-                        item.author_name,
-                        json.dumps(item.raw_data, ensure_ascii=False, sort_keys=True),
-                        now,
-                    ),
-                )
-                count += 1
-        return count
+            connection.executemany(
+                """
+                INSERT INTO scan_candidates(
+                    run_id, attempt_id, platform, keyword, platform_content_id,
+                    url, title, author_name, raw_json, status, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'discovered', ?)
+                ON CONFLICT(attempt_id, platform_content_id) DO UPDATE SET
+                    url = excluded.url, title = excluded.title,
+                    author_name = excluded.author_name, raw_json = excluded.raw_json
+                """,
+                rows,
+            )
+        return len(rows)
 
     def mark_scan_candidates(
         self,
@@ -1545,28 +1577,30 @@ class Storage:
         admitted_content_ids: Iterable[str],
         filter_reason: str = "未达到入库条件",
     ) -> int:
-        admitted = {str(value) for value in admitted_content_ids}
+        admitted = sorted({str(value) for value in admitted_content_ids})
+        placeholders = ", ".join("?" for _ in admitted)
+        updated = 0
         with self.connect() as connection:
-            rows = connection.execute(
-                "SELECT id, platform_content_id FROM scan_candidates WHERE attempt_id = ?",
-                (attempt_id,),
-            ).fetchall()
-            updated = 0
-            for row in rows:
-                is_admitted = str(row["platform_content_id"]) in admitted
+            if admitted:
                 cursor = connection.execute(
-                    """
+                    f"""
                     UPDATE scan_candidates
-                    SET status = ?, filter_reason = ?
-                    WHERE id = ?
+                    SET status = 'admitted', filter_reason = ''
+                    WHERE attempt_id = ? AND platform_content_id IN ({placeholders})
                     """,
-                    (
-                        "admitted" if is_admitted else "filtered",
-                        "" if is_admitted else filter_reason,
-                        row["id"],
-                    ),
+                    (attempt_id, *admitted),
                 )
                 updated += cursor.rowcount
+            filtered_clause = f"AND platform_content_id NOT IN ({placeholders})" if admitted else ""
+            cursor = connection.execute(
+                f"""
+                UPDATE scan_candidates
+                SET status = 'filtered', filter_reason = ?
+                WHERE attempt_id = ? {filtered_clause}
+                """,
+                (filter_reason, attempt_id, *admitted),
+            )
+            updated += cursor.rowcount
         return updated
 
     def create_alert(
@@ -1602,7 +1636,7 @@ class Storage:
                     now,
                 ),
             )
-            alert_id = int(cursor.lastrowid)
+            alert_id = int(cursor.lastrowid or 0)
             self._upsert_notification(
                 connection,
                 kind="runtime_alert",
@@ -1615,7 +1649,7 @@ class Storage:
             )
         return alert_id
 
-    def list_scan_runs(self, *, limit: int = 20) -> list[dict[str, object]]:
+    def list_scan_runs(self, *, limit: int = 20) -> list[dict[str, Any]]:
         with self.connect() as connection:
             rows = connection.execute(
                 """
@@ -1629,7 +1663,7 @@ class Storage:
             ).fetchall()
         return [self._scan_run_dict(row) for row in rows]
 
-    def get_scan_run(self, run_id: int) -> dict[str, object] | None:
+    def get_scan_run(self, run_id: int) -> dict[str, Any] | None:
         with self.connect() as connection:
             run_row = connection.execute(
                 "SELECT * FROM scan_runs WHERE id = ?",
@@ -1650,7 +1684,7 @@ class Storage:
         result["content_count"] = int(content_count)
         return result
 
-    def list_scan_run_choices(self, *, limit: int = 30) -> list[dict[str, object]]:
+    def list_scan_run_choices(self, *, limit: int = 30) -> list[dict[str, Any]]:
         with self.connect() as connection:
             rows = connection.execute(
                 """
@@ -1669,7 +1703,7 @@ class Storage:
         unacknowledged_only: bool = False,
         limit: int = 50,
         run_id: int | None = None,
-    ) -> list[dict[str, object]]:
+    ) -> list[dict[str, Any]]:
         conditions: list[str] = []
         parameters: list[object] = []
         if unacknowledged_only:
@@ -1703,7 +1737,7 @@ class Storage:
         *,
         unread_only: bool = False,
         limit: int = 100,
-    ) -> list[dict[str, object]]:
+    ) -> list[dict[str, Any]]:
         query = "SELECT * FROM app_notifications"
         if unread_only:
             query += " WHERE read_at IS NULL"
@@ -1739,7 +1773,7 @@ class Storage:
                 """,
                 (severity, clean_title, clean_message, uuid.uuid4().hex, now, read_at),
             )
-        return int(cursor.lastrowid)
+        return int(cursor.lastrowid or 0)
 
     def update_notification(
         self,
@@ -1804,7 +1838,7 @@ class Storage:
             )
         return cursor.rowcount > 0
 
-    def get_schedule_config(self) -> dict[str, object]:
+    def get_schedule_config(self) -> dict[str, Any]:
         with self.connect() as connection:
             row = connection.execute("SELECT * FROM schedule_config WHERE id = 1").fetchone()
         if row is None:
@@ -1878,7 +1912,7 @@ class Storage:
                 ),
             )
 
-    def get_wecom_config(self) -> dict[str, object]:
+    def get_wecom_config(self) -> dict[str, Any]:
         with self.connect() as connection:
             row = connection.execute("SELECT * FROM wecom_config WHERE id = 1").fetchone()
         if row is None:
@@ -1890,7 +1924,7 @@ class Storage:
             }
         return {**dict(row), "enabled": bool(row["enabled"])}
 
-    def get_llm_config(self) -> dict[str, object]:
+    def get_llm_config(self) -> dict[str, Any]:
         with self.connect() as connection:
             row = connection.execute("SELECT * FROM llm_config WHERE id = 1").fetchone()
         if row is None:
@@ -1910,7 +1944,7 @@ class Storage:
             result["capabilities"] = {}
         return result
 
-    def save_llm_capabilities(self, capabilities: dict[str, object]) -> None:
+    def save_llm_capabilities(self, capabilities: dict[str, Any]) -> None:
         now = datetime.now(UTC).isoformat()
         with self.connect() as connection:
             connection.execute(
@@ -2019,7 +2053,7 @@ class Storage:
                 ),
             )
 
-    def get_daily_report(self, report_date: str) -> dict[str, object] | None:
+    def get_daily_report(self, report_date: str) -> dict[str, Any] | None:
         with self.connect() as connection:
             row = connection.execute(
                 "SELECT * FROM daily_reports WHERE report_date = ?",
@@ -2157,7 +2191,7 @@ class Storage:
         )
 
     @staticmethod
-    def _scan_run_dict(row: sqlite3.Row) -> dict[str, object]:
+    def _scan_run_dict(row: sqlite3.Row) -> dict[str, Any]:
         result = dict(row)
         for key in ("platforms_json", "brands_json", "options_json"):
             result[key.removesuffix("_json")] = json.loads(str(result.pop(key)))
@@ -2202,7 +2236,7 @@ class Storage:
                     (brand["id"], clean_name, now, now),
                 )
 
-    def list_brands(self, *, enabled_only: bool = False) -> list[dict[str, object]]:
+    def list_brands(self, *, enabled_only: bool = False) -> list[dict[str, Any]]:
         query = "SELECT id, name, enabled, created_at, updated_at FROM brands"
         parameters: tuple[object, ...] = ()
         if enabled_only:
@@ -2282,7 +2316,7 @@ class Storage:
         *,
         brand_name: str | None = None,
         enabled_only: bool = False,
-    ) -> list[dict[str, object]]:
+    ) -> list[dict[str, Any]]:
         conditions: list[str] = []
         parameters: list[object] = []
         if brand_name is not None:
@@ -2305,7 +2339,7 @@ class Storage:
             ).fetchall()
         return [{**dict(row), "enabled": bool(row["enabled"])} for row in rows]
 
-    def list_scan_targets(self) -> list[dict[str, object]]:
+    def list_scan_targets(self) -> list[dict[str, Any]]:
         return self.list_keywords(enabled_only=True)
 
     def rename_keyword(self, keyword_id: int, new_keyword: str) -> bool:
@@ -2358,7 +2392,7 @@ class Storage:
             raise RuntimeError("账号写入后无法读取主键")
         return int(row["id"])
 
-    def list_accounts(self, *, enabled_only: bool = False) -> list[dict[str, object]]:
+    def list_accounts(self, *, enabled_only: bool = False) -> list[dict[str, Any]]:
         query = "SELECT * FROM platform_accounts"
         parameters: tuple[object, ...] = ()
         if enabled_only:
@@ -2369,11 +2403,11 @@ class Storage:
             rows = connection.execute(query, parameters).fetchall()
         return [{**dict(row), "enabled": bool(row["enabled"])} for row in rows]
 
-    def get_scan_account(self, platform: str) -> dict[str, object] | None:
+    def get_scan_account(self, platform: str) -> dict[str, Any] | None:
         accounts = self.list_scan_accounts(platform)
         return accounts[0] if accounts else None
 
-    def list_scan_accounts(self, platform: str) -> list[dict[str, object]]:
+    def list_scan_accounts(self, platform: str) -> list[dict[str, Any]]:
         """Return healthy accounts in least-recently-checked order."""
         accounts = [
             item
@@ -2416,6 +2450,7 @@ class Storage:
         inserted = 0
         updated = 0
         now = datetime.now(UTC).isoformat()
+        brand_ids: dict[str, int] = {}
         with self.connect() as connection:
             for item in items:
                 existing = connection.execute(
@@ -2430,7 +2465,7 @@ class Storage:
                     item.raw_data,
                 )
 
-                connection.execute(
+                content_row = connection.execute(
                     """
                     INSERT INTO content_items(
                         platform, platform_content_id, url, title, author_name,
@@ -2451,6 +2486,7 @@ class Storage:
                         metrics_json = excluded.metrics_json,
                         raw_json = excluded.raw_json,
                         last_seen_at = excluded.last_seen_at
+                    RETURNING id
                     """,
                     (
                         item.platform.value,
@@ -2465,30 +2501,27 @@ class Storage:
                         item.discovered_at,
                         now,
                     ),
-                )
-                content_row = connection.execute(
-                    """
-                    SELECT id FROM content_items
-                    WHERE platform = ? AND platform_content_id = ?
-                    """,
-                    (item.platform.value, item.content_id),
                 ).fetchone()
                 if content_row is None:
                     raise RuntimeError("内容写入后无法读取主键")
 
                 matched_brand = item.brand_name or item.source_keyword
-                brand_row = connection.execute(
-                    "SELECT id FROM brands WHERE name = ?",
-                    (matched_brand,),
-                ).fetchone()
-                if brand_row is None:
-                    self._insert_brand(connection, matched_brand, now)
+                brand_id = brand_ids.get(matched_brand)
+                if brand_id is None:
                     brand_row = connection.execute(
                         "SELECT id FROM brands WHERE name = ?",
                         (matched_brand,),
                     ).fetchone()
-                if brand_row is None:
-                    raise RuntimeError("品牌写入后无法读取主键")
+                    if brand_row is None:
+                        self._insert_brand(connection, matched_brand, now)
+                        brand_row = connection.execute(
+                            "SELECT id FROM brands WHERE name = ?",
+                            (matched_brand,),
+                        ).fetchone()
+                    if brand_row is None:
+                        raise RuntimeError("品牌写入后无法读取主键")
+                    brand_id = int(brand_row["id"])
+                    brand_ids[matched_brand] = brand_id
 
                 connection.execute(
                     """
@@ -2499,7 +2532,7 @@ class Storage:
                     ON CONFLICT(content_item_id, brand_id, source_keyword) DO UPDATE SET
                         last_matched_at = excluded.last_matched_at
                     """,
-                    (content_row["id"], brand_row["id"], item.source_keyword, now, now),
+                    (content_row["id"], brand_id, item.source_keyword, now, now),
                 )
                 if existing is None:
                     inserted += 1
@@ -2533,9 +2566,9 @@ class Storage:
     @staticmethod
     def _merge_raw_data(
         existing_json: str | None,
-        incoming: dict[str, object],
-    ) -> dict[str, object]:
-        existing: dict[str, object] = {}
+        incoming: dict[str, Any],
+    ) -> dict[str, Any]:
+        existing: dict[str, Any] = {}
         if existing_json:
             try:
                 decoded = json.loads(existing_json)
