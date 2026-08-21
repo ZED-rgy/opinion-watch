@@ -620,6 +620,7 @@ class SchedulerPage(QWidget):
             legacy_weekday = int(self.app_settings.value("schedule_weekday", 0))
             legacy_interval = int(self.app_settings.value("interval_minutes", 60))
             legacy_mode = str(self.app_settings.value("scan_mode", "quick"))
+            legacy_concurrency = int(self.app_settings.value("scan_concurrency", 1))
             legacy_enabled = str(self.app_settings.value("auto_enabled", "false")).lower() == "true"
             self.schedule_service.save(
                 enabled=legacy_enabled,
@@ -630,6 +631,7 @@ class SchedulerPage(QWidget):
                 weekday=max(0, min(6, legacy_weekday)),
                 interval_minutes=max(5, min(1440, legacy_interval)),
                 scan_mode=legacy_mode if legacy_mode in {"quick", "deep"} else "quick",
+                concurrency=max(1, min(4, legacy_concurrency)),
                 legacy_imported=True,
             )
             schedule_config = self.schedule_service.load()
@@ -672,7 +674,7 @@ class SchedulerPage(QWidget):
 
         hero = QFrame()
         hero.setObjectName("hero")
-        hero.setMinimumHeight(190)
+        hero.setMinimumHeight(230)
         hero_layout = QHBoxLayout(hero)
         hero_layout.setContentsMargins(24, 22, 24, 22)
         hero_layout.setSpacing(22)
@@ -729,6 +731,12 @@ class SchedulerPage(QWidget):
         saved_scan_mode = str(schedule_config.get("scan_mode") or "quick")
         scan_mode_index = self.scan_mode.findData(saved_scan_mode)
         self.scan_mode.setCurrentIndex(scan_mode_index if scan_mode_index >= 0 else 0)
+        self.concurrency = QSpinBox()
+        self.concurrency.setRange(1, 4)
+        self.concurrency.setValue(max(1, min(4, int(schedule_config.get("concurrency") or 1))))
+        self.concurrency.setToolTip(
+            "每个并发页面使用同一个已登录账号档案；建议先保持 1，过高可能触发平台验证。"
+        )
         controls.addWidget(self.auto_enabled, 0, 0, 1, 2)
         frequency_label = QLabel("巡检频次")
         frequency_label.setObjectName("muted")
@@ -750,6 +758,10 @@ class SchedulerPage(QWidget):
         scan_mode_label.setObjectName("muted")
         controls.addWidget(scan_mode_label, 5, 0)
         controls.addWidget(self.scan_mode, 5, 1)
+        concurrency_label = QLabel("并发页面（默认 1）")
+        concurrency_label.setObjectName("muted")
+        controls.addWidget(concurrency_label, 6, 0)
+        controls.addWidget(self.concurrency, 6, 1)
         self.update_schedule_controls()
         hero_layout.addLayout(controls)
         root.addWidget(hero)
@@ -861,6 +873,7 @@ class SchedulerPage(QWidget):
         self.weekday.currentIndexChanged.connect(lambda _index: self.save_schedule())
         self.interval.valueChanged.connect(lambda _value: self.save_schedule())
         self.scan_mode.currentIndexChanged.connect(lambda _index: self.save_scan_mode())
+        self.concurrency.valueChanged.connect(lambda _value: self.save_scan_mode())
         self.timer.timeout.connect(self.scheduled_scan)
         self.process.readyReadStandardOutput.connect(self.read_output)
         self.process.readyReadStandardError.connect(self.read_error)
@@ -906,6 +919,7 @@ class SchedulerPage(QWidget):
             weekday=int(self.weekday.currentData()),
             interval_minutes=self.interval.value(),
             scan_mode=str(self.scan_mode.currentData()),
+            concurrency=self.concurrency.value(),
             last_scheduled_at=(
                 last_value.isoformat()
                 if isinstance(last_value, datetime)
@@ -931,6 +945,7 @@ class SchedulerPage(QWidget):
                 "schedule_time": self.schedule_time.time().toString("HH:mm"),
                 "weekday": self.weekday.currentData(),
                 "interval_minutes": self.interval.value(),
+                "concurrency": self.concurrency.value(),
             },
             now,
         )
@@ -1016,6 +1031,8 @@ class SchedulerPage(QWidget):
                 "5",
                 "--brand-delay-seconds",
                 "5",
+                "--concurrency",
+                str(self.concurrency.value()),
                 "--trigger",
                 trigger,
             ]
@@ -2268,7 +2285,10 @@ class SettingsPage(QWidget):
         version, version_layout = _surface()
         version_layout.addWidget(_title("版本信息", "sectionTitle"))
         version_layout.addWidget(QLabel("品牌舆情监控  v0.2.0"))
-        note = QLabel("账号级 Qt 登录档案与自动巡检档案的直接接入仍在迁移中。")
+        note = QLabel(
+            "自动巡检与平台账号页使用同一个独立 Playwright 登录档案；请在“打开自动巡检浏览器”"
+            "中完成登录，不要使用普通 Chrome 个人档案代替。"
+        )
         note.setObjectName("muted")
         version_layout.addWidget(note)
         root.addWidget(version)

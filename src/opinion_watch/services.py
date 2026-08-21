@@ -25,6 +25,7 @@ class ScheduleService:
             weekday=int(str(values["weekday"])),
             interval_minutes=int(str(values["interval_minutes"])),
             scan_mode=str(values["scan_mode"]),
+            concurrency=int(str(values.get("concurrency") or 1)),
             last_scheduled_at=(
                 str(values["last_scheduled_at"]) if values.get("last_scheduled_at") else None
             ),

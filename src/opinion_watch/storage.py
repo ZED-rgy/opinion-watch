@@ -375,6 +375,7 @@ class Storage:
                     weekday INTEGER NOT NULL DEFAULT 0,
                     interval_minutes INTEGER NOT NULL DEFAULT 60,
                     scan_mode TEXT NOT NULL DEFAULT 'quick',
+                    concurrency INTEGER NOT NULL DEFAULT 1,
                     last_scheduled_at TEXT,
                     next_run_at TEXT,
                     missed_run_policy TEXT NOT NULL DEFAULT 'run_once',
@@ -408,6 +409,13 @@ class Storage:
                 except sqlite3.OperationalError as exc:
                     if "duplicate column name" not in str(exc).lower():
                         raise
+            try:
+                connection.execute(
+                    "ALTER TABLE schedule_config ADD COLUMN concurrency INTEGER NOT NULL DEFAULT 1"
+                )
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc).lower():
+                    raise
             for column, definition in (
                 ("suspected_count", "INTEGER NOT NULL DEFAULT 0"),
                 ("detailed_count", "INTEGER NOT NULL DEFAULT 0"),
@@ -1815,6 +1823,7 @@ class Storage:
         weekday: int,
         interval_minutes: int,
         scan_mode: str,
+        concurrency: int = 1,
         last_scheduled_at: str | None = None,
         next_run_at: str | None = None,
         missed_run_policy: str = "run_once",
@@ -1828,15 +1837,17 @@ class Storage:
             raise ValueError("执行日必须在周一到周日之间")
         if not 5 <= interval_minutes <= 1440:
             raise ValueError("巡检间隔必须在 5 到 1440 分钟之间")
+        if not 1 <= concurrency <= 4:
+            raise ValueError("并发页面数必须在 1 到 4 之间")
         now = datetime.now(UTC).isoformat()
         with self.connect() as connection:
             connection.execute(
                 """
                 INSERT INTO schedule_config(
                     id, enabled, frequency, schedule_time, weekday, interval_minutes,
-                    scan_mode, last_scheduled_at, next_run_at, missed_run_policy,
+                    scan_mode, concurrency, last_scheduled_at, next_run_at, missed_run_policy,
                     legacy_imported, updated_at
-                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     enabled = excluded.enabled,
                     frequency = excluded.frequency,
@@ -1844,6 +1855,7 @@ class Storage:
                     weekday = excluded.weekday,
                     interval_minutes = excluded.interval_minutes,
                     scan_mode = excluded.scan_mode,
+                    concurrency = excluded.concurrency,
                     last_scheduled_at = excluded.last_scheduled_at,
                     next_run_at = excluded.next_run_at,
                     missed_run_policy = excluded.missed_run_policy,
@@ -1857,6 +1869,7 @@ class Storage:
                     weekday,
                     interval_minutes,
                     scan_mode,
+                    concurrency,
                     last_scheduled_at,
                     next_run_at,
                     missed_run_policy,

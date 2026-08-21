@@ -16,6 +16,7 @@ class XiaohongshuCollector(BaseCollector):
         'header [class*="avatar" i]',
         'header img[alt*="头像"]',
     )
+    login_required_phrases = ("登录后查看搜索结果", "登录后查看")
     _content_pattern = re.compile(r"/(?:explore|discovery/item|search_result)/([0-9a-fA-F]{16,32})")
     content_link_selector = 'a.title[href*="/search_result/"]'
     title_selectors = (

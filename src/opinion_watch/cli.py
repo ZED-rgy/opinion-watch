@@ -6,7 +6,10 @@ import json
 import sys
 import uuid
 from collections.abc import Sequence
+from contextlib import suppress
 from datetime import UTC, datetime
+
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from opinion_watch.browser import BrowserProfileLocked, BrowserSession
 from opinion_watch.classification import classify_batch
@@ -206,6 +209,12 @@ def _add_scan_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--retries", type=int, default=1)
     parser.add_argument("--retry-delay-seconds", type=float, default=5)
     parser.add_argument("--brand-delay-seconds", type=float, default=3)
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=1,
+        help="同一账号档案内并发采集页面数，默认 1，建议先保持默认值",
+    )
     parser.add_argument("--headless", action="store_true")
 
 
@@ -267,7 +276,14 @@ async def _login(
             await page.goto(collector.home_url, wait_until="domcontentloaded", timeout=60_000)
             print(f"已打开 {platform.value}。请在浏览器中完成登录。")
             await asyncio.to_thread(input, "登录完成后回到此处按回车关闭浏览器：")
-            status = await collector.session_status(page, session.active_context)
+            status = SessionStatus.LOGIN_REQUIRED
+            for check_no in range(3):
+                status = await collector.session_status(page, session.active_context)
+                if status is SessionStatus.HEALTHY or check_no == 2:
+                    break
+                await page.wait_for_timeout(1_000)
+                with suppress(PlaywrightTimeoutError):
+                    await page.reload(wait_until="domcontentloaded", timeout=30_000)
             if account is not None:
                 storage.update_account_status(
                     int(account["id"]), "ready" if status is SessionStatus.HEALTHY else status.value
@@ -410,6 +426,7 @@ async def _scan(
     retries: int,
     retry_delay_seconds: float,
     brand_delay_seconds: float,
+    concurrency: int,
     trigger: str = "manual",
 ) -> int:
     resolved_limit = limit if limit is not None else (50 if mode == "deep" else 20)
@@ -426,6 +443,7 @@ async def _scan(
             retries=retries,
             retry_delay_seconds=retry_delay_seconds,
             brand_delay_seconds=brand_delay_seconds,
+            concurrency=concurrency,
             headless=headless,
         ),
         trigger=trigger,
@@ -455,6 +473,7 @@ async def _watch(settings: Settings, storage: Storage, args: argparse.Namespace)
             args.retries,
             args.retry_delay_seconds,
             args.brand_delay_seconds,
+            args.concurrency,
             trigger="watch",
         )
         exit_code = max(exit_code, current_code)
@@ -808,6 +827,7 @@ async def run(args: argparse.Namespace) -> int:
             args.retries,
             args.retry_delay_seconds,
             args.brand_delay_seconds,
+            args.concurrency,
             trigger=args.trigger,
         )
     if args.command == "watch":

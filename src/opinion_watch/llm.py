@@ -22,6 +22,8 @@ class LLMConfigurationError(LLMError):
 
 
 _API_KEY_PATTERN = re.compile(r"(?i)sk-[a-z0-9_*.-]{8,}")
+_REQUEST_TIMEOUT_SECONDS = 30
+_MAX_PARALLEL_REQUESTS = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,7 +165,7 @@ class LLMClient:
             method="POST",
         )
         try:
-            with urlopen(request, timeout=60) as response:
+            with urlopen(request, timeout=_REQUEST_TIMEOUT_SECONDS) as response:
                 raw = response.read().decode("utf-8")
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:500]
@@ -177,7 +179,7 @@ class LLMClient:
         except URLError as exc:
             raise LLMError(f"大模型接口连接失败：{exc.reason}") from exc
         except TimeoutError as exc:
-            raise LLMError("大模型接口请求超时") from exc
+            raise LLMError(f"大模型接口请求超时（{_REQUEST_TIMEOUT_SECONDS} 秒）") from exc
         try:
             data = json.loads(raw)
             content = data["choices"][0]["message"]["content"]
@@ -364,6 +366,23 @@ def _content_key(content: dict[str, object]) -> str:
     return f"{platform}:{content_id}"
 
 
+async def _assess_many(
+    client: LLMClient,
+    contents: list[dict[str, object]],
+) -> list[LLMAssessment | Exception]:
+    """评估候选内容并发执行，避免一个慢请求拖住整批巡检。"""
+    semaphore = asyncio.Semaphore(min(_MAX_PARALLEL_REQUESTS, max(1, len(contents))))
+
+    async def assess_one(content: dict[str, object]) -> LLMAssessment | Exception:
+        try:
+            async with semaphore:
+                return await client.assess(content)
+        except Exception as exc:
+            return exc
+
+    return list(await asyncio.gather(*(assess_one(content) for content in contents)))
+
+
 async def screen_items_with_llm(
     storage: Storage,
     contents: list[dict[str, object]],
@@ -383,12 +402,13 @@ async def screen_items_with_llm(
     candidates = contents[:max_candidates]
     assessments: dict[str, LLMAssessment] = {}
     errors: list[str] = []
-    for content in candidates:
-        try:
-            assessments[_content_key(content)] = await client.assess(content)
-        except Exception as exc:
+    results = await _assess_many(client, candidates)
+    for content, result in zip(candidates, results, strict=True):
+        if isinstance(result, Exception):
             if len(errors) < 3:
-                errors.append(str(exc)[:300])
+                errors.append(str(result)[:300])
+        else:
+            assessments[_content_key(content)] = result
     return assessments, errors, len(candidates)
 
 
@@ -412,9 +432,12 @@ async def classify_with_llm(
     processed = 0
     failed = 0
     errors: list[str] = []
-    for content in candidates:
+    results = await _assess_many(client, candidates)
+    for content, result in zip(candidates, results, strict=True):
         try:
-            assessment = await client.assess(content)
+            if isinstance(result, Exception):
+                raise result
+            assessment = result
             storage.upsert_assessment(
                 content_item_id=int(content["id"]),
                 category=assessment.category.value,

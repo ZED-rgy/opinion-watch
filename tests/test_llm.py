@@ -145,7 +145,7 @@ def test_llm_client_uses_openai_compatible_chat_endpoint(monkeypatch) -> None:
     assert captured == {
         "url": "https://example.test/v1/chat/completions",
         "authorization": "Bearer key",
-        "timeout": 60,
+        "timeout": 30,
     }
 
 

@@ -68,6 +68,35 @@ def test_session_status_accepts_visible_authenticated_avatar_when_cookie_name_ch
     assert status is SessionStatus.HEALTHY
 
 
+def test_xiaohongshu_search_login_modal_with_session_cookie_is_verification() -> None:
+    class FakeLocator:
+        first = None
+
+        async def inner_text(self, timeout: int) -> str:
+            return "登录后查看搜索结果"
+
+        async def count(self) -> int:
+            return 0
+
+        async def is_visible(self) -> bool:
+            return False
+
+    class FakePage:
+        url = "https://www.xiaohongshu.com/search_result?keyword=速探长"
+
+        def locator(self, selector: str) -> FakeLocator:
+            return FakeLocator()
+
+    class FakeContext:
+        async def cookies(self) -> list[dict[str, str]]:
+            return [{"name": "web_session"}]
+
+    status = asyncio.run(
+        XiaohongshuCollector().session_status(FakePage(), FakeContext())  # type: ignore[arg-type]
+    )
+    assert status is SessionStatus.VERIFICATION_REQUIRED
+
+
 def test_canonical_url_removes_rotating_query_parameters() -> None:
     collector = XiaohongshuCollector()
 

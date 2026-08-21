@@ -32,6 +32,7 @@ class ScanOptions:
     retries: int = 1
     retry_delay_seconds: float = 5
     brand_delay_seconds: float = 3
+    concurrency: int = 1
     headless: bool = False
 
     def validate(self) -> None:
@@ -50,6 +51,8 @@ class ScanOptions:
             raise ValueError("retry-delay-seconds 必须在 0 到 3600 之间")
         if not 0 <= self.brand_delay_seconds <= 3600:
             raise ValueError("brand-delay-seconds 必须在 0 到 3600 之间")
+        if not 1 <= self.concurrency <= 4:
+            raise ValueError("concurrency 必须在 1 到 4 之间")
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -394,9 +397,45 @@ async def _run_scan_locked(
                         )
                         continue
                     storage.update_account_status(int(account["id"]), "ready")
+                    prefetched_search: dict[str, list[CollectedContent] | Exception] = {}
+                    if options.concurrency > 1 and len(targets) > 1:
+                        # Keep one persistent profile/context per account, but use
+                        # separate tabs for independent keyword searches. This is
+                        # safe for the current account lease and avoids opening the
+                        # same Chrome profile from multiple processes.
+                        prefetch_semaphore = asyncio.Semaphore(options.concurrency)
+
+                        async def prefetch_target(
+                            target: dict[str, object],
+                            *,
+                            semaphore: asyncio.Semaphore = prefetch_semaphore,
+                            cache: dict[str, list[CollectedContent] | Exception] = (
+                                prefetched_search
+                            ),
+                            target_collector=collector,
+                        ) -> None:
+                            brand = str(target["brand_name"])
+                            keyword = str(target["keyword"])
+                            cache_key = f"{brand}\x00{keyword}"
+                            async with semaphore:
+                                prefetch_page = await session.active_context.new_page()
+                                try:
+                                    cache[cache_key] = await target_collector.search(
+                                        prefetch_page,
+                                        session.active_context,
+                                        keyword,
+                                        limit=options.limit,
+                                    )
+                                except Exception as exc:
+                                    cache[cache_key] = exc
+                                finally:
+                                    await prefetch_page.close()
+
+                        await asyncio.gather(*(prefetch_target(target) for target in targets))
                     for target_index, target in enumerate(targets):
                         brand = str(target["brand_name"])
                         keyword = str(target["keyword"])
+                        cached_search = prefetched_search.pop(f"{brand}\x00{keyword}", None)
                         platform_blocked = False
                         for attempt_no in range(1, options.retries + 2):
                             attempt_id = storage.create_scan_attempt(
@@ -406,12 +445,21 @@ async def _run_scan_locked(
                                 attempt_no=attempt_no,
                             )
                             try:
-                                search_items = await collector.search(
-                                    page,
-                                    session.active_context,
-                                    keyword,
-                                    limit=options.limit,
-                                )
+                                if isinstance(cached_search, Exception):
+                                    search_items = None
+                                    prefetch_error = cached_search
+                                    cached_search = None
+                                    raise prefetch_error
+                                if cached_search is not None:
+                                    search_items = cached_search
+                                    cached_search = None
+                                else:
+                                    search_items = await collector.search(
+                                        page,
+                                        session.active_context,
+                                        keyword,
+                                        limit=options.limit,
+                                    )
                                 search_items = [
                                     replace(item, brand_name=brand) for item in search_items
                                 ]

@@ -587,6 +587,7 @@ def test_schedule_config_is_persisted_across_storage_instances(tmp_path: Path) -
         weekday=4,
         interval_minutes=60,
         scan_mode="deep",
+        concurrency=2,
         last_scheduled_at="2026-08-21T09:00:00+00:00",
         next_run_at="2026-08-28T18:30:00+00:00",
     )
@@ -599,6 +600,7 @@ def test_schedule_config_is_persisted_across_storage_instances(tmp_path: Path) -
     assert config["schedule_time"] == "18:30"
     assert config["weekday"] == 4
     assert config["scan_mode"] == "deep"
+    assert config["concurrency"] == 2
     assert config["last_scheduled_at"] == "2026-08-21T09:00:00+00:00"
     assert config["next_run_at"] == "2026-08-28T18:30:00+00:00"
 

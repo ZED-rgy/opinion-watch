@@ -28,6 +28,7 @@ class BaseCollector(ABC):
     home_url: str
     authenticated_cookie_names: frozenset[str]
     authenticated_ui_selectors: tuple[str, ...] = ()
+    login_required_phrases: tuple[str, ...] = ()
     title_selectors: tuple[str, ...] = ()
     description_selectors: tuple[str, ...] = ()
     author_selectors: tuple[str, ...] = ()
@@ -68,6 +69,17 @@ class BaseCollector(ABC):
             return SessionStatus.RATE_LIMITED
         if any(phrase in body_text for phrase in self.verification_phrases):
             return SessionStatus.VERIFICATION_REQUIRED
+        if any(phrase in body_text for phrase in self.login_required_phrases):
+            # A platform can show a login modal on a search route while the
+            # account cookie is still present. Report this as a route-level
+            # verification issue instead of incorrectly marking the account
+            # itself as logged out.
+            with suppress(Exception):
+                cookies = await context.cookies()
+                names = {cookie["name"] for cookie in cookies}
+                if names.intersection(self.authenticated_cookie_names):
+                    return SessionStatus.VERIFICATION_REQUIRED
+            return SessionStatus.LOGIN_REQUIRED
 
         # Do not restrict the cookie query to one URL: platforms may scope the
         # current session cookie to a parent domain or a non-root path.
