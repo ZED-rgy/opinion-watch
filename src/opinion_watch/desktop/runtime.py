@@ -1,13 +1,64 @@
-"""桌面端运行时引导：参数解析、迁移和运行环境组装。
-
-第 7 步会把 build_parser / create_runtime 也迁到这里。
-"""
+"""桌面端运行时引导：参数解析、迁移和运行环境组装。"""
 
 from __future__ import annotations
 
+import argparse
+import os
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+
 from PySide6.QtCore import QSettings
 
+from opinion_watch.config import DEFAULT_BRANDS, Settings
 from opinion_watch.storage import Storage
+
+DESKTOP_LEASE_SECONDS = 900
+DESKTOP_HEARTBEAT_INTERVAL_MS = 300_000
+
+
+@dataclass(frozen=True, slots=True)
+class DesktopRuntime:
+    """桌面进程的运行环境；lease_owner 用于心跳与退出释放。"""
+
+    settings: Settings
+    storage: Storage
+    lease_owner: str
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="品牌舆情监控桌面应用")
+    parser.add_argument("--smoke-test", action="store_true", help="初始化界面后立即退出")
+    parser.add_argument("--screenshot", type=Path, help="保存桌面界面截图后退出")
+    parser.add_argument("--page", type=int, choices=range(6), default=0, help="启动时显示的页面")
+    parser.add_argument(
+        "--runtime-dir",
+        type=Path,
+        help="运行数据目录；开机自启时用于固定数据库位置，默认取环境变量或当前目录下 runtime",
+    )
+    return parser
+
+
+def create_runtime(runtime_dir: Path | None = None) -> DesktopRuntime:
+    if runtime_dir is not None:
+        # 写入环境变量而不是只改本进程配置：巡检 QProcess 子进程继承同一个值，
+        # 才能保证读写同一个数据库。
+        os.environ["OPINION_WATCH_RUNTIME_DIR"] = str(runtime_dir.resolve())
+    settings = Settings.from_environment()
+    settings.ensure_directories()
+    storage = Storage(settings.database_path)
+    storage.initialize()
+    storage.recover_stale_scan_runs()
+    migrate_legacy_schedule(storage)
+    owner = str(uuid.uuid4())
+    # 短租约 + 定时心跳：桌面进程崩溃后最多几分钟即可重新启动，
+    # 而不是等一个超长租约自然过期。
+    if not storage.acquire_task_lease("desktop", owner, lease_seconds=DESKTOP_LEASE_SECONDS):
+        raise RuntimeError("品牌舆情监控已经在运行，请先关闭已有窗口。")
+    if not storage.list_brands():
+        for brand in DEFAULT_BRANDS:
+            storage.add_brand(brand)
+    return DesktopRuntime(settings=settings, storage=storage, lease_owner=owner)
 
 
 def migrate_legacy_schedule(storage: Storage) -> None:

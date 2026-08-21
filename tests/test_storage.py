@@ -771,9 +771,7 @@ def test_finish_scan_run_preserves_manual_note_when_no_new_note(tmp_path: Path) 
 def test_mark_all_notifications_read_is_a_single_batch_update(tmp_path: Path) -> None:
     storage = make_storage(tmp_path)
     for index in range(3):
-        storage.create_notification(
-            severity="P3", title=f"播报 {index}", message="测试内容"
-        )
+        storage.create_notification(severity="P3", title=f"播报 {index}", message="测试内容")
     storage.create_notification(severity="P3", title="已读", message="测试内容", read=True)
 
     assert storage.count_unread_notifications() == 3

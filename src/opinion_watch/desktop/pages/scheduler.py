@@ -311,7 +311,7 @@ class SchedulerPage(QWidget):
         self.process.errorOccurred.connect(self._scan_process_error)
         self.timeline.itemSelectionChanged.connect(self._update_run_buttons)
         self.configure_timer(self.auto_enabled.isChecked())
-        self.refresh()
+        # 首次数据加载由主窗口的页面切换触发，避免启动时双重刷新。
 
     def update_schedule_controls(self) -> None:
         mode = str(self.frequency.currentData())
