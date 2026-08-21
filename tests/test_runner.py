@@ -110,7 +110,7 @@ def test_list_level_screening_marks_only_suspected_content_for_details() -> None
     assert items[1].raw_data["precheck"]["suspected"] is True
 
 
-def test_model_screening_filters_ordinary_content_before_storage(
+def test_model_screening_skips_clean_content_before_storage(
     tmp_path: Path,
     monkeypatch: object,
 ) -> None:
@@ -124,22 +124,8 @@ def test_model_screening_filters_ordinary_content_before_storage(
         source_keyword="示例品牌",
     )
 
-    async def fake_screen(_storage, contents):
-        content = contents[0]
-        return (
-            {
-                f"douyin:{content['platform_content_id']}": LLMAssessment(
-                    category=OpinionCategory.OTHER,
-                    severity=RiskSeverity.P3,
-                    confidence=0.95,
-                    rationale="普通内容",
-                    matched_signals=[],
-                    requires_review=False,
-                )
-            },
-            [],
-            1,
-        )
+    async def fake_screen(_storage, _contents):
+        raise AssertionError("clean content must not call the model")
 
     monkeypatch.setattr("opinion_watch.runner.screen_items_with_llm", fake_screen)
     admitted, candidates, stats = asyncio.run(
@@ -149,6 +135,58 @@ def test_model_screening_filters_ordinary_content_before_storage(
     assert admitted == []
     assert candidates == set()
     assert stats["filtered"] == 1
+
+
+def test_model_screening_only_sends_uncertain_content(
+    tmp_path: Path,
+    monkeypatch: object,
+) -> None:
+    storage = Storage(tmp_path / "test.db")
+    storage.initialize()
+    items = [
+        CollectedContent(
+            platform=Platform.DOUYIN,
+            content_id="clean",
+            url="https://www.douyin.com/video/clean",
+            title="示例品牌日常介绍",
+            source_keyword="示例品牌",
+        ),
+        CollectedContent(
+            platform=Platform.DOUYIN,
+            content_id="uncertain",
+            url="https://www.douyin.com/video/uncertain",
+            title="示例品牌投诉后客服不理",
+            source_keyword="示例品牌",
+        ),
+    ]
+    received: list[str] = []
+
+    async def fake_screen(_storage, contents):
+        received.extend(str(item["platform_content_id"]) for item in contents)
+        return (
+            {
+                "douyin:uncertain": LLMAssessment(
+                    category=OpinionCategory.REASONABLE_CONSUMER_COMPLAINT,
+                    severity=RiskSeverity.P2,
+                    confidence=0.9,
+                    rationale="需要复核",
+                    matched_signals=["投诉"],
+                    requires_review=True,
+                )
+            },
+            [],
+            1,
+        )
+
+    monkeypatch.setattr("opinion_watch.runner.screen_items_with_llm", fake_screen)
+    admitted, candidates, stats = asyncio.run(
+        _screen_items_for_admission(storage, items, brand="示例品牌")
+    )
+
+    assert received == ["uncertain"]
+    assert [item.content_id for item in admitted] == ["uncertain"]
+    assert candidates == {"uncertain"}
+    assert stats["model_candidates"] == 1
 
 
 def test_scan_runner_retries_transient_error_and_records_attempts(

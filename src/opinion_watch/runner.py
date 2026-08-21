@@ -100,6 +100,7 @@ def _screen_items_for_detail(
             "confidence": result.confidence,
             "matched_signals": result.matched_signals,
             "rationale": result.rationale,
+            "requires_review": result.requires_review,
         }
         screened_item = replace(item, raw_data=raw_data)
         screened.append(screened_item)
@@ -117,6 +118,19 @@ async def _screen_items_for_admission(
 ) -> tuple[list[CollectedContent], set[str], dict[str, object]]:
     """Filter ordinary search cards before they reach the operational database."""
     screened, rule_candidates = _screen_items_for_detail(items)
+    model_candidate_ids = set(rule_candidates)
+    for item in screened:
+        precheck = item.raw_data.get("precheck", {})
+        if not isinstance(precheck, dict):
+            continue
+        # Ordinary/uncertain negative content is worth a model review. Clean
+        # search cards never reach the model and are filtered by local rules.
+        if (
+            precheck.get("category") == "ordinary_grievance"
+            or bool(precheck.get("requires_review"))
+            or bool(precheck.get("matched_signals"))
+        ):
+            model_candidate_ids.add(item.content_id)
     payloads = [
         {
             "platform": item.platform.value,
@@ -128,6 +142,7 @@ async def _screen_items_for_admission(
             "raw_data": item.raw_data,
         }
         for item in screened
+        if item.content_id in model_candidate_ids
     ]
     model_assessments = {}
     model_errors: list[str] = []
@@ -196,6 +211,7 @@ async def _screen_items_for_admission(
             "filtered": len(items) - len(admitted),
             "suspected": len(detail_candidates),
             "model_attempted": model_attempted,
+            "model_candidates": len(payloads),
             "model_errors": model_errors,
         },
     )
