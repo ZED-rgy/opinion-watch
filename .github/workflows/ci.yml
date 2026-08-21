@@ -18,7 +18,7 @@ jobs:
       - run: uv sync --dev --extra desktop
       - run: uv run ruff check .
       - run: uv run ruff format --check .
-      - run: uv run mypy src/opinion_watch/events.py src/opinion_watch/scheduling.py src/opinion_watch/services.py
+      - run: uv run mypy src
       - run: uv run pytest
       - run: uv run python -m compileall -q src
       - run: uv run opinion-watch-desktop --smoke-test

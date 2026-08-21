@@ -9,10 +9,21 @@ from collections.abc import Callable
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import qtawesome as qta
-from PySide6.QtCore import QProcess, QSettings, QSize, Qt, QTime, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QFont, QPixmap
+from PySide6.QtCore import (
+    QByteArray,
+    QProcess,
+    QSettings,
+    QSize,
+    Qt,
+    QTime,
+    QTimer,
+    QUrl,
+    Signal,
+)
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QPixmap, QTextCursor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -106,7 +117,7 @@ def _windows_autostart_enabled() -> bool:
     return True
 
 
-def _set_windows_autostart(enabled: bool) -> None:
+def _set_windows_autostart(enabled: bool, runtime_dir: Path | None = None) -> None:
     if os.name != "nt":
         if enabled:
             raise RuntimeError("开机启动仅支持 Windows。")
@@ -120,6 +131,10 @@ def _set_windows_autostart(enabled: bool) -> None:
                 command = f'"{sys.executable}" -m opinion_watch.desktop'
             else:
                 command = f'"{launcher}"'
+            # 开机启动没有可控的工作目录，默认 runtime 目录相对 CWD 解析，
+            # 自启进程会连到另一个空数据库。把当前实际使用的目录固定下来。
+            if runtime_dir is not None:
+                command += f' --runtime-dir "{runtime_dir.resolve()}"'
             winreg.SetValueEx(key, "OpinionWatch", 0, winreg.REG_SZ, command)
         else:
             with suppress(FileNotFoundError):
@@ -245,7 +260,7 @@ def _icon(name: str, color: str = "#5D667A"):
 
 def _button(
     text: str,
-    callback: Callable[[], None],
+    callback: Callable[[], object],
     *,
     icon: str | None = None,
     role: str = "primary",
@@ -291,11 +306,14 @@ def _new_table(headers: list[str], *, multi_select: bool = False) -> QTableWidge
     return table
 
 
+def _decode_process_output(data: QByteArray) -> str:
+    return bytes(data.data()).decode("utf-8", "replace")
+
+
 def _selected_id(table: QTableWidget) -> int | None:
     row = table.currentRow()
-    if row < 0 or table.item(row, 0) is None:
-        return None
-    return int(table.item(row, 0).text())
+    cell = table.item(row, 0) if row >= 0 else None
+    return int(cell.text()) if cell is not None else None
 
 
 def _set_check_cell(table: QTableWidget, row: int, checked: bool = False) -> None:
@@ -343,7 +361,7 @@ def _show_error(parent: QWidget, exc: Exception) -> None:
     QMessageBox.critical(parent, "操作失败", str(exc))
 
 
-def _process_json_result(output: str) -> dict[str, object] | None:
+def _process_json_result(output: str) -> dict[str, Any] | None:
     for line in reversed(output.splitlines()):
         try:
             candidate = json.loads(line.strip())
@@ -429,7 +447,7 @@ class RunDetailDialog(QDialog):
     def __init__(
         self,
         storage: Storage,
-        run: dict[str, object],
+        run: dict[str, Any],
         diagnostic_output: str = "",
         parent: QWidget | None = None,
     ) -> None:
@@ -617,10 +635,10 @@ class SchedulerPage(QWidget):
         if not bool(schedule_config.get("legacy_imported")):
             legacy_frequency = str(self.app_settings.value("schedule_frequency", "daily"))
             legacy_time = str(self.app_settings.value("schedule_time", "09:00"))
-            legacy_weekday = int(self.app_settings.value("schedule_weekday", 0))
-            legacy_interval = int(self.app_settings.value("interval_minutes", 60))
+            legacy_weekday = int(str(self.app_settings.value("schedule_weekday", 0)))
+            legacy_interval = int(str(self.app_settings.value("interval_minutes", 60)))
             legacy_mode = str(self.app_settings.value("scan_mode", "quick"))
-            legacy_concurrency = int(self.app_settings.value("scan_concurrency", 1))
+            legacy_concurrency = int(str(self.app_settings.value("scan_concurrency", 1)))
             legacy_enabled = str(self.app_settings.value("auto_enabled", "false")).lower() == "true"
             self.schedule_service.save(
                 enabled=legacy_enabled,
@@ -641,6 +659,7 @@ class SchedulerPage(QWidget):
         self.next_run_at: datetime | None = None
         self.output_buffer: list[str] = []
         self.latest_run_id: int | None = None
+        self.current_run_id: int | None = None
 
         self.setObjectName("page")
         root = QVBoxLayout(self)
@@ -878,6 +897,7 @@ class SchedulerPage(QWidget):
         self.process.readyReadStandardOutput.connect(self.read_output)
         self.process.readyReadStandardError.connect(self.read_error)
         self.process.finished.connect(self.process_finished)
+        self.process.errorOccurred.connect(self._scan_process_error)
         self.configure_timer(self.auto_enabled.isChecked())
         self.refresh()
 
@@ -1010,11 +1030,15 @@ class SchedulerPage(QWidget):
         if self.process.state() != QProcess.ProcessState.NotRunning:
             self.run_status.setText("巡检正在运行，请勿重复启动")
             return
+        llm_enabled = bool(self.storage.get_llm_config().get("enabled"))
+        self.current_run_id = None
         self.output_buffer.clear()
         self.output.clear()
         self.output.setVisible(False)
         self.detail_button.setVisible(False)
-        self.run_status.setText("正在检索抖音和小红书…")
+        self.run_status.setText(
+            "正在检索抖音和小红书…" + ("（大模型复判已启用）" if llm_enabled else "（规则筛选）")
+        )
         self.process.setProgram(sys.executable)
         self.process.setArguments(
             [
@@ -1039,26 +1063,55 @@ class SchedulerPage(QWidget):
         )
         self.process.start()
 
+    def _scan_process_error(self, error: QProcess.ProcessError) -> None:
+        # 启动失败时 finished 不会触发，状态会一直停在“正在检索…”。
+        if error is QProcess.ProcessError.FailedToStart:
+            self.run_status.setText("巡检子进程无法启动，请检查 Python 运行环境")
+
     def read_output(self) -> None:
-        value = bytes(self.process.readAllStandardOutput()).decode("utf-8", "replace")
+        value = _decode_process_output(self.process.readAllStandardOutput())
         self.output_buffer.append(value)
-        self.output.setPlainText("".join(self.output_buffer))
+        self._append_output(value)
         for line in value.splitlines():
             event = parse_event(line)
-            if event is not None and event.get("type") == "scan.finished":
+            if event is None:
+                continue
+            if event.get("type") == "scan.started":
+                with suppress(TypeError, ValueError):
+                    self.current_run_id = int(str(event.get("run_id")))
+            elif event.get("type") == "scan.finished":
                 self.run_status.setText(
                     "巡检已完成" if event.get("status") == "succeeded" else "巡检未完成"
                 )
+            elif event.get("type") in {
+                "scan.session_status",
+                "scan.account_not_ready",
+                "scan.browser_error",
+            }:
+                message = str(event.get("message") or "巡检遇到问题，请查看运行详情")
+                self.run_status.setText(message[:120])
 
     def read_error(self) -> None:
-        value = bytes(self.process.readAllStandardError()).decode("utf-8", "replace")
+        value = _decode_process_output(self.process.readAllStandardError())
         self.output_buffer.append(value)
-        self.output.setPlainText("".join(self.output_buffer))
+        self._append_output(value)
+
+    def _append_output(self, value: str) -> None:
+        # 增量追加；整段 setPlainText 会在长巡检里把每次刷新都变成全量重排。
+        cursor = self.output.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        cursor.insertText(value)
 
     def process_finished(self, exit_code: int, _status: QProcess.ExitStatus) -> None:
         self.run_status.setText("巡检已完成" if exit_code == 0 else "巡检未完成，请查看运行详情")
-        runs = self.storage.list_scan_runs(limit=1)
-        self.latest_run_id = int(runs[0]["id"]) if runs else None
+        if self.current_run_id is not None:
+            # 用本次子进程在 scan.started 里上报的 run_id；取“最新一条记录”
+            # 会在并发 CLI 巡检时指向别人的运行。
+            self.latest_run_id = self.current_run_id
+            self.current_run_id = None
+        else:
+            runs = self.storage.list_scan_runs(limit=1)
+            self.latest_run_id = int(runs[0]["id"]) if runs else None
         self.detail_button.setVisible(self.latest_run_id is not None)
         self.edit_run_button.setVisible(self.latest_run_id is not None)
         self.delete_run_button.setVisible(self.latest_run_id is not None)
@@ -1115,9 +1168,10 @@ class SchedulerPage(QWidget):
         self.wecom_status_label.setText("企微日报：已启用" if wecom_enabled else "企微日报：未启用")
 
         while self.platform_rows.count():
-            item = self.platform_rows.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+            layout_item = self.platform_rows.takeAt(0)
+            row_widget = layout_item.widget() if layout_item is not None else None
+            if row_widget is not None:
+                row_widget.deleteLater()
         for platform, name in PLATFORM_NAMES.items():
             platform_accounts = [item for item in accounts if item["platform"] == platform]
             ready_count = sum(1 for item in platform_accounts if item["status"] == "ready")
@@ -1188,7 +1242,7 @@ class KeywordsPage(QWidget):
     def __init__(self, storage: Storage) -> None:
         super().__init__()
         self.storage = storage
-        self.rows: dict[int, dict[str, object]] = {}
+        self.rows: dict[int, dict[str, Any]] = {}
         self.setObjectName("page")
         root = QVBoxLayout(self)
         root.setContentsMargins(30, 26, 30, 28)
@@ -1354,7 +1408,7 @@ class AccountsPage(QWidget):
     def __init__(self, storage: Storage) -> None:
         super().__init__()
         self.storage = storage
-        self.rows: dict[int, dict[str, object]] = {}
+        self.rows: dict[int, dict[str, Any]] = {}
         self.setObjectName("page")
         root = QVBoxLayout(self)
         root.setContentsMargins(30, 26, 30, 28)
@@ -1421,7 +1475,7 @@ class AccountsPage(QWidget):
         except Exception as exc:
             _show_error(self, exc)
 
-    def selected_account(self) -> dict[str, object] | None:
+    def selected_account(self) -> dict[str, Any] | None:
         account_id = _selected_id(self.table)
         return self.rows.get(account_id) if account_id is not None else None
 
@@ -1456,7 +1510,7 @@ class AccountsPage(QWidget):
 class BrowserLoginWindow(QMainWindow):
     account_updated = Signal()
 
-    def __init__(self, settings: Settings, storage: Storage, account: dict[str, object]) -> None:
+    def __init__(self, settings: Settings, storage: Storage, account: dict[str, Any]) -> None:
         super().__init__()
         self.storage = storage
         self.settings = settings
@@ -1531,13 +1585,13 @@ class BrowserLoginWindow(QMainWindow):
         self.close()
 
     def read_output(self) -> None:
-        value = bytes(self.process.readAllStandardOutput()).decode("utf-8", "replace")
+        value = _decode_process_output(self.process.readAllStandardOutput())
         if value.strip():
             self.output_buffer.append(value)
             self.status_label.setText(value.strip().splitlines()[-1])
 
     def read_error(self) -> None:
-        value = bytes(self.process.readAllStandardError()).decode("utf-8", "replace")
+        value = _decode_process_output(self.process.readAllStandardError())
         if value.strip():
             self.output_buffer.append(value)
 
@@ -1565,7 +1619,9 @@ class BrowserLoginWindow(QMainWindow):
         if self.process.state() != QProcess.ProcessState.NotRunning:
             self._cancelled = True
             self.process.write(b"\n")
-            self.process.waitForFinished(10_000)
+            # 只等一小段时间，避免长时间冻结界面。窗口对象仍被主窗口持有，
+            # 子进程会在后台正常收尾（关闭浏览器并释放账号租约）。
+            self.process.waitForFinished(2_000)
         event.accept()
 
 
@@ -1575,7 +1631,7 @@ class OpinionsPage(QWidget):
     def __init__(self, storage: Storage) -> None:
         super().__init__()
         self.storage = storage
-        self.rows: dict[int, dict[str, object]] = {}
+        self.rows: dict[int, dict[str, Any]] = {}
         self.setObjectName("page")
         root = QVBoxLayout(self)
         root.setContentsMargins(30, 26, 30, 28)
@@ -1760,7 +1816,7 @@ class OpinionsPage(QWidget):
             self.refresh()
             self.changed.emit()
 
-    def selected(self) -> dict[str, object] | None:
+    def selected(self) -> dict[str, Any] | None:
         content_id = self._selected_assessment_id()
         return self.rows.get(content_id) if content_id is not None else None
 
@@ -1771,9 +1827,9 @@ class OpinionsPage(QWidget):
 
     def select_all(self) -> None:
         should_check = any(
-            self.table.item(row, 0).checkState() != Qt.CheckState.Checked
+            (cell := self.table.item(row, 0)) is not None
+            and cell.checkState() != Qt.CheckState.Checked
             for row in range(self.table.rowCount())
-            if self.table.item(row, 0) is not None
         )
         _toggle_all(self.table, should_check)
         self.select_all_button.setText("取消全选" if should_check else "全选")
@@ -2026,7 +2082,7 @@ class NotificationsPage(QWidget):
                 self.table.setItem(row, column, QTableWidgetItem(str(value)))
         self.panel.show_count(len(rows))
 
-    def selected_notification(self) -> dict[str, object] | None:
+    def selected_notification(self) -> dict[str, Any] | None:
         row = self.table.currentRow()
         cell = self.table.item(row, 1) if row >= 0 else None
         if cell is None:
@@ -2043,15 +2099,15 @@ class NotificationsPage(QWidget):
 
     def select_all(self) -> None:
         should_check = any(
-            self.table.item(row, 0).checkState() != Qt.CheckState.Checked
+            (cell := self.table.item(row, 0)) is not None
+            and cell.checkState() != Qt.CheckState.Checked
             for row in range(self.table.rowCount())
-            if self.table.item(row, 0) is not None
         )
         _toggle_all(self.table, should_check)
         self.select_all_button.setText("取消全选" if should_check else "全选")
 
     def _notification_form(
-        self, title_text: str, item: dict[str, object] | None = None
+        self, title_text: str, item: dict[str, Any] | None = None
     ) -> tuple[QDialog, QComboBox, QLineEdit, QTextEdit, QComboBox]:
         dialog = QDialog(self)
         dialog.setWindowTitle(title_text)
@@ -2159,10 +2215,19 @@ class SettingsPage(QWidget):
         self.storage = storage
         self.wecom_test_process = QProcess(self)
         self.wecom_test_process.finished.connect(self.wecom_test_finished)
+        self.wecom_test_process.errorOccurred.connect(
+            lambda error: self._subprocess_failed("企微测试", error)
+        )
         self.wecom_discover_process = QProcess(self)
         self.wecom_discover_process.finished.connect(self.wecom_discover_finished)
+        self.wecom_discover_process.errorOccurred.connect(
+            lambda error: self._subprocess_failed("群聊 ID 监听", error)
+        )
         self.llm_test_process = QProcess(self)
         self.llm_test_process.finished.connect(self.llm_test_finished)
+        self.llm_test_process.errorOccurred.connect(
+            lambda error: self._subprocess_failed("大模型测试", error)
+        )
         self.setObjectName("page")
         page_layout = QVBoxLayout(self)
         page_layout.setContentsMargins(30, 26, 30, 28)
@@ -2346,12 +2411,24 @@ class SettingsPage(QWidget):
 
     def save_autostart(self, enabled: bool) -> None:
         try:
-            _set_windows_autostart(enabled)
+            _set_windows_autostart(enabled, runtime_dir=self.settings.runtime_dir)
         except Exception as exc:
             self.autostart_enabled.blockSignals(True)
             self.autostart_enabled.setChecked(not enabled)
             self.autostart_enabled.blockSignals(False)
             _show_error(self, exc)
+
+    def _subprocess_failed(self, label: str, error: QProcess.ProcessError) -> None:
+        # 只处理启动失败：进程根本没跑起来时 finished 不会触发，
+        # 按钮会永久停留在禁用状态且没有任何提示。
+        if error is not QProcess.ProcessError.FailedToStart:
+            return
+        self.wecom_test_button.setEnabled(True)
+        self.wecom_discover_button.setEnabled(True)
+        self.llm_test_button.setEnabled(True)
+        QMessageBox.warning(
+            self, "无法启动子进程", f"{label}子进程无法启动，请检查运行环境后重试。"
+        )
 
     def test_wecom(self) -> None:
         if self.wecom_test_process.state() != QProcess.ProcessState.NotRunning:
@@ -2398,8 +2475,8 @@ class SettingsPage(QWidget):
 
     def llm_test_finished(self, exit_code: int, _status: QProcess.ExitStatus) -> None:
         self.llm_test_button.setEnabled(True)
-        output = bytes(self.llm_test_process.readAllStandardOutput()).decode("utf-8", "replace")
-        error = bytes(self.llm_test_process.readAllStandardError()).decode("utf-8", "replace")
+        output = _decode_process_output(self.llm_test_process.readAllStandardOutput())
+        error = _decode_process_output(self.llm_test_process.readAllStandardError())
         message = (output or error).strip() or "大模型测试结束。"
         if exit_code == 0:
             QMessageBox.information(self, "大模型测试", message)
@@ -2423,8 +2500,8 @@ class SettingsPage(QWidget):
 
     def wecom_test_finished(self, exit_code: int, _status: QProcess.ExitStatus) -> None:
         self.wecom_test_button.setEnabled(True)
-        output = bytes(self.wecom_test_process.readAllStandardOutput()).decode("utf-8", "replace")
-        error = bytes(self.wecom_test_process.readAllStandardError()).decode("utf-8", "replace")
+        output = _decode_process_output(self.wecom_test_process.readAllStandardOutput())
+        error = _decode_process_output(self.wecom_test_process.readAllStandardError())
         message = (output or error).strip() or "企微测试结束。"
         if exit_code == 0:
             QMessageBox.information(self, "企微测试", message)
@@ -2433,10 +2510,8 @@ class SettingsPage(QWidget):
 
     def wecom_discover_finished(self, exit_code: int, _status: QProcess.ExitStatus) -> None:
         self.wecom_discover_button.setEnabled(True)
-        output = bytes(self.wecom_discover_process.readAllStandardOutput()).decode(
-            "utf-8", "replace"
-        )
-        error = bytes(self.wecom_discover_process.readAllStandardError()).decode("utf-8", "replace")
+        output = _decode_process_output(self.wecom_discover_process.readAllStandardOutput())
+        error = _decode_process_output(self.wecom_discover_process.readAllStandardError())
         if exit_code != 0:
             QMessageBox.warning(self, "监听失败", (error or output).strip() or "未发现群聊 ID。")
             return
@@ -2634,7 +2709,7 @@ class MainWindow(QMainWindow):
         ):
             page.refresh()
 
-    def open_account_browser(self, account: dict[str, object]) -> None:
+    def open_account_browser(self, account: dict[str, Any]) -> None:
         account_id = int(account["id"])
         window = self.browser_windows.get(account_id)
         if window is None or window.process.state() == QProcess.ProcessState.NotRunning:
@@ -2654,17 +2729,28 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--smoke-test", action="store_true", help="初始化界面后立即退出")
     parser.add_argument("--screenshot", type=Path, help="保存桌面界面截图后退出")
     parser.add_argument("--page", type=int, choices=range(6), default=0, help="启动时显示的页面")
+    parser.add_argument(
+        "--runtime-dir",
+        type=Path,
+        help="运行数据目录；开机自启时用于固定数据库位置，默认取环境变量或当前目录下 runtime",
+    )
     return parser
 
 
-def create_runtime() -> tuple[Settings, Storage]:
+def create_runtime(runtime_dir: Path | None = None) -> tuple[Settings, Storage]:
+    if runtime_dir is not None:
+        # 写入环境变量而不是只改本进程配置：巡检 QProcess 子进程继承同一个值，
+        # 才能保证读写同一个数据库。
+        os.environ["OPINION_WATCH_RUNTIME_DIR"] = str(runtime_dir.resolve())
     settings = Settings.from_environment()
     settings.ensure_directories()
     storage = Storage(settings.database_path)
     storage.initialize()
     storage.recover_stale_scan_runs()
     owner = str(uuid.uuid4())
-    if not storage.acquire_task_lease("desktop", owner, lease_seconds=86_400):
+    # 短租约 + 定时心跳：桌面进程崩溃后最多几分钟即可重新启动，
+    # 而不是等一个超长租约自然过期。
+    if not storage.acquire_task_lease("desktop", owner, lease_seconds=900):
         raise RuntimeError("品牌舆情监控已经在运行，请先关闭已有窗口。")
     if not storage.list_brands():
         for brand in DEFAULT_BRANDS:
@@ -2680,7 +2766,7 @@ def main() -> None:
     app.setOrganizationName("opinion-watch")
     app.setFont(QFont("Microsoft YaHei UI", 10))
     app.setStyleSheet(APP_STYLE)
-    settings, storage = create_runtime()
+    settings, storage = create_runtime(args.runtime_dir)
     app.aboutToQuit.connect(
         lambda: storage.release_task_lease(
             "desktop", str(getattr(storage, "_desktop_lease_owner", ""))
@@ -2688,6 +2774,13 @@ def main() -> None:
     )
     window = MainWindow(settings, storage)
     window.navigation.setCurrentRow(args.page)
+    lease_owner = str(getattr(storage, "_desktop_lease_owner", ""))
+    lease_timer = QTimer(window)
+    lease_timer.setInterval(300_000)
+    lease_timer.timeout.connect(
+        lambda: storage.heartbeat_task_lease("desktop", lease_owner, lease_seconds=900)
+    )
+    lease_timer.start()
     tray: QSystemTrayIcon | None = None
     if not args.smoke_test and QSystemTrayIcon.isSystemTrayAvailable():
         tray = QSystemTrayIcon(window.windowIcon(), window)
