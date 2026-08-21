@@ -96,13 +96,11 @@ QLabel#heroTime {{ color: {c["text_strong"]}; font-size: 34px; font-weight: 700;
 QLabel#metric {{ color: {c["text_strong"]}; font-size: 24px; font-weight: 700; }}
 QLabel#emptyTitle {{ font-size: 16px; font-weight: 700; color: #30394C; }}
 QLabel#alertText {{ color: {c["warning_text"]}; }}
-QLabel#noticeText {{ color: {c["warning_text"]}; }}
+QLabel#noticeText {{ color: #725214; font-size: 12px; }}
+QFrame#statusPill QLabel {{ color: #176A4C; font-weight: 600; }}
 QLabel#heroCalendar {{
-    background: {c["primary_soft"]};
-    color: {c["primary_text"]};
-    border-radius: 26px;
-    font-size: 20px;
-    font-weight: 700;
+    background: {c["success_soft"]};
+    border-radius: 28px;
 }}
 QLabel#readyDot {{ font-size: 10px; }}
 QLabel#readyDot[state="ok"] {{ color: {c["success"]}; }}
