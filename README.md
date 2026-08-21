@@ -44,6 +44,9 @@
   认领，避免并发重复发送。
 - 已完成：SQLite 版本化迁移、巡检计数字段修复、跨进程巡检租约和中断任务恢复；
   初始化不会重新启用用户停用的品牌/账号或补回已删除的品牌同名关键词。
+- 已完成：定时配置、上次计划时间、下次执行时间和错过任务的一次性补跑策略写入 SQLite，
+  桌面调度器与后续无界面 Worker 共用纯函数调度规则；巡检 stdout 使用带版本和类型的
+  JSON Lines 事件协议，便于桌面端逐步脱离混合日志解析。
 - 自动巡检现在按“平台账号”选择已登录的独立 Playwright 档案；旧版 Qt 登录档案
   不会被复制或导出，首次切换到新流程的账号需要重新登录一次。
 - 明确不做：自动填写或提交平台举报；大模型只提供辅助复判，不替代人工结论。
@@ -204,6 +207,23 @@ uv run opinion-watch classify review 7 `
 ```powershell
 uv run opinion-watch llm test
 ```
+
+测试连接时会同时探测文本消息和多模态 `image_url` 消息兼容性，并把能力结果缓存到本地
+配置中；巡检只在能力允许时发送图片证据，接口拒绝时仍会回退为纯文本复判。
+
+## 工程检查
+
+提交前可运行：
+
+```powershell
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy src/opinion_watch/events.py src/opinion_watch/scheduling.py
+uv run pytest
+```
+
+GitHub Actions 会在 Windows + Python 3.12 上重复执行静态检查、类型基线、覆盖率门槛、
+编译检查和桌面 smoke test。
 
 ## 定时扫描
 

@@ -34,6 +34,7 @@ class LLMSettings:
     model: str
     api_key: str
     max_candidates: int = 20
+    multimodal_messages: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +61,22 @@ class LLMCallBudget:
         return count
 
 
+@dataclass(frozen=True, slots=True)
+class LLMCapabilities:
+    chat_completions: bool
+    text_messages: bool
+    multimodal_messages: bool
+    error: str = ""
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "chat_completions": self.chat_completions,
+            "text_messages": self.text_messages,
+            "multimodal_messages": self.multimodal_messages,
+            "error": self.error,
+        }
+
+
 class LLMClient:
     def __init__(self, settings: LLMSettings) -> None:
         self.settings = settings
@@ -80,7 +97,9 @@ class LLMClient:
             raise LLMConfigurationError("未找到大模型 API Key")
 
     async def assess(self, content: dict[str, object]) -> LLMAssessment:
-        message = build_assessment_message(content)
+        message = build_assessment_message(
+            content, allow_multimodal=self.settings.multimodal_messages
+        )
         try:
             raw = await self._complete(
                 [
@@ -120,6 +139,34 @@ class LLMClient:
                 {"role": "user", "content": "请确认连接正常。"},
             ]
         )
+
+    async def probe_capabilities(self) -> LLMCapabilities:
+        """Probe text and image message compatibility for the configured endpoint."""
+        try:
+            await self.test()
+        except LLMError as exc:
+            return LLMCapabilities(False, False, False, str(exc)[:300])
+
+        pixel = (
+            "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQ"
+            "VR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+        )
+        try:
+            await self._complete(
+                [
+                    {"role": "system", "content": '只需返回 JSON：{"ok":true}。'},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "请确认图片消息格式正常。"},
+                            {"type": "image_url", "image_url": {"url": pixel}},
+                        ],
+                    },
+                ]
+            )
+        except LLMError as exc:
+            return LLMCapabilities(True, True, False, str(exc)[:300])
+        return LLMCapabilities(True, True, True)
 
     async def _complete(self, messages: list[dict[str, object]]) -> str:
         payload = {
@@ -211,9 +258,13 @@ def build_assessment_prompt(content: dict[str, object]) -> str:
     )[:12_000]
 
 
-def build_assessment_message(content: dict[str, object]) -> str | list[dict[str, object]]:
+def build_assessment_message(
+    content: dict[str, object], *, allow_multimodal: bool = True
+) -> str | list[dict[str, object]]:
     """Add locally captured image/video keyframe evidence when available."""
     prompt = build_assessment_prompt(content)
+    if not allow_multimodal:
+        return prompt
     raw_data = content.get("raw_data")
     raw = raw_data if isinstance(raw_data, dict) else {}
     media = raw.get("media")
@@ -330,12 +381,17 @@ def _settings_from_storage(storage: Storage) -> LLMSettings | None:
     config = storage.get_llm_config()
     if not bool(config.get("enabled")):
         return None
+    capabilities = config.get("capabilities")
+    multimodal_messages = not isinstance(capabilities, dict) or bool(
+        capabilities.get("multimodal_messages", True)
+    )
     return LLMSettings(
         provider=str(config.get("provider") or "openai-compatible"),
         base_url=str(config.get("base_url") or ""),
         model=str(config.get("model") or ""),
         api_key=CredentialStore.get_llm_api_key(),
         max_candidates=int(config.get("max_candidates") or 20),
+        multimodal_messages=multimodal_messages,
     )
 
 

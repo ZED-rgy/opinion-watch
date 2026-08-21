@@ -5,7 +5,7 @@ import json
 import sys
 import uuid
 from collections.abc import Callable
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import qtawesome as qta
@@ -44,7 +44,9 @@ from PySide6.QtWidgets import (
 
 from opinion_watch.config import DEFAULT_BRANDS, Settings
 from opinion_watch.credentials import CredentialStore
+from opinion_watch.events import parse_event
 from opinion_watch.models import OpinionCategory, Platform, RiskSeverity
+from opinion_watch.scheduling import next_scheduled_datetime
 from opinion_watch.storage import Storage
 
 ASSET_DIR = Path(__file__).with_name("assets")
@@ -572,6 +574,26 @@ class SchedulerPage(QWidget):
         super().__init__()
         self.storage = storage
         self.app_settings = QSettings("opinion-watch", "desktop")
+        schedule_config = self.storage.get_schedule_config()
+        if not bool(schedule_config.get("legacy_imported")):
+            legacy_frequency = str(self.app_settings.value("schedule_frequency", "daily"))
+            legacy_time = str(self.app_settings.value("schedule_time", "09:00"))
+            legacy_weekday = int(self.app_settings.value("schedule_weekday", 0))
+            legacy_interval = int(self.app_settings.value("interval_minutes", 60))
+            legacy_mode = str(self.app_settings.value("scan_mode", "quick"))
+            legacy_enabled = str(self.app_settings.value("auto_enabled", "false")).lower() == "true"
+            self.storage.save_schedule_config(
+                enabled=legacy_enabled,
+                frequency=legacy_frequency
+                if legacy_frequency in {"daily", "weekly", "interval"}
+                else "daily",
+                schedule_time=legacy_time,
+                weekday=max(0, min(6, legacy_weekday)),
+                interval_minutes=max(5, min(1440, legacy_interval)),
+                scan_mode=legacy_mode if legacy_mode in {"quick", "deep"} else "quick",
+                legacy_imported=True,
+            )
+            schedule_config = self.storage.get_schedule_config()
         self.process = QProcess(self)
         self.timer = QTimer(self)
         self.timer.setSingleShot(True)
@@ -641,35 +663,31 @@ class SchedulerPage(QWidget):
         controls.setHorizontalSpacing(12)
         controls.setVerticalSpacing(8)
         self.auto_enabled = QCheckBox("启用定时巡检")
-        self.auto_enabled.setChecked(
-            str(self.app_settings.value("auto_enabled", "false")).lower() == "true"
-        )
+        self.auto_enabled.setChecked(bool(schedule_config.get("enabled")))
         self.frequency = QComboBox()
         self.frequency.addItem("每日一次", "daily")
         self.frequency.addItem("每周一次", "weekly")
         self.frequency.addItem("按间隔", "interval")
-        saved_frequency = str(self.app_settings.value("schedule_frequency", "daily"))
+        saved_frequency = str(schedule_config.get("frequency") or "daily")
         frequency_index = self.frequency.findData(saved_frequency)
         self.frequency.setCurrentIndex(frequency_index if frequency_index >= 0 else 0)
         self.schedule_time = QTimeEdit()
         self.schedule_time.setDisplayFormat("HH:mm")
-        saved_time = QTime.fromString(
-            str(self.app_settings.value("schedule_time", "09:00")), "HH:mm"
-        )
+        saved_time = QTime.fromString(str(schedule_config.get("schedule_time") or "09:00"), "HH:mm")
         self.schedule_time.setTime(saved_time if saved_time.isValid() else QTime(9, 0))
         self.weekday = QComboBox()
         for index, name in enumerate(("周一", "周二", "周三", "周四", "周五", "周六", "周日")):
             self.weekday.addItem(name, index)
-        saved_weekday = int(self.app_settings.value("schedule_weekday", 0))
+        saved_weekday = int(schedule_config.get("weekday") or 0)
         self.weekday.setCurrentIndex(max(0, min(6, saved_weekday)))
         self.interval = QSpinBox()
         self.interval.setRange(5, 1440)
         self.interval.setSuffix(" 分钟")
-        self.interval.setValue(int(self.app_settings.value("interval_minutes", 60)))
+        self.interval.setValue(int(schedule_config.get("interval_minutes") or 60))
         self.scan_mode = QComboBox()
         self.scan_mode.addItem("快速巡检（每关键词至少 20 条）", "quick")
         self.scan_mode.addItem("深度巡检（每关键词至少 50 条）", "deep")
-        saved_scan_mode = str(self.app_settings.value("scan_mode", "quick"))
+        saved_scan_mode = str(schedule_config.get("scan_mode") or "quick")
         scan_mode_index = self.scan_mode.findData(saved_scan_mode)
         self.scan_mode.setCurrentIndex(scan_mode_index if scan_mode_index >= 0 else 0)
         controls.addWidget(self.auto_enabled, 0, 0, 1, 2)
@@ -821,45 +839,83 @@ class SchedulerPage(QWidget):
         self.interval.setVisible(mode == "interval")
 
     def save_schedule(self) -> None:
-        self.app_settings.setValue("schedule_frequency", self.frequency.currentData())
-        self.app_settings.setValue("schedule_time", self.schedule_time.time().toString("HH:mm"))
-        self.app_settings.setValue("schedule_weekday", self.weekday.currentData())
-        self.app_settings.setValue("interval_minutes", self.interval.value())
         self.update_schedule_controls()
         if self.auto_enabled.isChecked():
+            self._persist_schedule(next_run_at=None)
             self.configure_timer(True)
+        else:
+            self._persist_schedule(next_run_at=None)
 
     def save_scan_mode(self) -> None:
-        self.app_settings.setValue("scan_mode", self.scan_mode.currentData())
+        self._persist_schedule()
+
+    def _persist_schedule(
+        self,
+        *,
+        next_run_at: datetime | None | object = ...,
+        last_scheduled_at: datetime | None | object = ...,
+    ) -> None:
+        current = self.storage.get_schedule_config()
+        next_value = current.get("next_run_at") if next_run_at is ... else next_run_at
+        last_value = (
+            current.get("last_scheduled_at") if last_scheduled_at is ... else last_scheduled_at
+        )
+        self.storage.save_schedule_config(
+            enabled=self.auto_enabled.isChecked(),
+            frequency=str(self.frequency.currentData()),
+            schedule_time=self.schedule_time.time().toString("HH:mm"),
+            weekday=int(self.weekday.currentData()),
+            interval_minutes=self.interval.value(),
+            scan_mode=str(self.scan_mode.currentData()),
+            last_scheduled_at=(
+                last_value.isoformat()
+                if isinstance(last_value, datetime)
+                else str(last_value)
+                if last_value
+                else None
+            ),
+            next_run_at=(
+                next_value.isoformat()
+                if isinstance(next_value, datetime)
+                else str(next_value)
+                if next_value
+                else None
+            ),
+            legacy_imported=True,
+        )
 
     def _next_scheduled_datetime(self) -> datetime:
         now = datetime.now().astimezone()
-        mode = str(self.frequency.currentData())
-        if mode == "interval":
-            return now + timedelta(minutes=self.interval.value())
-        target = now.replace(
-            hour=self.schedule_time.time().hour(),
-            minute=self.schedule_time.time().minute(),
-            second=0,
-            microsecond=0,
+        return next_scheduled_datetime(
+            now,
+            frequency=str(self.frequency.currentData()),
+            schedule_time=self.schedule_time.time().toString("HH:mm"),
+            weekday=int(self.weekday.currentData()),
+            interval_minutes=self.interval.value(),
         )
-        if mode == "weekly":
-            days = (int(self.weekday.currentData()) - now.weekday()) % 7
-            target += timedelta(days=days)
-            if target <= now:
-                target += timedelta(days=7)
-        elif target <= now:
-            target += timedelta(days=1)
-        return target
 
     def _set_next_run(self) -> None:
         self.next_run_at = self._next_scheduled_datetime()
         self.next_run_label.setText(self.next_run_at.strftime("%Y-%m-%d %H:%M"))
+        self._persist_schedule(next_run_at=self.next_run_at)
 
     def configure_timer(self, enabled: bool) -> None:
-        self.app_settings.setValue("auto_enabled", enabled)
         if enabled:
-            self._set_next_run()
+            saved_next = self.storage.get_schedule_config().get("next_run_at")
+            try:
+                parsed_next = datetime.fromisoformat(str(saved_next)) if saved_next else None
+            except ValueError:
+                parsed_next = None
+            now = datetime.now().astimezone()
+            if parsed_next is not None and parsed_next > now:
+                self.next_run_at = parsed_next
+                self.next_run_label.setText(self.next_run_at.strftime("%Y-%m-%d %H:%M"))
+            else:
+                # A missed schedule is compensated once after restart, then the
+                # normal frequency calculation resumes after that run.
+                self.next_run_at = now + timedelta(seconds=1)
+                self.next_run_label.setText(self.next_run_at.strftime("%Y-%m-%d %H:%M"))
+            self._persist_schedule(next_run_at=self.next_run_at)
             delay = max(
                 1000, int((self.next_run_at - datetime.now().astimezone()).total_seconds() * 1000)
             )
@@ -870,6 +926,7 @@ class SchedulerPage(QWidget):
             self.timer.stop()
             self.next_run_at = None
             self.next_run_label.setText("尚未计划")
+            self._persist_schedule(next_run_at=None)
             if self.process.state() == QProcess.ProcessState.NotRunning:
                 self.run_status.setText("开启定时巡检后，将按设定频次自动运行")
 
@@ -885,6 +942,10 @@ class SchedulerPage(QWidget):
 
     def scheduled_scan(self) -> None:
         if self.process.state() == QProcess.ProcessState.NotRunning:
+            self._persist_schedule(
+                last_scheduled_at=datetime.now(UTC),
+                next_run_at=self.next_run_at,
+            )
             self.start_scan(trigger="watch")
         elif self.auto_enabled.isChecked():
             self.configure_timer(True)
@@ -924,6 +985,12 @@ class SchedulerPage(QWidget):
         value = bytes(self.process.readAllStandardOutput()).decode("utf-8", "replace")
         self.output_buffer.append(value)
         self.output.setPlainText("".join(self.output_buffer))
+        for line in value.splitlines():
+            event = parse_event(line)
+            if event is not None and event.get("type") == "scan.finished":
+                self.run_status.setText(
+                    "巡检已完成" if event.get("status") == "succeeded" else "巡检未完成"
+                )
 
     def read_error(self) -> None:
         value = bytes(self.process.readAllStandardError()).decode("utf-8", "replace")

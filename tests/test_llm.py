@@ -68,6 +68,19 @@ def test_build_assessment_message_attaches_local_media_evidence() -> None:
     assert str(message[1]["image_url"]["url"]).startswith("data:image/png;base64,")
 
 
+def test_build_assessment_message_skips_media_when_provider_lacks_support() -> None:
+    message = build_assessment_message(
+        {
+            "title": "图片证据",
+            "brand_names": ["示例品牌"],
+            "raw_data": {"media": [{"url": "https://example.test/image.png"}]},
+        },
+        allow_multimodal=False,
+    )
+    assert isinstance(message, str)
+    assert "图片证据" in message
+
+
 def test_llm_assess_retries_as_text_when_gateway_rejects_image_message() -> None:
     client = LLMClient(LLMSettings("openai-compatible", "https://example.test/v1", "demo", "key"))
     messages: list[list[dict[str, object]]] = []
@@ -219,3 +232,21 @@ def test_llm_call_budget_is_shared_and_never_exceeded() -> None:
     assert budget.take(5) == 2
     assert budget.take(1) == 0
     assert budget.used == 2
+
+
+def test_llm_capability_probe_records_text_and_multimodal_support() -> None:
+    client = LLMClient(LLMSettings("openai-compatible", "https://example.test/v1", "demo", "key"))
+    requests: list[list[dict[str, object]]] = []
+
+    async def fake_complete(messages):
+        requests.append(messages)
+        return '{"ok":true}'
+
+    client._complete = fake_complete  # type: ignore[method-assign]
+    capabilities = asyncio.run(client.probe_capabilities())
+
+    assert capabilities.chat_completions is True
+    assert capabilities.text_messages is True
+    assert capabilities.multimodal_messages is True
+    assert len(requests) == 2
+    assert isinstance(requests[1][1]["content"], list)

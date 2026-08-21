@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import uuid
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, replace
@@ -11,6 +10,7 @@ from opinion_watch.classification import classify_batch, classify_content, is_su
 from opinion_watch.collectors import collector_for
 from opinion_watch.collectors.base import CollectorRuntimeError
 from opinion_watch.config import Settings
+from opinion_watch.events import serialize_event
 from opinion_watch.llm import LLMCallBudget, classify_with_llm, screen_items_with_llm
 from opinion_watch.models import (
     CollectedContent,
@@ -249,7 +249,8 @@ async def _run_scan_locked(
     llm_config = storage.get_llm_config()
     llm_budget = LLMCallBudget(int(llm_config.get("max_candidates") or 20))
     print(
-        json.dumps(
+        serialize_event(
+            "scan.started",
             {
                 "run_id": run_id,
                 "trigger": trigger,
@@ -278,7 +279,8 @@ async def _run_scan_locked(
                     ),
                 )
                 print(
-                    json.dumps(
+                    serialize_event(
+                        "scan.account_not_ready",
                         {
                             "run_id": run_id,
                             "platform": platform.value,
@@ -347,7 +349,8 @@ async def _run_scan_locked(
                             message=message,
                         )
                         print(
-                            json.dumps(
+                            serialize_event(
+                                "scan.session_status",
                                 {
                                     "run_id": run_id,
                                     "platform": platform.value,
@@ -442,7 +445,8 @@ async def _run_scan_locked(
                                     and attempt_no <= options.retries
                                 )
                                 print(
-                                    json.dumps(
+                                    serialize_event(
+                                        "scan.attempt_failed",
                                         {
                                             "run_id": run_id,
                                             "attempt_id": attempt_id,
@@ -495,7 +499,8 @@ async def _run_scan_locked(
                                 )
                                 retrying = attempt_no <= options.retries
                                 print(
-                                    json.dumps(
+                                    serialize_event(
+                                        "scan.attempt_error",
                                         {
                                             "run_id": run_id,
                                             "attempt_id": attempt_id,
@@ -566,7 +571,8 @@ async def _run_scan_locked(
                                     media_items=media_count,
                                 )
                                 print(
-                                    json.dumps(
+                                    serialize_event(
+                                        "scan.attempt_succeeded",
                                         {
                                             "run_id": run_id,
                                             "attempt_id": attempt_id,
@@ -604,7 +610,8 @@ async def _run_scan_locked(
                     message=str(exc),
                 )
                 print(
-                    json.dumps(
+                    serialize_event(
+                        "scan.browser_error",
                         {
                             "run_id": run_id,
                             "platform": platform.value,
@@ -700,7 +707,8 @@ async def _run_scan_locked(
                 message=f"企微日报发送失败：{exc}",
             )
     print(
-        json.dumps(
+        serialize_event(
+            "scan.finished",
             {
                 "run_id": run_id,
                 "status": status.value,

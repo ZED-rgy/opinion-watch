@@ -57,7 +57,10 @@ Python 应用服务
 - `wecom_config`：企微 Bot ID、目标群聊 ID、启用状态和 WebSocket 地址；Secret 不存入数据库。
 - `daily_reports`：按本地日期保存日报内容、发送状态和失败原因；发送前使用原子认领，
   保证并发任务不会重复发送。
-- `llm_config`：大模型提供商、Base URL、模型名、启用状态和单轮候选上限；API Key 不存入数据库。
+- `llm_config`：大模型提供商、Base URL、模型名、启用状态、单轮候选上限和最近一次能力探测；
+  API Key 不存入数据库。
+- `schedule_config`：启用状态、每日/每周/间隔频次、执行时间、上次计划时间、下次执行时间
+  和错过任务策略。
 - `schema_migrations`、`task_leases`：数据库迁移版本和跨进程任务租约。
 
 ## 大模型接口
@@ -68,10 +71,24 @@ Python 应用服务
 - 舆情类型与风险复判；
 - 简短摘要和模型证据；
 - 模型失败时保留规则结论并生成告警；一轮巡检共享调用预算，避免按关键词无限叠加调用。
-- 服务商不接受 `image_url` 消息时自动回退为文本请求；非本机 Base URL 要求 HTTPS。
+- 保存配置或测试连接时探测文本和多模态能力，巡检按探测结果选择消息格式；服务商不接受
+  `image_url` 消息时自动回退为文本请求；非本机 Base URL 要求 HTTPS。
 
 当前客户端使用兼容 OpenAI `chat/completions` 的 HTTP 接口。API Key 存入 Windows
 凭据管理器，不进入 SQLite、日志、配置文件或 Git。相似内容聚类和定期简报仍是后续能力。
+
+## Worker 事件协议
+
+桌面端通过 QProcess 启动巡检 Worker。Worker 的结构化输出使用 JSON Lines，每条事件包含
+`version` 和 `type`，当前版本为 `1`；普通日志仍可显示在诊断区域，但不会被当作业务事件解析。
+协议实现位于 `opinion_watch.events`，便于未来将桌面启动方式替换为独立 Worker 或本地 IPC。
+
+## 调度边界
+
+调度配置已进入 SQLite，不再只依赖 QSettings。桌面端负责展示和配置，纯计算规则位于
+`opinion_watch.scheduling`，启动时会恢复未来的 `next_run_at`；如果发现错过计划，则按
+`run_once` 策略补跑一次，再恢复正常频次。CLI `watch` 仍可用于显式前台循环，后续可复用同一
+调度服务接入无界面 Worker。
 
 ## 通知扩展
 

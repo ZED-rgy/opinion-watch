@@ -24,6 +24,8 @@ opinion-watch-desktop = "opinion_watch.desktop:main"
 [dependency-groups]
 dev = [
     "pytest>=8.4.0,<9.0.0",
+    "pytest-cov>=6.0.0,<7.0.0",
+    "mypy>=1.15.0,<2.0.0",
     "ruff>=0.12.0,<1.0.0",
 ]
 
@@ -35,7 +37,7 @@ build-backend = "hatchling.build"
 packages = ["src/opinion_watch"]
 
 [tool.pytest.ini_options]
-addopts = "-q"
+addopts = "-q --cov=opinion_watch --cov-report=term-missing --cov-fail-under=35"
 pythonpath = ["src"]
 testpaths = ["tests"]
 

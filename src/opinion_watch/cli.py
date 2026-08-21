@@ -503,14 +503,21 @@ async def _llm_test(storage: Storage) -> int:
             max_candidates=int(config.get("max_candidates") or 20),
         )
     )
-    response = await client.test()
+    capabilities = await client.probe_capabilities()
+    storage.save_llm_capabilities(capabilities.as_dict())
     print(
         json.dumps(
-            {"status": "ok", "message": "大模型接口连接成功", "response": response[:500]},
+            {
+                "status": "ok" if capabilities.chat_completions else "failed",
+                "message": "大模型接口连接成功"
+                if capabilities.chat_completions
+                else "大模型接口连接失败",
+                "capabilities": capabilities.as_dict(),
+            },
             ensure_ascii=False,
         )
     )
-    return 0
+    return 0 if capabilities.chat_completions else 2
 
 
 def _brand_command(storage: Storage, args: argparse.Namespace) -> int:

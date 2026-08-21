@@ -563,3 +563,41 @@ def test_external_llm_http_endpoint_is_rejected(tmp_path: Path) -> None:
         assert "HTTPS" in str(exc)
     else:
         raise AssertionError("external HTTP endpoint should be rejected")
+
+
+def test_storage_context_closes_connections_after_commit(tmp_path: Path) -> None:
+    storage = make_storage(tmp_path)
+    with storage.connect() as connection:
+        connection.execute("SELECT 1")
+
+    try:
+        connection.execute("SELECT 1")
+    except Exception as exc:
+        assert "closed" in str(exc).lower()
+    else:
+        raise AssertionError("storage context should close the connection")
+
+
+def test_schedule_config_is_persisted_across_storage_instances(tmp_path: Path) -> None:
+    storage = make_storage(tmp_path)
+    storage.save_schedule_config(
+        enabled=True,
+        frequency="weekly",
+        schedule_time="18:30",
+        weekday=4,
+        interval_minutes=60,
+        scan_mode="deep",
+        last_scheduled_at="2026-08-21T09:00:00+00:00",
+        next_run_at="2026-08-28T18:30:00+00:00",
+    )
+
+    reopened = Storage(tmp_path / "test.db")
+    reopened.initialize()
+    config = reopened.get_schedule_config()
+    assert config["enabled"] is True
+    assert config["frequency"] == "weekly"
+    assert config["schedule_time"] == "18:30"
+    assert config["weekday"] == 4
+    assert config["scan_mode"] == "deep"
+    assert config["last_scheduled_at"] == "2026-08-21T09:00:00+00:00"
+    assert config["next_run_at"] == "2026-08-28T18:30:00+00:00"

@@ -11,6 +11,16 @@ from urllib.parse import urlparse
 from opinion_watch.models import CollectedContent, Platform, UpsertStats
 
 
+class _ManagedConnection(sqlite3.Connection):
+    """Close SQLite connections after the standard commit/rollback context."""
+
+    def __exit__(self, *args: object) -> None:
+        try:
+            super().__exit__(*args)
+        finally:
+            self.close()
+
+
 class Storage:
     _OPERATIONAL_TABLES = (
         "content_items",
@@ -30,10 +40,10 @@ class Storage:
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
 
     def connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.database_path)
+        connection = sqlite3.connect(self.database_path, factory=_ManagedConnection)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA journal_mode = WAL")
+        connection.execute("PRAGMA busy_timeout = 5000")
         return connection
 
     def backup_to(self, backup_path: Path) -> None:
@@ -74,6 +84,7 @@ class Storage:
 
     def initialize(self) -> None:
         with self.connect() as connection:
+            connection.execute("PRAGMA journal_mode = WAL")
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS brands (
@@ -306,6 +317,8 @@ class Storage:
                     base_url TEXT NOT NULL DEFAULT 'https://api.openai.com/v1',
                     model TEXT NOT NULL DEFAULT '',
                     max_candidates INTEGER NOT NULL DEFAULT 20,
+                    capabilities_json TEXT NOT NULL DEFAULT '{}',
+                    probed_at TEXT,
                     updated_at TEXT NOT NULL
                 );
 
@@ -330,6 +343,21 @@ class Storage:
                     heartbeat_at TEXT NOT NULL,
                     expires_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS schedule_config (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    enabled INTEGER NOT NULL DEFAULT 0,
+                    frequency TEXT NOT NULL DEFAULT 'daily',
+                    schedule_time TEXT NOT NULL DEFAULT '09:00',
+                    weekday INTEGER NOT NULL DEFAULT 0,
+                    interval_minutes INTEGER NOT NULL DEFAULT 60,
+                    scan_mode TEXT NOT NULL DEFAULT 'quick',
+                    last_scheduled_at TEXT,
+                    next_run_at TEXT,
+                    missed_run_policy TEXT NOT NULL DEFAULT 'run_once',
+                    legacy_imported INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL
+                );
                 """
             )
             for column, definition in (
@@ -345,6 +373,15 @@ class Storage:
             ):
                 try:
                     connection.execute(f"ALTER TABLE scan_runs ADD COLUMN {column} {definition}")
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column name" not in str(exc).lower():
+                        raise
+            for column, definition in (
+                ("capabilities_json", "TEXT NOT NULL DEFAULT '{}'"),
+                ("probed_at", "TEXT"),
+            ):
+                try:
+                    connection.execute(f"ALTER TABLE llm_config ADD COLUMN {column} {definition}")
                 except sqlite3.OperationalError as exc:
                     if "duplicate column name" not in str(exc).lower():
                         raise
@@ -374,6 +411,14 @@ class Storage:
             connection.execute(
                 """
                 INSERT INTO llm_config(id, updated_at)
+                VALUES (1, ?)
+                ON CONFLICT(id) DO NOTHING
+                """,
+                (now,),
+            )
+            connection.execute(
+                """
+                INSERT INTO schedule_config(id, updated_at)
                 VALUES (1, ?)
                 ON CONFLICT(id) DO NOTHING
                 """,
@@ -1613,6 +1658,75 @@ class Storage:
             )
         return cursor.rowcount > 0
 
+    def get_schedule_config(self) -> dict[str, object]:
+        with self.connect() as connection:
+            row = connection.execute("SELECT * FROM schedule_config WHERE id = 1").fetchone()
+        if row is None:
+            raise RuntimeError("定时巡检配置尚未初始化")
+        result = dict(row)
+        result["enabled"] = bool(result["enabled"])
+        result["legacy_imported"] = bool(result["legacy_imported"])
+        return result
+
+    def save_schedule_config(
+        self,
+        *,
+        enabled: bool,
+        frequency: str,
+        schedule_time: str,
+        weekday: int,
+        interval_minutes: int,
+        scan_mode: str,
+        last_scheduled_at: str | None = None,
+        next_run_at: str | None = None,
+        missed_run_policy: str = "run_once",
+        legacy_imported: bool = True,
+    ) -> None:
+        if frequency not in {"daily", "weekly", "interval"}:
+            raise ValueError("定时频次必须是 daily、weekly 或 interval")
+        if scan_mode not in {"quick", "deep"}:
+            raise ValueError("定时巡检模式必须是 quick 或 deep")
+        if not 0 <= weekday <= 6:
+            raise ValueError("执行日必须在周一到周日之间")
+        if not 5 <= interval_minutes <= 1440:
+            raise ValueError("巡检间隔必须在 5 到 1440 分钟之间")
+        now = datetime.now(UTC).isoformat()
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO schedule_config(
+                    id, enabled, frequency, schedule_time, weekday, interval_minutes,
+                    scan_mode, last_scheduled_at, next_run_at, missed_run_policy,
+                    legacy_imported, updated_at
+                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    enabled = excluded.enabled,
+                    frequency = excluded.frequency,
+                    schedule_time = excluded.schedule_time,
+                    weekday = excluded.weekday,
+                    interval_minutes = excluded.interval_minutes,
+                    scan_mode = excluded.scan_mode,
+                    last_scheduled_at = excluded.last_scheduled_at,
+                    next_run_at = excluded.next_run_at,
+                    missed_run_policy = excluded.missed_run_policy,
+                    legacy_imported = excluded.legacy_imported,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    int(enabled),
+                    frequency,
+                    schedule_time,
+                    weekday,
+                    interval_minutes,
+                    scan_mode,
+                    last_scheduled_at,
+                    next_run_at,
+                    missed_run_policy,
+                    int(legacy_imported),
+                    now,
+                ),
+            )
+
     def get_wecom_config(self) -> dict[str, object]:
         with self.connect() as connection:
             row = connection.execute("SELECT * FROM wecom_config WHERE id = 1").fetchone()
@@ -1635,8 +1749,26 @@ class Storage:
                 "base_url": "https://api.openai.com/v1",
                 "model": "",
                 "max_candidates": 20,
+                "capabilities": {},
+                "probed_at": None,
             }
-        return {**dict(row), "enabled": bool(row["enabled"])}
+        result = {**dict(row), "enabled": bool(row["enabled"])}
+        try:
+            result["capabilities"] = json.loads(str(result.pop("capabilities_json", "{}")))
+        except json.JSONDecodeError:
+            result["capabilities"] = {}
+        return result
+
+    def save_llm_capabilities(self, capabilities: dict[str, object]) -> None:
+        now = datetime.now(UTC).isoformat()
+        with self.connect() as connection:
+            connection.execute(
+                (
+                    "UPDATE llm_config SET capabilities_json = ?, probed_at = ?, "
+                    "updated_at = ? WHERE id = 1"
+                ),
+                (json.dumps(capabilities, ensure_ascii=False), now, now),
+            )
 
     def save_llm_config(
         self,
@@ -1678,6 +1810,8 @@ class Storage:
                     base_url = excluded.base_url,
                     model = excluded.model,
                     max_candidates = excluded.max_candidates,
+                    capabilities_json = '{}',
+                    probed_at = NULL,
                     updated_at = excluded.updated_at
                 """,
                 (

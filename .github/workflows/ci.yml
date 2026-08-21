@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --dev --extra desktop
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run mypy src/opinion_watch/events.py src/opinion_watch/scheduling.py
+      - run: uv run pytest
+      - run: uv run python -m compileall -q src
+      - run: uv run opinion-watch-desktop --smoke-test
