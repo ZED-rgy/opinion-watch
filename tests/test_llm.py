@@ -33,6 +33,28 @@ def test_parse_assessment_normalizes_json_response() -> None:
     assert assessment.matched_signals == ["出现指控"]
 
 
+def test_parse_assessment_accepts_reasoning_model_aliases() -> None:
+    assessment = parse_assessment(
+        '{"brand":"示例品牌","sentiment":"中性","risk_level":"低",'
+        '"conclusion":"内容未涉及品牌负面信息，无需人工干预。"}'
+    )
+
+    assert assessment.category is OpinionCategory.IRRELEVANT
+    assert assessment.severity is RiskSeverity.P3
+    assert assessment.rationale.startswith("模型复判摘要：内容未涉及")
+
+
+def test_parse_assessment_extracts_json_after_reasoning_text() -> None:
+    assessment = parse_assessment(
+        "思考过程结束。<think>内部推理</think>结果如下："
+        '{"category":"ordinary_grievance","severity":"P2",'
+        '"summary":"需要跟进","evidence":[],"needs_review":true}'
+    )
+
+    assert assessment.category is OpinionCategory.ORDINARY_GRIEVANCE
+    assert assessment.requires_review
+
+
 def test_build_assessment_prompt_contains_public_content_fields() -> None:
     prompt = build_assessment_prompt(
         {
@@ -221,7 +243,10 @@ def test_llm_capability_probe_records_text_and_multimodal_support() -> None:
 
     async def fake_complete(messages):
         requests.append(messages)
-        return '{"ok":true}'
+        return (
+            '{"category":"other","severity":"P3","confidence":0.5,'
+            '"summary":"连接测试","evidence":[],"needs_review":false}'
+        )
 
     client._complete = fake_complete  # type: ignore[method-assign]
     capabilities = asyncio.run(client.probe_capabilities())

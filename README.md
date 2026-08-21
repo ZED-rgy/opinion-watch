@@ -304,8 +304,8 @@ uv run opinion-watch wecom discover --timeout-seconds 120
 uv run opinion-watch wecom test
 ```
 
-日报仅在 `watch` 或桌面端定时巡检触发的当天首次成功/部分成功巡检后发送一次；
-同一天后续巡检不会重复发送。手动“立即巡检”不会触发日报发送。
+日报在 `watch` 或手动“立即巡检”触发的当天首次成功/部分成功巡检后发送一次；
+同一天后续巡检不会重复发送。
 
 ## 安全与运行约束
 

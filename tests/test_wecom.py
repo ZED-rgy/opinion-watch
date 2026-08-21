@@ -150,6 +150,24 @@ def test_daily_report_is_sent_once_per_day(tmp_path: Path, monkeypatch: object) 
     assert len(calls) == 1
 
 
+def test_manual_scan_can_send_daily_report(tmp_path: Path, monkeypatch: object) -> None:
+    storage = make_storage(tmp_path)
+    storage.save_wecom_config(enabled=True, bot_id="bot", chat_id="chat")
+    run_id = storage.create_scan_run(
+        trigger="manual", platforms=["douyin"], brands=["速探长"], options={}
+    )
+    calls: list[str] = []
+
+    async def fake_send(self: WeComClient, chat_id: str, content: str) -> None:
+        calls.append(chat_id)
+
+    monkeypatch.setattr(CredentialStore, "get_wecom_secret", classmethod(lambda cls: "secret"))
+    monkeypatch.setattr(WeComClient, "send_markdown", fake_send)
+
+    assert asyncio.run(send_daily_report_if_due(storage, scan_run_id=run_id))
+    assert calls == ["chat"]
+
+
 def test_daily_report_claim_prevents_duplicate_senders(tmp_path: Path) -> None:
     storage = make_storage(tmp_path)
     run_id = storage.create_scan_run(

@@ -729,7 +729,10 @@ async def _run_scan_locked(
         model_summary=model_summary,
     )
     wecom_report_sent = False
-    if trigger == "watch" and status in {ScanRunStatus.SUCCEEDED, ScanRunStatus.PARTIAL}:
+    if trigger in {"watch", "manual"} and status in {
+        ScanRunStatus.SUCCEEDED,
+        ScanRunStatus.PARTIAL,
+    }:
         try:
             wecom_report_sent = await send_daily_report_if_due(storage, scan_run_id=run_id)
         except Exception as exc:
