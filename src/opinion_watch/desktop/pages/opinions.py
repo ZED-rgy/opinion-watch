@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from PySide6.QtCore import Qt, QUrl, Signal
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtGui import QColor, QDesktopServices
 from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
@@ -54,7 +54,7 @@ from opinion_watch.desktop.dialogs import (
     edit_scan_run_metadata,
     show_error,
 )
-from opinion_watch.desktop.theme import repolish
+from opinion_watch.desktop.theme import COLORS, repolish
 from opinion_watch.desktop.utils import format_timestamp
 from opinion_watch.models import OpinionCategory, RiskSeverity
 from opinion_watch.storage import Storage
@@ -347,13 +347,23 @@ class OpinionsPage(QWidget):
                 set_text_cell(
                     self.table, row, 9, assessment_source_name(str(item["source"])), tooltip=False
                 )
-                set_text_cell(
+                review_status = str(item["review_status"])
+                review_cell = set_text_cell(
                     self.table,
                     row,
                     10,
-                    REVIEW_STATUS_NAMES.get(str(item["review_status"]), item["review_status"]),
+                    REVIEW_STATUS_NAMES.get(review_status, review_status),
                     tooltip=False,
                 )
+                review_color = {
+                    "pending": COLORS["warning_text"],
+                    "reviewed": COLORS["success"],
+                }.get(review_status, "#8A94A6")
+                review_cell.setForeground(QColor(review_color))
+                if review_status == "pending":
+                    font = review_cell.font()
+                    font.setBold(True)
+                    review_cell.setFont(font)
         self.panel.show_count(len(rows))
         self._update_detail_panel()
         has_selected_run = run_id is not None

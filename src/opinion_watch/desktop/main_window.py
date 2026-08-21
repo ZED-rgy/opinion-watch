@@ -33,7 +33,7 @@ from opinion_watch.desktop.pages import (
     SchedulerPage,
     SettingsPage,
 )
-from opinion_watch.desktop.theme import COLORS, repolish
+from opinion_watch.desktop.theme import COLORS, SIDEBAR, repolish
 from opinion_watch.models import Platform
 from opinion_watch.storage import Storage
 
@@ -101,7 +101,7 @@ class MainWindow(QMainWindow):
         sidebar_layout.setContentsMargins(16, 22, 16, 18)
         logo = QHBoxLayout()
         logo_icon = QLabel()
-        logo_icon.setPixmap(icon("fa6s.shield-halved", "#2F5BEA").pixmap(QSize(28, 28)))
+        logo_icon.setPixmap(icon("fa6s.shield-halved", "#5B82FF").pixmap(QSize(28, 28)))
         logo.addWidget(logo_icon)
         brand = QLabel("品牌舆情监控")
         brand.setObjectName("brandName")
@@ -113,11 +113,13 @@ class MainWindow(QMainWindow):
         self.navigation.setObjectName("navigation")
         self.navigation.setItemDelegate(NavBadgeDelegate(self.navigation))
         self.nav_items: dict[Page, QListWidgetItem] = {}
+        self._nav_icons: dict[Page, str] = {}
         for page, text, icon_name in _NAV_ITEMS:
-            item = QListWidgetItem(icon(icon_name), text)
+            item = QListWidgetItem(icon(icon_name, SIDEBAR["icon"]), text)
             item.setSizeHint(QSize(0, 44))
             self.navigation.addItem(item)
             self.nav_items[page] = item
+            self._nav_icons[page] = icon_name
         sidebar_layout.addWidget(self.navigation, 1)
         ready = QFrame()
         ready.setObjectName("statusPill")
@@ -186,10 +188,10 @@ class MainWindow(QMainWindow):
 
     def change_page(self, index: int) -> None:
         self.stack.setCurrentIndex(index)
-        bell_item = self.nav_items[Page.NOTIFICATIONS]
-        bell_item.setIcon(
-            icon("fa6s.bell", "#244BC5" if index == Page.NOTIFICATIONS else "#5D667A")
-        )
+        # 深色侧边栏上激活项高亮为白色图标，其余保持浅灰。
+        for page, item in self.nav_items.items():
+            color = SIDEBAR["icon_active"] if page.value == index else SIDEBAR["icon"]
+            item.setIcon(icon(self._nav_icons[page], color))
         self.refresh_current_page()
 
     def refresh_current_page(self) -> None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
@@ -38,6 +39,7 @@ from opinion_watch.desktop.components import (
     toggle_all,
 )
 from opinion_watch.desktop.dialogs import confirm_destructive, show_error
+from opinion_watch.desktop.theme import COLORS
 from opinion_watch.desktop.utils import format_timestamp
 from opinion_watch.storage import Storage
 
@@ -126,7 +128,16 @@ class NotificationsPage(QWidget):
                 set_text_cell(
                     self.table, row, 5, format_timestamp(item["created_at"]), tooltip=False
                 )
-                set_text_cell(self.table, row, 6, "未读" if unread else "已读", tooltip=False)
+                status_cell = set_text_cell(
+                    self.table, row, 6, "未读" if unread else "已读", tooltip=False
+                )
+                if unread:
+                    status_cell.setForeground(QColor(COLORS["primary"]))
+                    status_font = status_cell.font()
+                    status_font.setBold(True)
+                    status_cell.setFont(status_font)
+                else:
+                    status_cell.setForeground(QColor("#8A94A6"))
         self.panel.show_count(len(rows))
 
     def selected_notification(self) -> dict[str, Any] | None:

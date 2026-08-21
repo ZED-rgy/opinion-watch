@@ -63,6 +63,21 @@ STATE_COLORS = {
 SPACING = {"xs": 4, "sm": 8, "md": 14, "lg": 18, "xl": 30}
 RADII = {"sm": 8, "md": 10, "lg": 14, "pill": 16}
 
+# 深色侧边栏令牌：导航区与内容区形成明确的层次对比。
+SIDEBAR = {
+    "bg": "#16213E",
+    "border": "#101830",
+    "text": "#A9B4CC",
+    "text_hover": "#E8ECF7",
+    "text_active": "#FFFFFF",
+    "hover_bg": "rgba(255, 255, 255, 0.07)",
+    "active_bg": "#2F5BEA",
+    "brand": "#FFFFFF",
+    "muted": "#6B77A0",
+    "icon": "#8B97BC",
+    "icon_active": "#FFFFFF",
+}
+
 
 def repolish(widget: QWidget) -> None:
     """在运行时修改动态属性后强制 QSS 重新求值。"""
@@ -85,8 +100,19 @@ QWidget#emptyState, QWidget#surfaceRow, QLabel, QCheckBox {{ background: transpa
 QStackedWidget#surfaceStack {{ background: transparent; }}
 QSplitter#opinionSplit {{ background: transparent; }}
 QSplitter::handle {{ background: {c["border"]}; width: 1px; }}
-QFrame#sidebar {{ background: {c["surface"]}; border-right: 1px solid #E8EAF0; }}
-QLabel#brandName {{ color: #14213D; font-size: 17px; font-weight: 700; }}
+QFrame#sidebar {{
+    background: {SIDEBAR["bg"]};
+    border-right: 1px solid {SIDEBAR["border"]};
+}}
+QFrame#sidebar QLabel {{ background: transparent; }}
+QLabel#brandName {{ color: {SIDEBAR["brand"]}; font-size: 17px; font-weight: 700; }}
+QFrame#sidebar QLabel#muted {{ color: {SIDEBAR["muted"]}; }}
+QFrame#sidebar QFrame#statusPill {{
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    border-radius: {RADII["pill"]}px;
+}}
+QFrame#sidebar QFrame#statusPill QLabel {{ color: #C6CFE4; font-weight: 600; }}
 QLabel#eyebrow {{ color: #71798A; font-size: 12px; font-weight: 600; }}
 QLabel#pageTitle {{ color: {c["text_strong"]}; font-size: 28px; font-weight: 700; }}
 QLabel#pageSubtitle {{ color: {c["text_muted"]}; font-size: 14px; }}
@@ -132,7 +158,10 @@ QFrame#surface, QFrame#hero {{
     border: 1px solid {c["border"]};
     border-radius: {RADII["lg"]}px;
 }}
-QFrame#hero {{ border: 1px solid #DFE5F2; }}
+QFrame#hero {{
+    border: 1px solid #DFE5F2;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #FFFFFF, stop:1 #F1F5FF);
+}}
 QFrame#detailPanel {{
     background: {c["surface"]};
     border: 1px solid {c["border"]};
@@ -152,13 +181,18 @@ QFrame#divider {{ background: #E7EAF0; border: 0; }}
 QPushButton {{
     min-height: 36px;
     padding: 0 15px;
-    background: {c["primary"]};
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #3D68F2, stop:1 #2C55E0);
     color: #FFFFFF;
     border: 1px solid {c["primary"]};
     border-radius: {RADII["sm"]}px;
     font-weight: 600;
 }}
-QPushButton:hover {{ background: {c["primary_hover"]}; border-color: {c["primary_hover"]}; }}
+QPushButton:hover {{
+    background: qlineargradient(
+        x1:0, y1:0, x2:0, y2:1, stop:0 #3059E5, stop:1 {c["primary_hover"]}
+    );
+    border-color: {c["primary_hover"]};
+}}
 QPushButton:pressed {{ background: {c["primary_pressed"]}; }}
 QPushButton:focus {{ border: 2px solid {c["focus_ring"]}; }}
 QPushButton:disabled {{
@@ -213,6 +247,7 @@ QTableWidget {{
     outline: 0;
 }}
 QTableWidget::item {{ border-bottom: 1px solid {c["border_soft"]}; padding: 8px; }}
+QTableWidget::item:hover {{ background: #F3F6FD; }}
 QTableWidget::item:selected {{
     background: {c["selection_bg"]};
     color: {c["selection_text"]};
@@ -220,12 +255,13 @@ QTableWidget::item:selected {{
     font-weight: 600;
 }}
 QHeaderView::section {{
-    background: #F6F7F9;
-    color: #5D667A;
+    background: transparent;
+    color: #8A94A6;
     border: 0;
     border-bottom: 1px solid #E5E8EE;
     padding: 10px 8px;
-    font-weight: 600;
+    font-size: 12px;
+    font-weight: 700;
 }}
 QToolTip {{
     background: #2B3245;
@@ -243,18 +279,24 @@ QMenu {{
 QMenu::item {{ padding: 8px 22px; border-radius: 6px; color: {c["text"]}; }}
 QMenu::item:selected {{ background: {c["primary_soft"]}; color: {c["primary_text"]}; }}
 QListWidget#navigation {{
-    background: {c["surface"]};
+    background: transparent;
     border: 0;
     outline: 0;
     padding: 6px 12px;
 }}
 QListWidget#navigation::item {{
-    color: #596277; padding: 11px 12px; border-radius: {RADII["sm"]}px; margin: 2px 0;
+    color: {SIDEBAR["text"]};
+    padding: 11px 12px;
+    border-radius: {RADII["sm"]}px;
+    margin: 2px 0;
 }}
-QListWidget#navigation::item:hover {{ background: #F3F5F9; color: #26334D; }}
+QListWidget#navigation::item:hover {{
+    background: {SIDEBAR["hover_bg"]};
+    color: {SIDEBAR["text_hover"]};
+}}
 QListWidget#navigation::item:selected {{
-    background: {c["primary_soft"]};
-    color: {c["primary_text"]};
+    background: {SIDEBAR["active_bg"]};
+    color: {SIDEBAR["text_active"]};
     font-weight: 600;
 }}
 QListWidget#timeline {{ background: transparent; border: 0; outline: 0; }}
