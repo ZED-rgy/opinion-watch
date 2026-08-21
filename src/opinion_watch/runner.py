@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import uuid
 from collections.abc import Sequence
+from contextlib import suppress
 from dataclasses import asdict, dataclass, replace
+from typing import Any
 
 from opinion_watch.browser import BrowserSession
 from opinion_watch.classification import classify_batch, classify_content, is_suspected
@@ -11,7 +13,7 @@ from opinion_watch.collectors import collector_for
 from opinion_watch.collectors.base import CollectorRuntimeError
 from opinion_watch.config import Settings
 from opinion_watch.events import serialize_event
-from opinion_watch.llm import LLMCallBudget, classify_with_llm, screen_items_with_llm
+from opinion_watch.llm import LLMAssessment, LLMCallBudget, classify_with_llm, screen_items_with_llm
 from opinion_watch.models import (
     CollectedContent,
     Platform,
@@ -54,7 +56,7 @@ class ScanOptions:
         if not 1 <= self.concurrency <= 4:
             raise ValueError("concurrency 必须在 1 到 4 之间")
 
-    def to_dict(self) -> dict[str, object]:
+    def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
@@ -118,7 +120,7 @@ async def _screen_items_for_admission(
     *,
     brand: str,
     budget: LLMCallBudget | None = None,
-) -> tuple[list[CollectedContent], set[str], dict[str, object]]:
+) -> tuple[list[CollectedContent], set[str], dict[str, Any]]:
     """Filter ordinary search cards before they reach the operational database."""
     screened, rule_candidates = _screen_items_for_detail(items)
     model_candidate_ids = set(rule_candidates)
@@ -147,7 +149,7 @@ async def _screen_items_for_admission(
         for item in screened
         if item.content_id in model_candidate_ids
     ]
-    model_assessments = {}
+    model_assessments: dict[str, LLMAssessment] = {}
     model_errors: list[str] = []
     model_attempted = 0
     try:
@@ -173,7 +175,7 @@ async def _screen_items_for_admission(
             keep = rule_admitted
             source = "rules"
             suspected = rule_admitted
-            screening_data: dict[str, object] = {
+            screening_data: dict[str, Any] = {
                 "source": source,
                 "admitted": keep,
                 "suspected": suspected,
@@ -258,14 +260,21 @@ async def _run_scan_locked(
     brands = list(dict.fromkeys(str(item["brand_name"]) for item in targets))
 
     platform_values = [platform.value for platform in platforms]
+    llm_config = storage.get_llm_config()
     run_id = storage.create_scan_run(
         trigger=trigger,
         platforms=platform_values,
         brands=brands,
-        options=options.to_dict(),
+        options={
+            **options.to_dict(),
+            # Keep the setting that was actually used at run start. The
+            # settings page can be edited while a subprocess is running, so
+            # reading it only after completion is misleading.
+            "llm_enabled_at_start": bool(llm_config.get("enabled")),
+        },
     )
     totals = ScanTotals()
-    llm_config = storage.get_llm_config()
+    coverage_shortfalls: list[str] = []
     llm_budget = LLMCallBudget(int(llm_config.get("max_candidates") or 20))
     print(
         serialize_event(
@@ -276,6 +285,7 @@ async def _run_scan_locked(
                 "status": ScanRunStatus.RUNNING.value,
                 "platforms": platform_values,
                 "brands": brands,
+                "llm_enabled": bool(llm_config.get("enabled")),
             },
             ensure_ascii=False,
         )
@@ -312,7 +322,7 @@ async def _run_scan_locked(
                 continue
             ready_accounts = storage.list_scan_accounts(platform.value)
             if len(ready_accounts) > 1:
-                selected_account: dict[str, object] | None = None
+                selected_account: dict[str, Any] | None = None
                 for candidate_account in ready_accounts:
                     candidate_lease_name = f"account:{int(candidate_account['id'])}"
                     if not storage.acquire_task_lease(candidate_lease_name, owner):
@@ -328,8 +338,18 @@ async def _run_scan_locked(
                             probe_status = await collector.session_status(
                                 probe_page, probe_session.active_context
                             )
-                    except Exception:
+                    except Exception as exc:
                         storage.update_account_status(int(candidate_account["id"]), "error")
+                        storage.create_alert(
+                            run_id=run_id,
+                            platform=platform.value,
+                            kind="account_probe_error",
+                            severity="warning",
+                            message=(
+                                f"{platform.value} 账号 #{candidate_account['id']} "
+                                f"登录态探测失败：{exc}"
+                            ),
+                        )
                         continue
                     finally:
                         storage.release_task_lease(candidate_lease_name, owner)
@@ -406,7 +426,7 @@ async def _run_scan_locked(
                         prefetch_semaphore = asyncio.Semaphore(options.concurrency)
 
                         async def prefetch_target(
-                            target: dict[str, object],
+                            target: dict[str, Any],
                             *,
                             semaphore: asyncio.Semaphore = prefetch_semaphore,
                             cache: dict[str, list[CollectedContent] | Exception] = (
@@ -418,8 +438,9 @@ async def _run_scan_locked(
                             keyword = str(target["keyword"])
                             cache_key = f"{brand}\x00{keyword}"
                             async with semaphore:
-                                prefetch_page = await session.active_context.new_page()
+                                prefetch_page = None
                                 try:
+                                    prefetch_page = await session.active_context.new_page()
                                     cache[cache_key] = await target_collector.search(
                                         prefetch_page,
                                         session.active_context,
@@ -427,9 +448,13 @@ async def _run_scan_locked(
                                         limit=options.limit,
                                     )
                                 except Exception as exc:
+                                    # 缓存异常而不是抛出：gather 一旦抛出，其余
+                                    # 预取任务会继续挂在即将关闭的浏览器上下文上。
                                     cache[cache_key] = exc
                                 finally:
-                                    await prefetch_page.close()
+                                    if prefetch_page is not None:
+                                        with suppress(Exception):
+                                            await prefetch_page.close()
 
                         await asyncio.gather(*(prefetch_target(target) for target in targets))
                     for target_index, target in enumerate(targets):
@@ -624,6 +649,44 @@ async def _run_scan_locked(
                                 scanned_count = int(screening_stats["scanned"])
                                 filtered_count = int(screening_stats["filtered"])
                                 suspected_count = int(screening_stats["suspected"])
+                                # Zero results can be a legitimate no-match
+                                # search. Warn when the platform returned a
+                                # partial page, which is the actionable case
+                                # for coverage and loading diagnostics.
+                                if 0 < scanned_count < options.limit:
+                                    shortfall = (
+                                        f"{platform.value}/{keyword} 实际检索 {scanned_count} 条，"
+                                        f"低于目标 {options.limit} 条"
+                                    )
+                                    coverage_shortfalls.append(shortfall)
+                                    storage.create_alert(
+                                        run_id=run_id,
+                                        attempt_id=attempt_id,
+                                        platform=platform.value,
+                                        keyword=keyword,
+                                        kind="coverage_shortfall",
+                                        severity="warning",
+                                        message=(
+                                            "平台当前可见结果不足目标数量，已完成可见范围扫描："
+                                            + shortfall
+                                        ),
+                                    )
+                                elif scanned_count == 0:
+                                    # A silent selector break looks identical to
+                                    # "no results"; surface it for human triage.
+                                    storage.create_alert(
+                                        run_id=run_id,
+                                        attempt_id=attempt_id,
+                                        platform=platform.value,
+                                        keyword=keyword,
+                                        kind="zero_results",
+                                        severity="warning",
+                                        message=(
+                                            f"{platform.value}/{keyword} 检索结果为 0 条。"
+                                            "可能确实没有公开结果，也可能是页面结构变化导致"
+                                            "选择器失效，建议人工打开搜索页核对一次。"
+                                        ),
+                                    )
                                 totals.scanned += scanned_count
                                 totals.filtered += filtered_count
                                 totals.suspected += suspected_count
@@ -718,8 +781,8 @@ async def _run_scan_locked(
         )
         raise
 
-    classification_summary: dict[str, object] | None = None
-    model_summary: dict[str, object] | None = None
+    classification_summary: dict[str, Any] | None = None
+    model_summary: dict[str, Any] | None = None
     if totals.succeeded > 0:
         try:
             classification_summary = classify_batch(
@@ -738,6 +801,7 @@ async def _run_scan_locked(
             )
         try:
             model_summary = await classify_with_llm(storage, run_id=run_id, budget=llm_budget)
+            model_summary["enabled_at_start"] = bool(llm_config.get("enabled"))
             if model_summary.get("failed"):
                 storage.create_alert(
                     run_id=run_id,
@@ -747,7 +811,12 @@ async def _run_scan_locked(
                     or "部分内容的大模型复判失败。",
                 )
         except Exception as exc:
-            model_summary = {"enabled": True, "processed": 0, "failed": 1}
+            model_summary = {
+                "enabled": bool(llm_config.get("enabled")),
+                "enabled_at_start": bool(llm_config.get("enabled")),
+                "processed": 0,
+                "failed": 1,
+            }
             storage.create_alert(
                 run_id=run_id,
                 kind="llm_classification_error",
@@ -789,6 +858,7 @@ async def _run_scan_locked(
         suspected=totals.suspected,
         detailed=totals.detailed,
         media_items=totals.media_items,
+        note=("；".join(coverage_shortfalls) if coverage_shortfalls else ""),
         classification_summary=classification_summary,
         model_summary=model_summary,
     )

@@ -235,7 +235,12 @@ def test_scan_runner_retries_transient_error_and_records_attempts(
         "succeeded",
     ]
     assert collector.keywords == ["速探长", "速探长", "速探长物流"]
-    assert storage.list_alerts() == []
+    alerts = storage.list_alerts()
+    assert len(alerts) == 2
+    assert {alert["kind"] for alert in alerts} == {"coverage_shortfall"}
+    assert all("低于目标 20 条" in alert["message"] for alert in alerts)
+    assert "实际检索 1 条" in str(run["note"])
+    assert run["options"]["llm_enabled_at_start"] is False
     assessments = storage.list_assessments()
     assert len(assessments) == 1
     assert assessments[0]["content_item_id"] == 1

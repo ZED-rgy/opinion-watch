@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 
 from opinion_watch.scheduling import next_scheduled_datetime
 from opinion_watch.storage import Storage
@@ -14,7 +15,7 @@ class ScheduleService:
     def __init__(self, storage: Storage) -> None:
         self.storage = storage
 
-    def load(self) -> dict[str, object]:
+    def load(self) -> dict[str, Any]:
         return self.storage.get_schedule_config()
 
     def save(self, **values: object) -> None:
@@ -34,7 +35,7 @@ class ScheduleService:
             legacy_imported=bool(values.get("legacy_imported", True)),
         )
 
-    def next_run(self, config: dict[str, object], now: datetime) -> datetime:
+    def next_run(self, config: dict[str, Any], now: datetime) -> datetime:
         return next_scheduled_datetime(
             now,
             frequency=str(config.get("frequency") or "daily"),

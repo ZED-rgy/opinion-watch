@@ -8,6 +8,8 @@ import uuid
 from collections.abc import Sequence
 from contextlib import suppress
 from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
 
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
@@ -242,7 +244,7 @@ def _account_profile(
     storage: Storage,
     platform: Platform,
     account_id: int | None,
-) -> tuple[object, object]:
+) -> tuple[Path, dict[str, Any] | None]:
     if account_id is None:
         return settings.profile_dir(platform), None
     account = next(
