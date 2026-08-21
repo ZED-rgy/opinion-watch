@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import uuid
 from collections.abc import Callable
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -29,11 +31,13 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPushButton,
     QScrollArea,
     QSpinBox,
     QStackedWidget,
+    QSystemTrayIcon,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -46,10 +50,11 @@ from opinion_watch.config import DEFAULT_BRANDS, Settings
 from opinion_watch.credentials import CredentialStore
 from opinion_watch.events import parse_event
 from opinion_watch.models import OpinionCategory, Platform, RiskSeverity
-from opinion_watch.scheduling import next_scheduled_datetime
+from opinion_watch.services import ScheduleService
 from opinion_watch.storage import Storage
 
 ASSET_DIR = Path(__file__).with_name("assets")
+AUTOSTART_REGISTRY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
 PLATFORM_NAMES = {
     Platform.DOUYIN.value: "抖音",
@@ -86,6 +91,39 @@ ASSESSMENT_SOURCE_NAMES = {"rules": "规则", "model": "大模型", "manual": "�
 
 def _assessment_source_name(source: str) -> str:
     return ASSESSMENT_SOURCE_NAMES.get(source, source)
+
+
+def _windows_autostart_enabled() -> bool:
+    if os.name != "nt":
+        return False
+    import winreg
+
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_REGISTRY_PATH) as key:
+            winreg.QueryValueEx(key, "OpinionWatch")
+    except (FileNotFoundError, OSError):
+        return False
+    return True
+
+
+def _set_windows_autostart(enabled: bool) -> None:
+    if os.name != "nt":
+        if enabled:
+            raise RuntimeError("开机启动仅支持 Windows。")
+        return
+    import winreg
+
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, AUTOSTART_REGISTRY_PATH) as key:
+        if enabled:
+            launcher = Path(sys.argv[0]).resolve()
+            if launcher.suffix.lower() == ".py" or launcher.name.lower().startswith("python"):
+                command = f'"{sys.executable}" -m opinion_watch.desktop'
+            else:
+                command = f'"{launcher}"'
+            winreg.SetValueEx(key, "OpinionWatch", 0, winreg.REG_SZ, command)
+        else:
+            with suppress(FileNotFoundError):
+                winreg.DeleteValue(key, "OpinionWatch")
 
 
 CATEGORY_NAMES = {
@@ -573,8 +611,9 @@ class SchedulerPage(QWidget):
     def __init__(self, storage: Storage) -> None:
         super().__init__()
         self.storage = storage
+        self.schedule_service = ScheduleService(storage)
         self.app_settings = QSettings("opinion-watch", "desktop")
-        schedule_config = self.storage.get_schedule_config()
+        schedule_config = self.schedule_service.load()
         if not bool(schedule_config.get("legacy_imported")):
             legacy_frequency = str(self.app_settings.value("schedule_frequency", "daily"))
             legacy_time = str(self.app_settings.value("schedule_time", "09:00"))
@@ -582,7 +621,7 @@ class SchedulerPage(QWidget):
             legacy_interval = int(self.app_settings.value("interval_minutes", 60))
             legacy_mode = str(self.app_settings.value("scan_mode", "quick"))
             legacy_enabled = str(self.app_settings.value("auto_enabled", "false")).lower() == "true"
-            self.storage.save_schedule_config(
+            self.schedule_service.save(
                 enabled=legacy_enabled,
                 frequency=legacy_frequency
                 if legacy_frequency in {"daily", "weekly", "interval"}
@@ -593,7 +632,7 @@ class SchedulerPage(QWidget):
                 scan_mode=legacy_mode if legacy_mode in {"quick", "deep"} else "quick",
                 legacy_imported=True,
             )
-            schedule_config = self.storage.get_schedule_config()
+            schedule_config = self.schedule_service.load()
         self.process = QProcess(self)
         self.timer = QTimer(self)
         self.timer.setSingleShot(True)
@@ -855,12 +894,12 @@ class SchedulerPage(QWidget):
         next_run_at: datetime | None | object = ...,
         last_scheduled_at: datetime | None | object = ...,
     ) -> None:
-        current = self.storage.get_schedule_config()
+        current = self.schedule_service.load()
         next_value = current.get("next_run_at") if next_run_at is ... else next_run_at
         last_value = (
             current.get("last_scheduled_at") if last_scheduled_at is ... else last_scheduled_at
         )
-        self.storage.save_schedule_config(
+        self.schedule_service.save(
             enabled=self.auto_enabled.isChecked(),
             frequency=str(self.frequency.currentData()),
             schedule_time=self.schedule_time.time().toString("HH:mm"),
@@ -886,12 +925,14 @@ class SchedulerPage(QWidget):
 
     def _next_scheduled_datetime(self) -> datetime:
         now = datetime.now().astimezone()
-        return next_scheduled_datetime(
+        return self.schedule_service.next_run(
+            {
+                "frequency": self.frequency.currentData(),
+                "schedule_time": self.schedule_time.time().toString("HH:mm"),
+                "weekday": self.weekday.currentData(),
+                "interval_minutes": self.interval.value(),
+            },
             now,
-            frequency=str(self.frequency.currentData()),
-            schedule_time=self.schedule_time.time().toString("HH:mm"),
-            weekday=int(self.weekday.currentData()),
-            interval_minutes=self.interval.value(),
         )
 
     def _set_next_run(self) -> None:
@@ -901,7 +942,7 @@ class SchedulerPage(QWidget):
 
     def configure_timer(self, enabled: bool) -> None:
         if enabled:
-            saved_next = self.storage.get_schedule_config().get("next_run_at")
+            saved_next = self.schedule_service.load().get("next_run_at")
             try:
                 parsed_next = datetime.fromisoformat(str(saved_next)) if saved_next else None
             except ValueError:
@@ -2166,10 +2207,16 @@ class SettingsPage(QWidget):
         wecom_actions.addWidget(self.wecom_discover_button)
         wecom_actions.addStretch()
         layout.addLayout(wecom_actions)
+        self.autostart_enabled = QCheckBox("启用 Windows 开机启动")
+        self.autostart_enabled.setToolTip(
+            "仅写入当前 Windows 用户的启动项；关闭应用后不会继续驻留后台。"
+        )
+        self.autostart_enabled.toggled.connect(self.save_autostart)
+        layout.addWidget(self.autostart_enabled)
         layout.addWidget(_title("大模型辅助研判", "sectionTitle"))
         llm_note = QLabel(
-            "可选的二次复判：规则先筛选疑似舆情，再调用兼容 OpenAI chat/completions 的接口；"
-            "详情中的图片和视频关键帧会随多模态请求一并研判。"
+            "可选的文本二次复判：规则先筛选疑似舆情，再调用兼容 OpenAI chat/completions 的接口；"
+            "当前仅发送标题、正文和评论等文本证据，不发送图片或视频。"
             "例如 DeepSeek 使用 https://api.deepseek.com，OpenAI 使用 https://api.openai.com/v1。"
             " API Key 仅保存到 Windows 凭据管理器；关闭后不影响规则巡检。"
         )
@@ -2242,6 +2289,9 @@ class SettingsPage(QWidget):
         self.wecom_bot_id.setText(str(config.get("bot_id") or ""))
         self.wecom_chat_id.setText(str(config.get("chat_id") or ""))
         self.wecom_secret.clear()
+        self.autostart_enabled.blockSignals(True)
+        self.autostart_enabled.setChecked(_windows_autostart_enabled())
+        self.autostart_enabled.blockSignals(False)
         llm_config = self.storage.get_llm_config()
         self.llm_enabled.blockSignals(True)
         self.llm_enabled.setChecked(bool(llm_config.get("enabled")))
@@ -2272,6 +2322,15 @@ class SettingsPage(QWidget):
         except Exception as exc:
             _show_error(self, exc)
             return False
+
+    def save_autostart(self, enabled: bool) -> None:
+        try:
+            _set_windows_autostart(enabled)
+        except Exception as exc:
+            self.autostart_enabled.blockSignals(True)
+            self.autostart_enabled.setChecked(not enabled)
+            self.autostart_enabled.blockSignals(False)
+            _show_error(self, exc)
 
     def test_wecom(self) -> None:
         if self.wecom_test_process.state() != QProcess.ProcessState.NotRunning:
@@ -2608,6 +2667,32 @@ def main() -> None:
     )
     window = MainWindow(settings, storage)
     window.navigation.setCurrentRow(args.page)
+    tray: QSystemTrayIcon | None = None
+    if not args.smoke_test and QSystemTrayIcon.isSystemTrayAvailable():
+        tray = QSystemTrayIcon(window.windowIcon(), window)
+        tray.setToolTip("品牌舆情监控")
+        tray_menu = QMenu(window)
+        show_action = tray_menu.addAction("显示主窗口")
+        show_action.triggered.connect(window.showNormal)
+        show_action.triggered.connect(window.raise_)
+        show_action.triggered.connect(window.activateWindow)
+        tray_menu.addSeparator()
+        quit_action = tray_menu.addAction("退出")
+        quit_action.triggered.connect(app.quit)
+        tray.setContextMenu(tray_menu)
+
+        def activate_tray(reason: QSystemTrayIcon.ActivationReason) -> None:
+            if reason in (
+                QSystemTrayIcon.ActivationReason.Trigger,
+                QSystemTrayIcon.ActivationReason.DoubleClick,
+            ):
+                window.showNormal()
+                window.raise_()
+                window.activateWindow()
+
+        tray.activated.connect(activate_tray)
+        tray.show()
+        app.aboutToQuit.connect(tray.hide)
     if args.screenshot:
         screenshot_path = args.screenshot.resolve()
         screenshot_path.parent.mkdir(parents=True, exist_ok=True)

@@ -33,6 +33,7 @@ def test_daily_report_contains_scan_summary(tmp_path: Path) -> None:
 
     assert "品牌舆情巡检日报" in report
     assert "当日去重内容：1 条" in report
+    assert "聚合事件：0 个" in report
 
 
 def test_wecom_client_authenticates_and_sends_markdown() -> None:

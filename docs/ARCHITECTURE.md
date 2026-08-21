@@ -61,6 +61,8 @@ Python 应用服务
   API Key 不存入数据库。
 - `schedule_config`：启用状态、每日/每周/间隔频次、执行时间、上次计划时间、下次执行时间
   和错过任务策略。
+- `event_clusters`、`event_cluster_members`：按平台、品牌和规范化标题生成的保守事件聚合，
+  只纳入疑似/高风险内容；聚合表可重建，不替代原始内容和人工复核记录。
 - `schema_migrations`、`task_leases`：数据库迁移版本和跨进程任务租约。
 
 ## 大模型接口
@@ -71,11 +73,12 @@ Python 应用服务
 - 舆情类型与风险复判；
 - 简短摘要和模型证据；
 - 模型失败时保留规则结论并生成告警；一轮巡检共享调用预算，避免按关键词无限叠加调用。
-- 保存配置或测试连接时探测文本和多模态能力，巡检按探测结果选择消息格式；服务商不接受
-  `image_url` 消息时自动回退为文本请求；非本机 Base URL 要求 HTTPS。
+- 保存配置或测试连接时探测文本能力；当前 Provider Adapter 固定使用标题、正文和评论等
+  文本消息，图片和视频证据不发送给大模型；非本机 Base URL 要求 HTTPS。
 
 当前客户端使用兼容 OpenAI `chat/completions` 的 HTTP 接口。API Key 存入 Windows
-凭据管理器，不进入 SQLite、日志、配置文件或 Git。相似内容聚类和定期简报仍是后续能力。
+凭据管理器，不进入 SQLite、日志、配置文件或 Git。当前只发送标题、正文和评论等文本
+证据，图片、视频和关键帧不会发给大模型；事件聚合结果会进入日报统计。
 
 ## Worker 事件协议
 
@@ -85,10 +88,13 @@ Python 应用服务
 
 ## 调度边界
 
-调度配置已进入 SQLite，不再只依赖 QSettings。桌面端负责展示和配置，纯计算规则位于
-`opinion_watch.scheduling`，启动时会恢复未来的 `next_run_at`；如果发现错过计划，则按
-`run_once` 策略补跑一次，再恢复正常频次。CLI `watch` 仍可用于显式前台循环，后续可复用同一
-调度服务接入无界面 Worker。
+调度配置已进入 SQLite，不再只依赖 QSettings。桌面端负责展示和配置，调度读写和纯计算规则
+由 `opinion_watch.services.ScheduleService` 与 `opinion_watch.scheduling` 共同提供；启动时会
+恢复未来的 `next_run_at`，如果发现错过计划，则按 `run_once` 策略补跑一次，再恢复正常频次。
+CLI `watch` 也复用同一套下一次执行计算。
+
+正常桌面进程提供系统托盘菜单，可从托盘恢复主窗口或退出应用；设置页的开机启动开关只
+修改当前 Windows 用户的启动项，默认关闭。安装包不在当前源码阶段自动生成。
 
 ## 通知扩展
 

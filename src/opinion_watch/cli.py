@@ -4,8 +4,9 @@ import argparse
 import asyncio
 import json
 import sys
+import uuid
 from collections.abc import Sequence
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 from opinion_watch.browser import BrowserProfileLocked, BrowserSession
 from opinion_watch.classification import classify_batch
@@ -16,6 +17,7 @@ from opinion_watch.credentials import CredentialStore
 from opinion_watch.llm import LLMClient, LLMSettings
 from opinion_watch.models import OpinionCategory, Platform, RiskSeverity, SessionStatus
 from opinion_watch.runner import ScanOptions, _screen_items_for_admission, run_scan
+from opinion_watch.scheduling import next_scheduled_datetime
 from opinion_watch.storage import Storage
 from opinion_watch.wecom import WeComClient
 
@@ -250,23 +252,33 @@ async def _login(
 ) -> int:
     collector = collector_for(platform)
     profile_dir, account = _account_profile(settings, storage, platform, account_id)
-    async with BrowserSession(
-        profile_dir,
-        channel=settings.browser_channel,
-        headless=False,
-        artifact_dir=settings.artifact_dir / platform.value,
-    ) as session:
-        page = await session.page()
-        await page.goto(collector.home_url, wait_until="domcontentloaded", timeout=60_000)
-        print(f"已打开 {platform.value}。请在浏览器中完成登录。")
-        await asyncio.to_thread(input, "登录完成后回到此处按回车关闭浏览器：")
-        status = await collector.session_status(page, session.active_context)
-        if account is not None:
-            storage.update_account_status(
-                int(account["id"]), "ready" if status is SessionStatus.HEALTHY else status.value
+    lease_name = f"account:{int(account['id'])}" if account is not None else None
+    owner = f"login-{uuid.uuid4()}"
+    if lease_name is not None and not storage.acquire_task_lease(lease_name, owner):
+        raise BrowserProfileLocked("该账号浏览器档案正在被其他任务使用，请先关闭对应窗口。")
+    try:
+        async with BrowserSession(
+            profile_dir,
+            channel=settings.browser_channel,
+            headless=False,
+            artifact_dir=settings.artifact_dir / platform.value,
+        ) as session:
+            page = await session.page()
+            await page.goto(collector.home_url, wait_until="domcontentloaded", timeout=60_000)
+            print(f"已打开 {platform.value}。请在浏览器中完成登录。")
+            await asyncio.to_thread(input, "登录完成后回到此处按回车关闭浏览器：")
+            status = await collector.session_status(page, session.active_context)
+            if account is not None:
+                storage.update_account_status(
+                    int(account["id"]), "ready" if status is SessionStatus.HEALTHY else status.value
+                )
+            print(
+                json.dumps({"platform": platform.value, "status": status.value}, ensure_ascii=False)
             )
-        print(json.dumps({"platform": platform.value, "status": status.value}, ensure_ascii=False))
-        return 0 if status is SessionStatus.HEALTHY else 2
+            return 0 if status is SessionStatus.HEALTHY else 2
+    finally:
+        if lease_name is not None:
+            storage.release_task_lease(lease_name, owner)
 
 
 async def _check(
@@ -278,21 +290,31 @@ async def _check(
 ) -> int:
     collector = collector_for(platform)
     profile_dir, account = _account_profile(settings, storage, platform, account_id)
-    async with BrowserSession(
-        profile_dir,
-        channel=settings.browser_channel,
-        headless=headless,
-        artifact_dir=settings.artifact_dir / platform.value,
-    ) as session:
-        page = await session.page()
-        await page.goto(collector.home_url, wait_until="domcontentloaded", timeout=60_000)
-        status = await collector.session_status(page, session.active_context)
-        if account is not None:
-            storage.update_account_status(
-                int(account["id"]), "ready" if status is SessionStatus.HEALTHY else status.value
+    lease_name = f"account:{int(account['id'])}" if account is not None else None
+    owner = f"check-{uuid.uuid4()}"
+    if lease_name is not None and not storage.acquire_task_lease(lease_name, owner):
+        raise BrowserProfileLocked("该账号浏览器档案正在被其他任务使用，请先关闭对应窗口。")
+    try:
+        async with BrowserSession(
+            profile_dir,
+            channel=settings.browser_channel,
+            headless=headless,
+            artifact_dir=settings.artifact_dir / platform.value,
+        ) as session:
+            page = await session.page()
+            await page.goto(collector.home_url, wait_until="domcontentloaded", timeout=60_000)
+            status = await collector.session_status(page, session.active_context)
+            if account is not None:
+                storage.update_account_status(
+                    int(account["id"]), "ready" if status is SessionStatus.HEALTHY else status.value
+                )
+            print(
+                json.dumps({"platform": platform.value, "status": status.value}, ensure_ascii=False)
             )
-        print(json.dumps({"platform": platform.value, "status": status.value}, ensure_ascii=False))
-        return 0 if status is SessionStatus.HEALTHY else 2
+            return 0 if status is SessionStatus.HEALTHY else 2
+    finally:
+        if lease_name is not None:
+            storage.release_task_lease(lease_name, owner)
 
 
 async def _search_one(
@@ -411,8 +433,10 @@ async def _scan(
 
 
 async def _watch(settings: Settings, storage: Storage, args: argparse.Namespace) -> int:
-    if args.interval_minutes <= 0:
-        raise ValueError("interval-minutes 必须大于 0")
+    if args.interval_minutes < 5:
+        raise ValueError("interval-minutes 必须在 5 到 1440 分钟之间")
+    if args.interval_minutes > 1440:
+        raise ValueError("interval-minutes 必须在 5 到 1440 分钟之间")
     if args.max_runs < 0:
         raise ValueError("max-runs 不能小于 0")
 
@@ -438,8 +462,14 @@ async def _watch(settings: Settings, storage: Storage, args: argparse.Namespace)
         if args.max_runs and completed >= args.max_runs:
             return exit_code
 
-        delay_seconds = args.interval_minutes * 60
-        next_run = datetime.now(UTC) + timedelta(seconds=delay_seconds)
+        now = datetime.now(UTC)
+        next_run = next_scheduled_datetime(
+            now,
+            frequency="interval",
+            schedule_time="00:00",
+            interval_minutes=args.interval_minutes,
+        )
+        delay_seconds = max(0, (next_run - now).total_seconds())
         print(
             json.dumps(
                 {

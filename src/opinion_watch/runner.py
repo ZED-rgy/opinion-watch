@@ -295,6 +295,9 @@ async def _run_scan_locked(
             if len(ready_accounts) > 1:
                 selected_account: dict[str, object] | None = None
                 for candidate_account in ready_accounts:
+                    candidate_lease_name = f"account:{int(candidate_account['id'])}"
+                    if not storage.acquire_task_lease(candidate_lease_name, owner):
+                        continue
                     try:
                         async with BrowserSession(
                             settings.account_profile_dir(platform, int(candidate_account["id"])),
@@ -309,6 +312,8 @@ async def _run_scan_locked(
                     except Exception:
                         storage.update_account_status(int(candidate_account["id"]), "error")
                         continue
+                    finally:
+                        storage.release_task_lease(candidate_lease_name, owner)
                     if probe_status is SessionStatus.HEALTHY:
                         selected_account = candidate_account
                         break
@@ -326,6 +331,17 @@ async def _run_scan_locked(
                     )
                     continue
                 account = selected_account
+            account_lease_name = f"account:{int(account['id'])}"
+            if not storage.acquire_task_lease(account_lease_name, owner):
+                totals.failed += 1
+                storage.create_alert(
+                    run_id=run_id,
+                    platform=platform.value,
+                    kind="account_busy",
+                    severity="warning",
+                    message=f"{platform.value} 账号浏览器档案正在被其他任务使用。",
+                )
+                continue
             try:
                 async with BrowserSession(
                     settings.account_profile_dir(platform, int(account["id"])),
@@ -621,6 +637,8 @@ async def _run_scan_locked(
                         ensure_ascii=False,
                     )
                 )
+            finally:
+                storage.release_task_lease(account_lease_name, owner)
     except asyncio.CancelledError:
         storage.finish_scan_run(
             run_id,
@@ -671,6 +689,21 @@ async def _run_scan_locked(
                 kind="llm_classification_error",
                 severity="warning",
                 message=f"大模型复判未执行：{exc}",
+            )
+        try:
+            # Rebuild from the full suspected/high-risk history so a new run does not
+            # erase clusters created by earlier runs. The run remains available in
+            # scan_run_contents for filtering/reporting at read time.
+            cluster_count = storage.rebuild_event_clusters()
+            if classification_summary is None:
+                classification_summary = {}
+            classification_summary["event_clusters"] = cluster_count
+        except Exception as exc:
+            storage.create_alert(
+                run_id=run_id,
+                kind="event_clustering_error",
+                severity="warning",
+                message=f"事件聚合未执行：{exc}",
             )
 
     if totals.failed == 0:

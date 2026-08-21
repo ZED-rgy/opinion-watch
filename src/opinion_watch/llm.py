@@ -1,12 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
-import mimetypes
 import re
 from dataclasses import dataclass
-from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -34,7 +31,6 @@ class LLMSettings:
     model: str
     api_key: str
     max_candidates: int = 20
-    multimodal_messages: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,9 +93,7 @@ class LLMClient:
             raise LLMConfigurationError("未找到大模型 API Key")
 
     async def assess(self, content: dict[str, object]) -> LLMAssessment:
-        message = build_assessment_message(
-            content, allow_multimodal=self.settings.multimodal_messages
-        )
+        message = build_assessment_message(content)
         try:
             raw = await self._complete(
                 [
@@ -108,17 +102,7 @@ class LLMClient:
                 ]
             )
         except LLMError as exc:
-            # Some OpenAI-compatible gateways accept chat/completions but only
-            # implement text messages. Retry image evidence as text rather than
-            # failing the whole detail pass on an image_url validation error.
-            if isinstance(message, list) and _is_multimodal_unsupported(exc):
-                raw = await self._complete(
-                    [
-                        {"role": "system", "content": _SYSTEM_PROMPT},
-                        {"role": "user", "content": build_assessment_prompt(content)},
-                    ]
-                )
-            elif "大模型返回了空内容" in str(exc):
+            if "大模型返回了空内容" in str(exc):
                 # A few compatible gateways occasionally return an empty first
                 # choice. Retry once without media; never invent a result for
                 # an empty model response.
@@ -141,32 +125,12 @@ class LLMClient:
         )
 
     async def probe_capabilities(self) -> LLMCapabilities:
-        """Probe text and image message compatibility for the configured endpoint."""
+        """Probe the text-only provider contract used by this application."""
         try:
             await self.test()
         except LLMError as exc:
             return LLMCapabilities(False, False, False, str(exc)[:300])
-
-        pixel = (
-            "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQ"
-            "VR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
-        )
-        try:
-            await self._complete(
-                [
-                    {"role": "system", "content": '只需返回 JSON：{"ok":true}。'},
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": "请确认图片消息格式正常。"},
-                            {"type": "image_url", "image_url": {"url": pixel}},
-                        ],
-                    },
-                ]
-            )
-        except LLMError as exc:
-            return LLMCapabilities(True, True, False, str(exc)[:300])
-        return LLMCapabilities(True, True, True)
+        return LLMCapabilities(True, True, False)
 
     async def _complete(self, messages: list[dict[str, object]]) -> str:
         payload = {
@@ -258,51 +222,9 @@ def build_assessment_prompt(content: dict[str, object]) -> str:
     )[:12_000]
 
 
-def build_assessment_message(
-    content: dict[str, object], *, allow_multimodal: bool = True
-) -> str | list[dict[str, object]]:
-    """Add locally captured image/video keyframe evidence when available."""
-    prompt = build_assessment_prompt(content)
-    if not allow_multimodal:
-        return prompt
-    raw_data = content.get("raw_data")
-    raw = raw_data if isinstance(raw_data, dict) else {}
-    media = raw.get("media")
-    if not isinstance(media, list):
-        return prompt
-
-    parts: list[dict[str, object]] = [{"type": "text", "text": prompt}]
-    for item in media[:4]:
-        if not isinstance(item, dict):
-            continue
-        data_url = _media_data_url(item)
-        if data_url:
-            parts.append({"type": "image_url", "image_url": {"url": data_url}})
-    return parts if len(parts) > 1 else prompt
-
-
-def _is_multimodal_unsupported(error: Exception) -> bool:
-    """Return whether an API error specifically rejects image message parts."""
-    message = str(error).lower()
-    return ("image_url" in message or "image url" in message) and any(
-        marker in message
-        for marker in ("unknown variant", "expected text", "unsupported", "invalid")
-    )
-
-
-def _media_data_url(item: dict[str, object]) -> str | None:
-    path_value = str(item.get("evidence_path") or "")
-    if path_value:
-        path = Path(path_value)
-        try:
-            if path.is_file() and path.stat().st_size <= 2_000_000:
-                mime = mimetypes.guess_type(path.name)[0] or "image/png"
-                encoded = base64.b64encode(path.read_bytes()).decode("ascii")
-                return f"data:{mime};base64,{encoded}"
-        except OSError:
-            pass
-    url = str(item.get("url") or item.get("poster") or "")
-    return url if url.startswith(("https://", "http://")) else None
+def build_assessment_message(content: dict[str, object]) -> str:
+    """Build the only message format supported by the text-only provider."""
+    return build_assessment_prompt(content)
 
 
 def parse_assessment(raw_response: str) -> LLMAssessment:
@@ -381,17 +303,12 @@ def _settings_from_storage(storage: Storage) -> LLMSettings | None:
     config = storage.get_llm_config()
     if not bool(config.get("enabled")):
         return None
-    capabilities = config.get("capabilities")
-    multimodal_messages = not isinstance(capabilities, dict) or bool(
-        capabilities.get("multimodal_messages", True)
-    )
     return LLMSettings(
         provider=str(config.get("provider") or "openai-compatible"),
         base_url=str(config.get("base_url") or ""),
         model=str(config.get("model") or ""),
         api_key=CredentialStore.get_llm_api_key(),
         max_candidates=int(config.get("max_candidates") or 20),
-        multimodal_messages=multimodal_messages,
     )
 
 

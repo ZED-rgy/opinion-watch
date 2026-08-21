@@ -601,3 +601,59 @@ def test_schedule_config_is_persisted_across_storage_instances(tmp_path: Path) -
     assert config["scan_mode"] == "deep"
     assert config["last_scheduled_at"] == "2026-08-21T09:00:00+00:00"
     assert config["next_run_at"] == "2026-08-28T18:30:00+00:00"
+
+
+def test_event_clusters_only_include_suspected_content(tmp_path: Path) -> None:
+    storage = make_storage(tmp_path)
+    storage.add_brand("示例品牌")
+    storage.upsert_contents(
+        [
+            CollectedContent(
+                platform=Platform.DOUYIN,
+                content_id="cluster-1",
+                url="https://example.test/cluster-1",
+                title="示例品牌售后拒绝退款引发争议",
+                source_keyword="示例品牌",
+                brand_name="示例品牌",
+            ),
+            CollectedContent(
+                platform=Platform.DOUYIN,
+                content_id="cluster-2",
+                url="https://example.test/cluster-2",
+                title="示例品牌售后拒绝退款引发争议",
+                source_keyword="示例品牌",
+                brand_name="示例品牌",
+            ),
+            CollectedContent(
+                platform=Platform.DOUYIN,
+                content_id="ordinary-cluster",
+                url="https://example.test/ordinary-cluster",
+                title="示例品牌日常介绍视频",
+                source_keyword="示例品牌",
+                brand_name="示例品牌",
+            ),
+        ]
+    )
+    content_rows = {
+        row["platform_content_id"]: int(row["id"]) for row in storage.list_contents_for_assessment()
+    }
+    for content_id, category in (
+        ("cluster-1", OpinionCategory.SUSPECTED_FALSE_INFORMATION.value),
+        ("cluster-2", OpinionCategory.SUSPECTED_FALSE_INFORMATION.value),
+        ("ordinary-cluster", OpinionCategory.IRRELEVANT.value),
+    ):
+        storage.upsert_assessment(
+            content_item_id=content_rows[content_id],
+            category=category,
+            severity=RiskSeverity.P1.value
+            if content_id != "ordinary-cluster"
+            else RiskSeverity.P3.value,
+            confidence=0.9,
+            rationale="测试判断",
+            matched_signals=["售后"],
+            requires_review=content_id != "ordinary-cluster",
+        )
+
+    assert storage.rebuild_event_clusters() == 1
+    clusters = storage.list_event_clusters()
+    assert clusters[0]["content_count"] == 2

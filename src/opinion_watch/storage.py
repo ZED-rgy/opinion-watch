@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 import sqlite3
 import uuid
 from collections.abc import Iterable
@@ -283,6 +285,27 @@ class Storage:
 
                 CREATE INDEX IF NOT EXISTS idx_assessments_queue
                     ON opinion_assessments(review_status, severity, updated_at DESC);
+
+                CREATE TABLE IF NOT EXISTS event_clusters (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    fingerprint TEXT NOT NULL UNIQUE,
+                    platform TEXT NOT NULL,
+                    brand_names_json TEXT NOT NULL DEFAULT '[]',
+                    representative_title TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS event_cluster_members (
+                    cluster_id INTEGER NOT NULL REFERENCES event_clusters(id) ON DELETE CASCADE,
+                    content_item_id INTEGER NOT NULL REFERENCES content_items(id) ON DELETE CASCADE,
+                    added_at TEXT NOT NULL,
+                    PRIMARY KEY(cluster_id, content_item_id),
+                    UNIQUE(content_item_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_event_cluster_updated
+                    ON event_clusters(updated_at DESC);
 
                 CREATE TABLE IF NOT EXISTS app_notifications (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -882,6 +905,121 @@ class Storage:
                 (content_item_id,),
             ).fetchone()
         return self._assessment_dict(row) if row is not None else None
+
+    @staticmethod
+    def _event_cluster_fingerprint(platform: str, brand_names: list[str], title: str) -> str | None:
+        normalized_title = re.sub(r"[^\w\u4e00-\u9fff]+", "", title.lower())
+        if len(normalized_title) < 8:
+            return None
+        brand_key = "|".join(sorted(set(brand_names)))
+        raw_key = f"{platform}|{brand_key}|{normalized_title[:120]}"
+        return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+
+    def rebuild_event_clusters(self, *, run_id: int | None = None) -> int:
+        """Rebuild derived clusters from suspected/high-risk assessments only."""
+        run_filter = ""
+        parameters: list[object] = []
+        if run_id is not None:
+            run_filter = (
+                "AND EXISTS (SELECT 1 FROM scan_run_contents src "
+                "WHERE src.content_item_id = ci.id AND src.run_id = ?)"
+            )
+            parameters.append(run_id)
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT ci.id, ci.platform, ci.title,
+                       GROUP_CONCAT(DISTINCT b.name) AS brand_names
+                FROM content_items ci
+                JOIN opinion_assessments oa ON oa.content_item_id = ci.id
+                LEFT JOIN content_matches cm ON cm.content_item_id = ci.id
+                LEFT JOIN brands b ON b.id = cm.brand_id
+                WHERE (oa.requires_review = 1 OR oa.severity IN ('P0', 'P1', 'P2'))
+                  {run_filter}
+                GROUP BY ci.id, ci.platform, ci.title
+                ORDER BY ci.last_seen_at DESC
+                """,
+                parameters,
+            ).fetchall()
+            groups: dict[str, dict[str, object]] = {}
+            for row in rows:
+                brand_names = [value for value in str(row["brand_names"] or "").split(",") if value]
+                title = str(row["title"] or "").strip()
+                fingerprint = self._event_cluster_fingerprint(
+                    str(row["platform"]), brand_names, title
+                )
+                if fingerprint is None:
+                    continue
+                group = groups.setdefault(
+                    fingerprint,
+                    {
+                        "platform": str(row["platform"]),
+                        "brand_names": brand_names,
+                        "representative_title": title,
+                        "content_ids": [],
+                    },
+                )
+                content_ids = group["content_ids"]
+                if isinstance(content_ids, list):
+                    content_ids.append(int(row["id"]))
+
+            now = datetime.now(UTC).isoformat()
+            connection.execute("DELETE FROM event_cluster_members")
+            connection.execute("DELETE FROM event_clusters")
+            for fingerprint, group in groups.items():
+                cursor = connection.execute(
+                    """
+                    INSERT INTO event_clusters(
+                        fingerprint, platform, brand_names_json, representative_title,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        fingerprint,
+                        group["platform"],
+                        json.dumps(group["brand_names"], ensure_ascii=False),
+                        group["representative_title"],
+                        now,
+                        now,
+                    ),
+                )
+                cluster_id = int(cursor.lastrowid)
+                for content_id in group["content_ids"]:
+                    connection.execute(
+                        """
+                        INSERT INTO event_cluster_members(cluster_id, content_item_id, added_at)
+                        VALUES (?, ?, ?)
+                        """,
+                        (cluster_id, content_id, now),
+                    )
+        return len(groups)
+
+    def list_event_clusters(self, *, limit: int = 20) -> list[dict[str, object]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT ec.id, ec.platform, ec.brand_names_json,
+                       ec.representative_title, ec.created_at, ec.updated_at,
+                       COUNT(ecm.content_item_id) AS content_count,
+                       MAX(ci.last_seen_at) AS last_seen_at
+                FROM event_clusters ec
+                JOIN event_cluster_members ecm ON ecm.cluster_id = ec.id
+                JOIN content_items ci ON ci.id = ecm.content_item_id
+                GROUP BY ec.id
+                ORDER BY last_seen_at DESC, ec.id DESC
+                LIMIT ?
+                """,
+                (max(1, min(limit, 100)),),
+            ).fetchall()
+        result: list[dict[str, object]] = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["brand_names"] = json.loads(str(item.pop("brand_names_json", "[]")))
+            except json.JSONDecodeError:
+                item["brand_names"] = []
+            result.append(item)
+        return result
 
     def link_scan_contents(
         self,

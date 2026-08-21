@@ -9,7 +9,6 @@ from opinion_watch.llm import (
     LLMAssessment,
     LLMCallBudget,
     LLMClient,
-    LLMError,
     LLMSettings,
     build_assessment_message,
     build_assessment_prompt,
@@ -49,7 +48,7 @@ def test_build_assessment_prompt_contains_public_content_fields() -> None:
     assert "评论一" in prompt
 
 
-def test_build_assessment_message_attaches_local_media_evidence() -> None:
+def test_build_assessment_message_is_text_only_even_when_media_exists() -> None:
     message = build_assessment_message(
         {
             "title": "图片证据",
@@ -62,33 +61,16 @@ def test_build_assessment_message_attaches_local_media_evidence() -> None:
         }
     )
 
-    assert isinstance(message, list)
-    assert message[0]["type"] == "text"
-    assert message[1]["type"] == "image_url"
-    assert str(message[1]["image_url"]["url"]).startswith("data:image/png;base64,")
-
-
-def test_build_assessment_message_skips_media_when_provider_lacks_support() -> None:
-    message = build_assessment_message(
-        {
-            "title": "图片证据",
-            "brand_names": ["示例品牌"],
-            "raw_data": {"media": [{"url": "https://example.test/image.png"}]},
-        },
-        allow_multimodal=False,
-    )
     assert isinstance(message, str)
     assert "图片证据" in message
 
 
-def test_llm_assess_retries_as_text_when_gateway_rejects_image_message() -> None:
+def test_llm_assess_sends_text_only_message() -> None:
     client = LLMClient(LLMSettings("openai-compatible", "https://example.test/v1", "demo", "key"))
     messages: list[list[dict[str, object]]] = []
 
     async def fake_complete(request_messages):
         messages.append(request_messages)
-        if len(messages) == 1:
-            raise LLMError("大模型接口返回 HTTP 400：unknown variant image_url, expected text")
         return json.dumps(
             {
                 "category": "ordinary_grievance",
@@ -112,9 +94,8 @@ def test_llm_assess_retries_as_text_when_gateway_rejects_image_message() -> None
     )
 
     assert assessment.category is OpinionCategory.ORDINARY_GRIEVANCE
-    assert len(messages) == 2
-    assert isinstance(messages[0][1]["content"], list)
-    assert isinstance(messages[1][1]["content"], str)
+    assert len(messages) == 1
+    assert isinstance(messages[0][1]["content"], str)
 
 
 def test_llm_client_uses_openai_compatible_chat_endpoint(monkeypatch) -> None:
@@ -247,6 +228,5 @@ def test_llm_capability_probe_records_text_and_multimodal_support() -> None:
 
     assert capabilities.chat_completions is True
     assert capabilities.text_messages is True
-    assert capabilities.multimodal_messages is True
-    assert len(requests) == 2
-    assert isinstance(requests[1][1]["content"], list)
+    assert capabilities.multimodal_messages is False
+    assert len(requests) == 1

@@ -64,6 +64,15 @@ def build_daily_report(storage: Storage, report_date: str | None = None) -> str:
             """,
             (start_utc, end_utc),
         ).fetchone()["count"]
+        cluster_count = connection.execute(
+            """
+            SELECT COUNT(DISTINCT ecm.cluster_id) AS count
+            FROM event_cluster_members ecm
+            JOIN content_items ci ON ci.id = ecm.content_item_id
+            WHERE ci.last_seen_at >= ? AND ci.last_seen_at < ?
+            """,
+            (start_utc, end_utc),
+        ).fetchone()["count"]
         alert_count = connection.execute(
             "SELECT COUNT(*) AS count FROM alerts WHERE created_at >= ? AND created_at < ?",
             (start_utc, end_utc),
@@ -115,6 +124,7 @@ def build_daily_report(storage: Storage, report_date: str | None = None) -> str:
         f"检索结果：{scanned} 条，入库 {collected} 条，过滤普通内容 {filtered} 条 "
         f"（新增 {inserted}，更新 {updated}）",
         f"疑似舆情：{suspected} 条，详情调查：{detailed} 条，媒体证据：{media_items} 条",
+        f"聚合事件：{int(cluster_count or 0)} 个（仅统计疑似/高风险内容）",
         f"当日去重内容：{int(content_stats['total'] or 0)} 条，"
         f"待复核：{int(pending_reviews)} 条，运行告警：{int(alert_count)} 条",
         "风险分布："
