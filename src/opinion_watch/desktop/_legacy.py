@@ -5,13 +5,11 @@ import json
 import os
 import sys
 import uuid
-from collections.abc import Callable
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-import qtawesome as qta
 from PySide6.QtCore import (
     QProcess,
     QSettings,
@@ -22,9 +20,8 @@ from PySide6.QtCore import (
     QUrl,
     Signal,
 )
-from PySide6.QtGui import QColor, QDesktopServices, QFont, QPixmap, QTextCursor
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QTextCursor
 from PySide6.QtWidgets import (
-    QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
@@ -43,12 +40,10 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
-    QPushButton,
     QScrollArea,
     QSpinBox,
     QStackedWidget,
     QSystemTrayIcon,
-    QTableWidget,
     QTableWidgetItem,
     QTextEdit,
     QTimeEdit,
@@ -58,9 +53,43 @@ from PySide6.QtWidgets import (
 
 from opinion_watch.config import DEFAULT_BRANDS, Settings
 from opinion_watch.credentials import CredentialStore
+from opinion_watch.desktop import components as _components
+from opinion_watch.desktop.autostart import (
+    set_windows_autostart as _set_windows_autostart,
+)
+from opinion_watch.desktop.autostart import (
+    windows_autostart_enabled as _windows_autostart_enabled,
+)
+from opinion_watch.desktop.components import (
+    EmptyState,
+    TablePanel,
+)
+from opinion_watch.desktop.components import (
+    checked_ids as _checked_ids,
+)
+from opinion_watch.desktop.components import (
+    icon as _icon,
+)
+from opinion_watch.desktop.components import (
+    make_table as _new_table,
+)
+from opinion_watch.desktop.components import (
+    selected_id as _selected_id,
+)
+from opinion_watch.desktop.components import (
+    set_check_cell as _set_check_cell,
+)
+from opinion_watch.desktop.components import (
+    surface as _surface,
+)
+from opinion_watch.desktop.components import (
+    title as _title,
+)
+from opinion_watch.desktop.components import (
+    toggle_all as _toggle_all,
+)
 from opinion_watch.desktop.constants import (
     ACCOUNT_STATUS_NAMES,
-    ASSET_DIR,
     CATEGORY_NAMES,
     PLATFORM_NAMES,
     REVIEW_STATUS_NAMES,
@@ -69,6 +98,15 @@ from opinion_watch.desktop.constants import (
 from opinion_watch.desktop.constants import (
     assessment_source_name as _assessment_source_name,
 )
+from opinion_watch.desktop.dialogs import (
+    RunDetailDialog,
+    delete_scan_run_with_confirmation,
+    edit_scan_run_metadata,
+)
+from opinion_watch.desktop.dialogs import (
+    show_error as _show_error,
+)
+from opinion_watch.desktop.login_window import BrowserLoginWindow
 from opinion_watch.desktop.theme import build_stylesheet
 from opinion_watch.desktop.utils import (
     decode_process_output as _decode_process_output,
@@ -76,388 +114,16 @@ from opinion_watch.desktop.utils import (
 from opinion_watch.desktop.utils import (
     format_timestamp as _format_timestamp,
 )
-from opinion_watch.desktop.utils import (
-    process_json_result as _process_json_result,
-)
 from opinion_watch.events import parse_event
 from opinion_watch.models import OpinionCategory, Platform, RiskSeverity
 from opinion_watch.services import ScheduleService
 from opinion_watch.storage import Storage
 
-AUTOSTART_REGISTRY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
-
-
-def _windows_autostart_enabled() -> bool:
-    if os.name != "nt":
-        return False
-    import winreg
-
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_REGISTRY_PATH) as key:
-            winreg.QueryValueEx(key, "OpinionWatch")
-    except (FileNotFoundError, OSError):
-        return False
-    return True
-
-
-def _set_windows_autostart(enabled: bool, runtime_dir: Path | None = None) -> None:
-    if os.name != "nt":
-        if enabled:
-            raise RuntimeError("开机启动仅支持 Windows。")
-        return
-    import winreg
-
-    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, AUTOSTART_REGISTRY_PATH) as key:
-        if enabled:
-            launcher = Path(sys.argv[0]).resolve()
-            if launcher.suffix.lower() == ".py" or launcher.name.lower().startswith("python"):
-                command = f'"{sys.executable}" -m opinion_watch.desktop'
-            else:
-                command = f'"{launcher}"'
-            # 开机启动没有可控的工作目录，默认 runtime 目录相对 CWD 解析，
-            # 自启进程会连到另一个空数据库。把当前实际使用的目录固定下来。
-            if runtime_dir is not None:
-                command += f' --runtime-dir "{runtime_dir.resolve()}"'
-            winreg.SetValueEx(key, "OpinionWatch", 0, winreg.REG_SZ, command)
-        else:
-            with suppress(FileNotFoundError):
-                winreg.DeleteValue(key, "OpinionWatch")
-
-
 APP_STYLE = build_stylesheet()
 
 
-def _icon(name: str, color: str = "#5D667A"):
-    return qta.icon(name, color=color)
-
-
-def _button(
-    text: str,
-    callback: Callable[[], object],
-    *,
-    icon: str | None = None,
-    role: str = "primary",
-) -> QPushButton:
-    button = QPushButton(text)
-    button.setProperty("role", role)
-    if icon:
-        button.setIcon(_icon(icon, "#FFFFFF" if role == "primary" else "#596277"))
-        button.setIconSize(QSize(15, 15))
-    button.clicked.connect(callback)
-    return button
-
-
-def _title(text: str, object_name: str = "pageTitle") -> QLabel:
-    label = QLabel(text)
-    label.setObjectName(object_name)
-    return label
-
-
-def _surface() -> tuple[QFrame, QVBoxLayout]:
-    frame = QFrame()
-    frame.setObjectName("surface")
-    layout = QVBoxLayout(frame)
-    layout.setContentsMargins(20, 18, 20, 18)
-    layout.setSpacing(14)
-    return frame, layout
-
-
-def _new_table(headers: list[str], *, multi_select: bool = False) -> QTableWidget:
-    table = QTableWidget(0, len(headers))
-    table.setHorizontalHeaderLabels(headers)
-    table.setAlternatingRowColors(True)
-    table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-    table.setSelectionMode(
-        QAbstractItemView.SelectionMode.ExtendedSelection
-        if multi_select
-        else QAbstractItemView.SelectionMode.SingleSelection
-    )
-    table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-    table.verticalHeader().setVisible(False)
-    table.verticalHeader().setDefaultSectionSize(44)
-    table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-    return table
-
-
-def _selected_id(table: QTableWidget) -> int | None:
-    row = table.currentRow()
-    cell = table.item(row, 0) if row >= 0 else None
-    return int(cell.text()) if cell is not None else None
-
-
-def _set_check_cell(table: QTableWidget, row: int, checked: bool = False) -> None:
-    cell = QTableWidgetItem()
-    cell.setFlags(cell.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-    cell.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
-    table.setItem(row, 0, cell)
-
-
-def _checked_ids(table: QTableWidget, id_column: int) -> list[int]:
-    values: list[int] = []
-    for row in range(table.rowCount()):
-        check_cell = table.item(row, 0)
-        id_cell = table.item(row, id_column)
-        if (
-            check_cell is not None
-            and check_cell.checkState() == Qt.CheckState.Checked
-            and id_cell is not None
-        ):
-            values.append(int(id_cell.text()))
-    return values
-
-
-def _toggle_all(table: QTableWidget, checked: bool) -> None:
-    state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
-    for row in range(table.rowCount()):
-        cell = table.item(row, 0)
-        if cell is not None:
-            cell.setCheckState(state)
-
-
-def _show_error(parent: QWidget, exc: Exception) -> None:
-    QMessageBox.critical(parent, "操作失败", str(exc))
-
-
-class EmptyState(QWidget):
-    def __init__(
-        self,
-        title: str,
-        description: str,
-        *,
-        action_text: str | None = None,
-        action: Callable[[], None] | None = None,
-        image_name: str | None = None,
-    ) -> None:
-        super().__init__()
-        self.setObjectName("emptyState")
-        layout = QVBoxLayout(self)
-        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.setContentsMargins(24, 28, 24, 28)
-        layout.setSpacing(10)
-        if image_name:
-            image = QLabel()
-            image.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            pixmap = QPixmap(str(ASSET_DIR / image_name))
-            if not pixmap.isNull():
-                image.setPixmap(
-                    pixmap.scaled(
-                        210,
-                        150,
-                        Qt.AspectRatioMode.KeepAspectRatio,
-                        Qt.TransformationMode.SmoothTransformation,
-                    )
-                )
-                layout.addWidget(image)
-        icon = QLabel()
-        icon.setPixmap(_icon("fa6s.inbox", "#8B96AA").pixmap(QSize(28, 28)))
-        icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(icon)
-        headline = QLabel(title)
-        headline.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        headline.setStyleSheet("font-size: 16px; font-weight: 700; color: #30394C;")
-        layout.addWidget(headline)
-        body = QLabel(description)
-        body.setObjectName("muted")
-        body.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        body.setWordWrap(True)
-        body.setMaximumWidth(430)
-        layout.addWidget(body)
-        if action_text and action:
-            button = _button(action_text, action, icon="fa6s.play")
-            button.setMaximumWidth(150)
-            layout.addWidget(button, alignment=Qt.AlignmentFlag.AlignCenter)
-
-
-class TablePanel(QStackedWidget):
-    def __init__(self, table: QTableWidget, empty: EmptyState) -> None:
-        super().__init__()
-        self.setObjectName("surfaceStack")
-        self.table = table
-        self.empty = empty
-        self.addWidget(table)
-        self.addWidget(empty)
-
-    def show_count(self, count: int) -> None:
-        self.setCurrentWidget(self.table if count else self.empty)
-
-
-class RunDetailDialog(QDialog):
-    def __init__(
-        self,
-        storage: Storage,
-        run: dict[str, Any],
-        diagnostic_output: str = "",
-        parent: QWidget | None = None,
-    ) -> None:
-        super().__init__(parent)
-        self.setWindowTitle(f"巡检详情 · #{run['id']}")
-        self.resize(1280, 760)
-        self.setMinimumSize(980, 620)
-        root = QVBoxLayout(self)
-        root.setContentsMargins(24, 22, 24, 22)
-        root.setSpacing(14)
-        status = RUN_STATUS_NAMES.get(str(run["status"]), str(run["status"]))
-        trigger = "定时巡检" if run.get("trigger") == "watch" else "手动巡检"
-        platforms = "、".join(
-            PLATFORM_NAMES.get(str(item), str(item)) for item in run.get("platforms", [])
-        )
-        model_summary = run.get("model_summary")
-        if isinstance(model_summary, dict) and model_summary.get("enabled"):
-            model_text = (
-                f"大模型：已启用，处理 {model_summary.get('processed', 0)} 条，"
-                f"失败 {model_summary.get('failed', 0)} 条"
-            )
-        else:
-            model_text = "大模型：本次未启用"
-        summary = QLabel(
-            f"运行编号：#{run['id']}　标题：{run.get('title') or '未命名记录'}\n"
-            f"状态：{status}　类型：{trigger}\n"
-            f"开始：{_format_timestamp(run.get('started_at'))}　"
-            f"结束：{_format_timestamp(run.get('finished_at'))}\n"
-            f"平台：{platforms or '无'}　检索：{run.get('scanned_count', 0)} 条　"
-            f"入库：{run.get('collected_count', 0)} 条　过滤：{run.get('filtered_count', 0)} 条　"
-            f"关联内容：{run.get('content_count', run.get('linked_content_count', 0))} 条　"
-            f"新增：{run.get('inserted_count', 0)}　更新：{run.get('updated_count', 0)}　"
-            f"成功：{run.get('succeeded_count', 0)}　失败：{run.get('failed_count', 0)}\n"
-            f"疑似：{run.get('suspected_count', 0)}　详情：{run.get('detailed_count', 0)}　"
-            f"媒体证据：{run.get('media_count', 0)}\n"
-            f"{model_text}"
-        )
-        summary.setWordWrap(True)
-        root.addWidget(summary)
-        if str(run.get("note") or "").strip():
-            note_label = QLabel(f"备注：{run['note']}")
-            note_label.setWordWrap(True)
-            note_label.setObjectName("muted")
-            root.addWidget(note_label)
-        root.addWidget(_title("关键词执行结果", "sectionTitle"))
-        table = _new_table(
-            [
-                "平台",
-                "关键词",
-                "状态",
-                "检索",
-                "入库",
-                "过滤",
-                "疑似",
-                "详情",
-                "媒体",
-                "新增",
-                "更新",
-                "错误",
-            ]
-        )
-        attempts = run.get("attempts", [])
-        table.setRowCount(len(attempts) if isinstance(attempts, list) else 0)
-        for row, attempt in enumerate(attempts if isinstance(attempts, list) else []):
-            values = (
-                PLATFORM_NAMES.get(str(attempt.get("platform")), attempt.get("platform", "")),
-                attempt.get("keyword", ""),
-                RUN_STATUS_NAMES.get(str(attempt.get("status")), attempt.get("status", "")),
-                attempt.get("scanned_count", 0),
-                attempt.get("collected_count", 0),
-                attempt.get("filtered_count", 0),
-                attempt.get("suspected_count", 0),
-                attempt.get("detailed_count", 0),
-                attempt.get("media_count", 0),
-                attempt.get("inserted_count", 0),
-                attempt.get("updated_count", 0),
-                attempt.get("error_message", "") or "—",
-            )
-            for column, value in enumerate(values):
-                table.setItem(row, column, QTableWidgetItem(str(value)))
-        table.setWordWrap(False)
-        table.setTextElideMode(Qt.TextElideMode.ElideNone)
-        table.setMinimumHeight(160)
-        table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        header = table.horizontalHeader()
-        for column in range(table.columnCount()):
-            header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(11, QHeaderView.ResizeMode.Stretch)
-        table.resizeRowsToContents()
-        root.addWidget(table, 1)
-        alerts = storage.list_alerts(run_id=int(run["id"]), unacknowledged_only=False)
-        if alerts:
-            root.addWidget(_title("本次巡检告警", "sectionTitle"))
-            alert_text = QTextEdit()
-            alert_text.setReadOnly(True)
-            alert_text.setPlainText(
-                "\n".join(
-                    f"{PLATFORM_NAMES.get(str(item.get('platform')), item.get('platform', ''))}："
-                    f"{item.get('message', '')}"
-                    for item in alerts
-                )
-            )
-            alert_text.setStyleSheet("color:#A06B00;")
-            alert_text.setMinimumHeight(74)
-            alert_text.setMaximumHeight(180)
-            root.addWidget(alert_text)
-        if diagnostic_output.strip():
-            diagnostic = QTextEdit()
-            diagnostic.setReadOnly(True)
-            diagnostic.setPlainText(diagnostic_output)
-            diagnostic.setVisible(False)
-            diagnostic.setMaximumHeight(180)
-            toggle = _button(
-                "显示原始诊断日志",
-                lambda: diagnostic.setVisible(not diagnostic.isVisible()),
-                role="secondary",
-            )
-            root.addWidget(toggle)
-            root.addWidget(diagnostic)
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
-        buttons.rejected.connect(self.reject)
-        root.addWidget(buttons)
-
-
-def edit_scan_run_metadata(storage: Storage, run_id: int, parent: QWidget) -> bool:
-    run = storage.get_scan_run(run_id)
-    if run is None:
-        return False
-    dialog = QDialog(parent)
-    dialog.setWindowTitle(f"编辑巡检记录 · #{run_id}")
-    dialog.resize(520, 260)
-    form = QFormLayout(dialog)
-    title = QLineEdit(str(run.get("title") or ""))
-    note = QTextEdit(str(run.get("note") or ""))
-    note.setPlaceholderText("记录本次巡检的背景、结论或后续动作（可选）")
-    note.setMaximumHeight(110)
-    form.addRow("记录标题", title)
-    form.addRow("备注", note)
-    buttons = QDialogButtonBox(
-        QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
-    )
-    buttons.accepted.connect(dialog.accept)
-    buttons.rejected.connect(dialog.reject)
-    form.addRow(buttons)
-    if dialog.exec() != QDialog.DialogCode.Accepted:
-        return False
-    try:
-        updated = storage.update_scan_run_metadata(
-            run_id, title=title.text(), note=note.toPlainText()
-        )
-    except ValueError as exc:
-        QMessageBox.warning(parent, "保存失败", str(exc))
-        return False
-    return updated
-
-
-def delete_scan_run_with_confirmation(storage: Storage, run_id: int, parent: QWidget) -> bool:
-    run = storage.get_scan_run(run_id)
-    if run is None:
-        return False
-    title = str(run.get("title") or f"巡检记录 #{run_id}")
-    answer = QMessageBox.question(
-        parent,
-        "删除巡检记录",
-        f"确定删除“{title}”吗？\n\n只会删除本次巡检批次及其关联关系，已采集内容仍会保留在全部历史中。",
-        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        QMessageBox.StandardButton.No,
-    )
-    if answer != QMessageBox.StandardButton.Yes:
-        return False
-    return storage.delete_scan_run(run_id)
+def _button(text, callback, *, icon=None, role="primary"):
+    return _components.button(text, callback, icon_name=icon, role=role)
 
 
 class SchedulerPage(QWidget):
@@ -1343,124 +1009,6 @@ class AccountsPage(QWidget):
             self.storage.delete_account(int(account["id"]))
             self.refresh()
             self.changed.emit()
-
-
-class BrowserLoginWindow(QMainWindow):
-    account_updated = Signal()
-
-    def __init__(self, settings: Settings, storage: Storage, account: dict[str, Any]) -> None:
-        super().__init__()
-        self.storage = storage
-        self.settings = settings
-        self.account = account
-        account_id = int(account["id"])
-        platform = Platform(str(account["platform"]))
-        self.account_id = account_id
-        self.platform = platform
-        self.process = QProcess(self)
-        self.process.readyReadStandardOutput.connect(self.read_output)
-        self.process.readyReadStandardError.connect(self.read_error)
-        self.process.finished.connect(self.process_finished)
-        self.output_buffer: list[str] = []
-        self._cancelled = False
-        central = QWidget()
-        layout = QVBoxLayout(central)
-        layout.addWidget(_title("自动巡检登录", "sectionTitle"))
-        note = QLabel(
-            f"已打开 {PLATFORM_NAMES[platform.value]} 的自动巡检登录档案。"
-            "请在弹出的 Chrome 窗口中完成登录，登录后回到这里点击“登录完成并检查”。"
-        )
-        note.setWordWrap(True)
-        note.setObjectName("muted")
-        layout.addWidget(note)
-        self.status_label = QLabel("正在启动自动巡检登录档案…")
-        self.status_label.setWordWrap(True)
-        layout.addWidget(self.status_label)
-        layout.addStretch()
-        actions = QHBoxLayout()
-        self.complete_button = _button("登录完成并检查", self.mark_ready, icon="fa6s.check")
-        actions.addWidget(self.complete_button)
-        actions.addWidget(_button("取消", self.cancel_login, role="secondary"))
-        actions.addStretch()
-        layout.addLayout(actions)
-        self.setCentralWidget(central)
-        self.resize(620, 260)
-        self.setWindowTitle(
-            f"{PLATFORM_NAMES[platform.value]} · {account['display_name']} · 自动巡检登录"
-        )
-        self._start_login_process()
-
-    def _start_login_process(self) -> None:
-        self._cancelled = False
-        self.output_buffer.clear()
-        self.complete_button.setText("登录完成并检查")
-        self.complete_button.setEnabled(True)
-        self.status_label.setText("正在启动自动巡检登录档案…")
-        self.process.setProgram(sys.executable)
-        self.process.setArguments(
-            [
-                "-m",
-                "opinion_watch",
-                "login",
-                "--platform",
-                self.platform.value,
-                "--account-id",
-                str(self.account_id),
-            ]
-        )
-        self.process.start()
-
-    def mark_ready(self) -> None:
-        if self.process.state() == QProcess.ProcessState.NotRunning:
-            self._start_login_process()
-            return
-        self.complete_button.setEnabled(False)
-        self.status_label.setText("正在检查登录状态，请稍候…")
-        self.process.write(b"\n")
-
-    def cancel_login(self) -> None:
-        self._cancelled = True
-        self.close()
-
-    def read_output(self) -> None:
-        value = _decode_process_output(self.process.readAllStandardOutput())
-        if value.strip():
-            self.output_buffer.append(value)
-            self.status_label.setText(value.strip().splitlines()[-1])
-
-    def read_error(self) -> None:
-        value = _decode_process_output(self.process.readAllStandardError())
-        if value.strip():
-            self.output_buffer.append(value)
-
-    def process_finished(self, _exit_code: int, _status: QProcess.ExitStatus) -> None:
-        if self._cancelled:
-            return
-        output = "".join(self.output_buffer)
-        result = _process_json_result(output)
-        self.complete_button.setEnabled(True)
-        if result and result.get("status") == "healthy":
-            self.storage.update_account_status(int(self.account["id"]), "ready")
-            self.account_updated.emit()
-            QMessageBox.information(self, "账号状态", "登录成功，自动巡检将使用这个登录档案。")
-            self.close()
-            return
-        status = str(result.get("status") if result else "error")
-        self.storage.update_account_status(int(self.account["id"]), status)
-        self.status_label.setText(f"登录检查结果：{status}")
-        QMessageBox.warning(
-            self, "登录检查失败", "未检测到有效登录态，请在 Chrome 中完成登录后重试。"
-        )
-        self.complete_button.setText("重新打开浏览器")
-
-    def closeEvent(self, event) -> None:
-        if self.process.state() != QProcess.ProcessState.NotRunning:
-            self._cancelled = True
-            self.process.write(b"\n")
-            # 只等一小段时间，避免长时间冻结界面。窗口对象仍被主窗口持有，
-            # 子进程会在后台正常收尾（关闭浏览器并释放账号租约）。
-            self.process.waitForFinished(2_000)
-        event.accept()
 
 
 class OpinionsPage(QWidget):
