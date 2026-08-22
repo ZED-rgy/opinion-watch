@@ -1120,7 +1120,7 @@ async def _run_scan_locked(
                                     else "succeeded"
                                 )
                                 if quality_partial or detail_coverage_partial:
-                                    totals.failed += 1
+                                    totals.partial += 1
                                     if quality_partial:
                                         coverage_shortfalls.append(quality_message)
                                 else:
@@ -1138,6 +1138,7 @@ async def _run_scan_locked(
                                     filtered=filtered_count,
                                     inserted=stats.inserted,
                                     updated=stats.updated,
+                                    partial=int(attempt_status == "partial"),
                                     suspected=suspected_count,
                                     detailed=detailed_count,
                                     media_items=media_count,
@@ -1236,7 +1237,9 @@ async def _run_scan_locked(
 
     classification_summary: dict[str, Any] | None = None
     model_summary: dict[str, Any] | None = None
-    if totals.succeeded > 0:
+    # A completed card scan with detail warnings still produced auditable
+    # content. Continue classification, clustering, and notifications for it.
+    if totals.collected > 0:
         try:
             classification_summary = classify_batch(
                 storage,
@@ -1292,9 +1295,9 @@ async def _run_scan_locked(
                 message=f"事件聚合未执行：{exc}",
             )
 
-    if totals.failed == 0:
+    if totals.failed == 0 and totals.partial == 0:
         status = ScanRunStatus.SUCCEEDED
-    elif totals.succeeded > 0:
+    elif totals.succeeded > 0 or totals.partial > 0 or totals.collected > 0:
         status = ScanRunStatus.PARTIAL
     else:
         status = ScanRunStatus.FAILED
@@ -1307,6 +1310,7 @@ async def _run_scan_locked(
         inserted=totals.inserted,
         updated=totals.updated,
         succeeded=totals.succeeded,
+        partial=totals.partial,
         failed=totals.failed,
         suspected=totals.suspected,
         detailed=totals.detailed,

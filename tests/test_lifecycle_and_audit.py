@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import replace
 
 from opinion_watch.collectors.douyin import DouyinCollector
 from opinion_watch.collectors.xiaohongshu import XiaohongshuCollector
@@ -46,6 +47,56 @@ def test_invalid_xhs_detail_text_falls_back_to_card_metadata() -> None:
     assert not collector._valid_detail_text("当前笔记无法浏览", "页面不见了")
     assert collector._valid_detail_text("速探长物流体验", "速探长物流体验")
     assert collector._unavailable_reason("页面不见了") == "页面不见了"
+
+
+def test_xhs_detail_prefers_live_card_click_over_tokenized_href() -> None:
+    class PopupExpectation:
+        def __init__(self) -> None:
+            self.value = asyncio.sleep(0, result=None)
+
+        async def __aenter__(self) -> "PopupExpectation":
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+    class Locator:
+        first = None
+
+        async def count(self) -> int:
+            return 1
+
+        async def click(self, **_kwargs: object) -> None:
+            page.url = "https://www.xiaohongshu.com/explore/0123456789abcdef"
+
+    class SearchPage:
+        url = "https://www.xiaohongshu.com/search_result?keyword=速探长"
+
+        def locator(self, _selector: str) -> Locator:
+            locator = Locator()
+            locator.first = locator
+            return locator
+
+        def expect_popup(self, **_kwargs: object) -> PopupExpectation:
+            return PopupExpectation()
+
+        async def wait_for_timeout(self, _milliseconds: int) -> None:
+            return None
+
+    page = SearchPage()
+    item = _item(content_id="0123456789abcdef")
+    item = replace(
+        item,
+        navigation_url=(
+            "https://www.xiaohongshu.com/explore/0123456789abcdef?xsec_token=temporary"
+        ),
+    )
+    target, restore_url, error = asyncio.run(
+        XiaohongshuCollector()._open_detail_by_click(page, item)  # type: ignore[arg-type]
+    )
+    assert target is page
+    assert restore_url == "https://www.xiaohongshu.com/search_result?keyword=速探长"
+    assert error == ""
 
 
 def test_douyin_login_confirmation_overrides_cookie_health() -> None:
@@ -170,14 +221,14 @@ def test_v4_migration_repairs_existing_unavailable_detail_title(tmp_path) -> Non
             "UPDATE content_items SET title = ?",
             ("当前笔记暂时无法浏览",),
         )
-        connection.execute("DELETE FROM schema_migrations WHERE version = 4")
+        connection.execute("DELETE FROM schema_migrations WHERE version >= 4")
 
     Storage(database).initialize()
     with storage.connect() as connection:
         title = connection.execute("SELECT title FROM content_items").fetchone()[0]
         version = connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
     assert title == "速探长海外仓提醒"
-    assert version == 4
+    assert version == 5
 
 
 def collector_anchor(url: str):

@@ -233,6 +233,25 @@ class CleanDetailCollector(ZeroDetailCollector):
         ]
 
 
+class PartialSuspectCollector(ZeroDetailCollector):
+    async def search(
+        self,
+        page: ZeroDetailPage,
+        context: object,
+        keyword: str,
+        *,
+        limit: int,
+    ) -> list[CollectedContent]:
+        items = await super().search(page, context, keyword, limit=limit)
+        return [
+            replace(
+                items[0],
+                title="配达人投诉后不退款",
+                raw_data={"search_card_text": "配达人投诉后不退款"},
+            )
+        ]
+
+
 def test_brand_match_with_zero_details_is_partial_and_alerts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -274,6 +293,54 @@ def test_brand_match_with_zero_details_is_partial_and_alerts(
     assert any(alert["kind"] == "zero_detail_coverage" for alert in storage.list_alerts())
     assert run["attempts"][0]["scanned_count"] == 1
     assert run["attempts"][0]["detailed_count"] == 0
+
+
+def test_partial_run_classifies_admitted_content_and_creates_notification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    storage = Storage(tmp_path / "scan.db")
+    storage.initialize()
+    storage.add_brand("配达人")
+    storage.add_keyword("配达人", "配达人")
+    account_id = storage.add_account(Platform.XIAOHONGSHU.value, "测试账号")
+    storage.update_account_status(account_id, "ready")
+    settings = Settings(
+        runtime_dir=tmp_path / "runtime",
+        database_path=tmp_path / "scan.db",
+        artifact_dir=tmp_path / "artifacts",
+    )
+    monkeypatch.setattr("opinion_watch.runner.BrowserSession", ZeroDetailBrowserSession)
+    monkeypatch.setattr(
+        "opinion_watch.runner.collector_for", lambda platform: PartialSuspectCollector()
+    )
+
+    exit_code = asyncio.run(
+        run_scan(
+            settings,
+            storage,
+            [Platform.XIAOHONGSHU],
+            options=ScanOptions(
+                limit=20,
+                detail_limit=2,
+                comments_limit=0,
+                retries=0,
+                brand_delay_seconds=0,
+            ),
+        )
+    )
+
+    run = storage.get_scan_run(1)
+    assert exit_code == 2
+    assert run is not None
+    assert run["status"] == "partial"
+    assert run["partial_count"] == 1
+    assert run["failed_count"] == 0
+    assert run["classification"]["processed"] == 1
+    assessments = storage.list_assessments()
+    assert len(assessments) == 1
+    assert assessments[0]["requires_review"] is True
+    notifications = storage.list_notifications(unread_only=True)
+    assert any(item["kind"] == "opinion_review" for item in notifications)
 
 
 def test_clean_detail_success_counts_before_filtered_from_admission(

@@ -109,6 +109,7 @@ class ScanTotals:
     inserted: int = 0
     updated: int = 0
     succeeded: int = 0
+    partial: int = 0
     failed: int = 0
     suspected: int = 0
     detailed: int = 0

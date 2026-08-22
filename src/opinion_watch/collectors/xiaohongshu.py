@@ -38,6 +38,12 @@ class XiaohongshuCollector(BaseCollector):
         '[class*="title"]',
         'meta[property="og:title"]',
     )
+    detail_view_selectors = (
+        "#detail-title",
+        "#noteContainer",
+        '[class*="note-detail" i]',
+        '[class*="note-content" i]',
+    )
     description_selectors = (
         "#detail-desc",
         '[class*="desc"]',

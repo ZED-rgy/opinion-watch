@@ -45,6 +45,7 @@ class BaseCollector(ABC):
     author_selectors: tuple[str, ...] = ()
     comment_selectors: tuple[str, ...] = ()
     media_container_selectors: tuple[str, ...] = ()
+    detail_view_selectors: tuple[str, ...] = ()
     # 平台可能在登录态健康时仍然弹出登录引导弹窗；这些选择器用于尝试
     # 关闭它而不是直接放弃本轮检索。
     login_modal_close_selectors: tuple[str, ...] = ()
@@ -341,7 +342,9 @@ class BaseCollector(ABC):
             )
             for item in items
         ]
-        detail_page = await context.new_page()
+        detail_page: Page | None = None
+        restore_search_url: str | None = None
+        popup_page: Page | None = None
         try:
             candidate_indexes = [
                 index
@@ -349,6 +352,13 @@ class BaseCollector(ABC):
                 if detail_candidate_ids is None or item.content_id in detail_candidate_ids
             ][:detail_limit]
             for index in candidate_indexes:
+                if restore_search_url and search_page is not None:
+                    await self._restore_search_page(search_page, restore_search_url)
+                    restore_search_url = None
+                if popup_page is not None:
+                    with suppress(Exception):
+                        await popup_page.close()
+                    popup_page = None
                 item = items[index]
                 attempting = {
                     **item.raw_data,
@@ -357,17 +367,41 @@ class BaseCollector(ABC):
                     "detail_error": "",
                 }
                 enriched[index] = replace(item, raw_data=attempting)
-                navigation_url = await self._detail_navigation_url(search_page, item)
+                click_error = ""
                 try:
-                    await detail_page.goto(
-                        navigation_url,
-                        wait_until="domcontentloaded",
-                        timeout=60_000,
-                    )
-                except PlaywrightTimeoutError as exc:
+                    if search_page is not None:
+                        (
+                            detail_page,
+                            restore_search_url,
+                            click_error,
+                        ) = await self._open_detail_by_click(search_page, item)
+                        if detail_page is None:
+                            enriched[index] = replace(
+                                item,
+                                raw_data={
+                                    **attempting,
+                                    "detail_status": DetailStatus.FAILED.value,
+                                    "detail_checked_at": attempting["detail_checked_at"],
+                                    "detail_error": click_error or "搜索卡片点击后未进入详情页",
+                                },
+                            )
+                            continue
+                        if detail_page is not search_page:
+                            popup_page = detail_page
+                    else:
+                        detail_page = await context.new_page()
+                        popup_page = detail_page
+                        await detail_page.goto(
+                            item.navigation_url or item.url,
+                            wait_until="domcontentloaded",
+                            timeout=60_000,
+                        )
+                except PlaywrightTimeoutError:
                     # 超时后详情页可能仍停留在上一条内容上；此时抽取会把别人的
                     # 正文、评论和媒体写进当前条目。跳过详情补充，保留浅层结果。
-                    if self.canonical_url(detail_page.url) != self.canonical_url(item.url):
+                    if detail_page is None or self.canonical_url(
+                        detail_page.url
+                    ) != self.canonical_url(item.url):
                         enriched[index] = replace(
                             item,
                             raw_data={
@@ -379,7 +413,19 @@ class BaseCollector(ABC):
                         )
                         continue
                     # A timeout can still leave a usable detail document.
-                    _ = exc
+                except PlaywrightError as exc:
+                    enriched[index] = replace(
+                        item,
+                        raw_data={
+                            **attempting,
+                            "detail_status": DetailStatus.FAILED.value,
+                            "detail_checked_at": attempting["detail_checked_at"],
+                            "detail_error": str(exc)[:1000],
+                        },
+                    )
+                    continue
+                if detail_page is None:
+                    continue
                 await detail_page.wait_for_timeout(self._human_delay_ms(1_500))
                 status = await self.session_status(detail_page, context)
                 if (
@@ -477,7 +523,11 @@ class BaseCollector(ABC):
                     raw_data=raw_data,
                 )
         finally:
-            await detail_page.close()
+            if restore_search_url and search_page is not None:
+                await self._restore_search_page(search_page, restore_search_url)
+            if popup_page is not None:
+                with suppress(Exception):
+                    await popup_page.close()
         return enriched
 
     async def _extract_media_evidence(
@@ -568,39 +618,61 @@ class BaseCollector(ABC):
             evidence.append(entry)
         return evidence
 
-    async def _detail_navigation_url(
+    async def _open_detail_by_click(
         self,
-        search_page: Page | None,
+        search_page: Page,
         item: CollectedContent,
-    ) -> str:
-        """Resolve a one-round detail URL without persisting its token.
+    ) -> tuple[Page | None, str | None, str]:
+        """Open a detail view through the live search card, never its tokenized href."""
+        locator = search_page.locator(f'a[href*="{item.content_id}"]').first
+        try:
+            if not await locator.count():
+                return None, None, "搜索页找不到对应卡片"
+            before_url = search_page.url
+            popup: Page | None = None
+            try:
+                async with search_page.expect_popup(timeout=4_000) as popup_info:
+                    await locator.click(timeout=5_000, no_wait_after=True)
+                popup = await popup_info.value
+            except PlaywrightTimeoutError:
+                # 没有新窗口并不等于点击失败：小红书常在当前页改路由或打开弹层。
+                popup = None
+            if popup is not None:
+                with suppress(Exception):
+                    await popup.wait_for_load_state("domcontentloaded", timeout=10_000)
+                await popup.wait_for_timeout(500)
+                if self.accepts_url(popup.url) or await self._has_detail_view(popup):
+                    return popup, None, ""
+                with suppress(Exception):
+                    await popup.close()
+                return None, None, "卡片新窗口未进入可识别的详情页"
 
-        XHS search cards can expose a tokenized href only after hydration.  If
-        the initial anchor did not have one, read the live card href from the
-        original search page before falling back to the canonical URL.  This
-        preserves the search-page route context and avoids inventing a URL.
-        """
-        navigation_url = item.navigation_url or ""
-        if navigation_url and urlsplit(navigation_url).query:
-            return navigation_url
-        if search_page is not None:
+            await search_page.wait_for_timeout(800)
+            if search_page.url != before_url and self.accepts_url(search_page.url):
+                return search_page, before_url, ""
+            if await self._has_detail_view(search_page):
+                return search_page, before_url, ""
+            return None, None, "卡片点击后未进入详情页"
+        except PlaywrightError as exc:
+            return None, None, str(exc)[:1000]
+
+    async def _has_detail_view(self, page: Page) -> bool:
+        selectors = self.detail_view_selectors or self.title_selectors
+        for selector in selectors:
+            with suppress(PlaywrightError):
+                locator = page.locator(selector).first
+                if await locator.count() and await locator.is_visible():
+                    return True
+        return False
+
+    async def _restore_search_page(self, search_page: Page, search_url: str) -> None:
+        """Return a current-page detail view to the original search context."""
+        if search_page.url != search_url:
             with suppress(Exception):
-                locator = search_page.locator(f'a[href*="{item.content_id}"]').first
-                before_url = search_page.url
-                await locator.click(timeout=3_000)
-                await search_page.wait_for_timeout(500)
-                clicked_url = search_page.url
-                if clicked_url != before_url and self.accepts_url(clicked_url):
-                    with suppress(Exception):
-                        await search_page.go_back(wait_until="domcontentloaded", timeout=10_000)
-                    return clicked_url
-                href = await locator.get_attribute("href")
-                if href:
-                    if not href.startswith("http"):
-                        href = f"{self.home_url.rstrip('/')}/{href.lstrip('/')}"
-                    if self.accepts_url(href):
-                        return href
-        return navigation_url or item.url
+                await search_page.go_back(wait_until="domcontentloaded", timeout=10_000)
+        if search_page.url != search_url:
+            with suppress(Exception):
+                await search_page.goto(search_url, wait_until="domcontentloaded", timeout=30_000)
 
     @staticmethod
     def _is_relevant_media(node: dict[str, Any], source_url: str) -> bool:

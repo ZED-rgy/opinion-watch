@@ -183,6 +183,7 @@ class Storage:
                     inserted_count INTEGER NOT NULL DEFAULT 0,
                     updated_count INTEGER NOT NULL DEFAULT 0,
                     succeeded_count INTEGER NOT NULL DEFAULT 0,
+                    partial_count INTEGER NOT NULL DEFAULT 0,
                     failed_count INTEGER NOT NULL DEFAULT 0,
                     suspected_count INTEGER NOT NULL DEFAULT 0,
                     detailed_count INTEGER NOT NULL DEFAULT 0,
@@ -212,6 +213,7 @@ class Storage:
                     error_status TEXT NOT NULL DEFAULT '',
                     error_message TEXT NOT NULL DEFAULT '',
                     screenshot_path TEXT,
+                    partial_count INTEGER NOT NULL DEFAULT 0,
                     UNIQUE(run_id, platform, keyword, attempt_no)
                 );
 
@@ -495,12 +497,24 @@ class Storage:
         current = connection.execute(
             "SELECT COALESCE(MAX(version), 0) FROM schema_migrations"
         ).fetchone()[0]
-        if int(current) >= 4:
+        if int(current) >= 5:
+            return
+        if int(current) == 4:
+            Storage._migrate_v5(connection)
+            connection.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (5, ?)",
+                (datetime.now(UTC).isoformat(),),
+            )
             return
         if int(current) == 3:
             Storage._migrate_v4(connection)
             connection.execute(
                 "INSERT INTO schema_migrations(version, applied_at) VALUES (4, ?)",
+                (datetime.now(UTC).isoformat(),),
+            )
+            Storage._migrate_v5(connection)
+            connection.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (5, ?)",
                 (datetime.now(UTC).isoformat(),),
             )
             return
@@ -521,6 +535,11 @@ class Storage:
             Storage._migrate_v4(connection)
             connection.execute(
                 "INSERT INTO schema_migrations(version, applied_at) VALUES (4, ?)",
+                (datetime.now(UTC).isoformat(),),
+            )
+            Storage._migrate_v5(connection)
+            connection.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (5, ?)",
                 (datetime.now(UTC).isoformat(),),
             )
             return
@@ -677,6 +696,11 @@ class Storage:
         Storage._migrate_v4(connection)
         connection.execute(
             "INSERT INTO schema_migrations(version, applied_at) VALUES (4, ?)",
+            (datetime.now(UTC).isoformat(),),
+        )
+        Storage._migrate_v5(connection)
+        connection.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (5, ?)",
             (datetime.now(UTC).isoformat(),),
         )
 
@@ -847,6 +871,73 @@ class Storage:
                     ),
                 )
                 break
+
+    @staticmethod
+    def _migrate_v5(connection: sqlite3.Connection) -> None:
+        """Persist partial-attempt counts separately from hard failures."""
+        Storage._add_column(
+            connection,
+            "scan_runs",
+            "partial_count INTEGER NOT NULL DEFAULT 0",
+        )
+        Storage._add_column(
+            connection,
+            "scan_attempts",
+            "partial_count INTEGER NOT NULL DEFAULT 0",
+        )
+        connection.execute(
+            """
+            UPDATE scan_attempts
+            SET partial_count = CASE WHEN status = 'partial' THEN 1 ELSE 0 END
+            WHERE status IN ('partial', 'succeeded', 'failed')
+            """
+        )
+        connection.execute(
+            """
+            UPDATE scan_runs
+            SET succeeded_count = (
+                    SELECT COUNT(*) FROM scan_attempts
+                    WHERE run_id = scan_runs.id AND status = 'succeeded'
+                ),
+                partial_count = (
+                    SELECT COUNT(*) FROM scan_attempts
+                    WHERE run_id = scan_runs.id AND status = 'partial'
+                ),
+                failed_count = (
+                    SELECT COUNT(*) FROM scan_attempts
+                    WHERE run_id = scan_runs.id AND status = 'failed'
+                ),
+                status = CASE
+                    WHEN (
+                        SELECT COUNT(*) FROM scan_attempts
+                        WHERE run_id = scan_runs.id AND status = 'failed'
+                    ) = 0
+                    AND (
+                        SELECT COUNT(*) FROM scan_attempts
+                        WHERE run_id = scan_runs.id AND status = 'partial'
+                    ) > 0 THEN 'partial'
+                    WHEN (
+                        SELECT COUNT(*) FROM scan_attempts
+                        WHERE run_id = scan_runs.id AND status = 'failed'
+                    ) > 0
+                    AND (
+                        SELECT COUNT(*) FROM scan_attempts
+                        WHERE run_id = scan_runs.id
+                          AND status IN ('succeeded', 'partial')
+                    ) > 0 THEN 'partial'
+                    WHEN (
+                        SELECT COUNT(*) FROM scan_attempts
+                        WHERE run_id = scan_runs.id AND status = 'failed'
+                    ) > 0 THEN 'failed'
+                    WHEN (
+                        SELECT COUNT(*) FROM scan_attempts
+                        WHERE run_id = scan_runs.id AND status = 'succeeded'
+                    ) > 0 THEN 'succeeded'
+                    ELSE status
+                END
+            WHERE EXISTS (SELECT 1 FROM scan_attempts WHERE run_id = scan_runs.id)
+            """
+        )
 
     @staticmethod
     def _migrate_content_match_keys(connection: sqlite3.Connection) -> None:
@@ -1776,6 +1867,7 @@ class Storage:
         inserted: int = 0,
         updated: int = 0,
         succeeded: int = 0,
+        partial: int = 0,
         failed: int = 0,
         suspected: int = 0,
         detailed: int = 0,
@@ -1799,7 +1891,8 @@ class Storage:
                 UPDATE scan_runs SET
                     status = ?, finished_at = ?, collected_count = ?,
                     scanned_count = ?, filtered_count = ?, inserted_count = ?,
-                    updated_count = ?, succeeded_count = ?, failed_count = ?, error_message = ?,
+                    updated_count = ?, succeeded_count = ?, partial_count = ?,
+                    failed_count = ?, error_message = ?,
                     suspected_count = ?, detailed_count = ?, media_count = ?,
                     brand_matched_count = ?, detail_attempted_count = ?,
                     detail_unavailable_count = ?, content_inserted_count = ?,
@@ -1817,6 +1910,7 @@ class Storage:
                     inserted,
                     updated,
                     succeeded,
+                    partial,
                     failed,
                     error_message,
                     suspected,
@@ -1867,6 +1961,7 @@ class Storage:
         filtered: int = 0,
         inserted: int = 0,
         updated: int = 0,
+        partial: int = 0,
         suspected: int = 0,
         detailed: int = 0,
         media_items: int = 0,
@@ -1887,7 +1982,8 @@ class Storage:
                 UPDATE scan_attempts SET
                     status = ?, finished_at = ?, collected_count = ?,
                     scanned_count = ?, filtered_count = ?, inserted_count = ?,
-                    updated_count = ?, error_status = ?, error_message = ?, screenshot_path = ?
+                    updated_count = ?, partial_count = ?, error_status = ?,
+                    error_message = ?, screenshot_path = ?
                     , suspected_count = ?, detailed_count = ?, media_count = ?
                     , brand_matched_count = ?, detail_attempted_count = ?,
                     detail_unavailable_count = ?, content_inserted_count = ?,
@@ -1902,6 +1998,7 @@ class Storage:
                     filtered,
                     inserted,
                     updated,
+                    partial,
                     error_status,
                     error_message,
                     screenshot_path,
@@ -2127,7 +2224,8 @@ class Storage:
             rows = connection.execute(
                 """
                 SELECT id, trigger, status, started_at, finished_at,
-                       title, note, collected_count, succeeded_count, failed_count
+                       title, note, collected_count, succeeded_count,
+                       partial_count, failed_count
                 FROM scan_runs
                 ORDER BY id DESC LIMIT ?
                 """,
