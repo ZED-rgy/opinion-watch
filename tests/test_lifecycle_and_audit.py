@@ -388,6 +388,73 @@ def test_douyin_detail_prefers_direct_navigation_without_clicking_search_card() 
     assert enriched[0].raw_data["detail_collected"] is True
 
 
+def test_douyin_rejects_detail_page_that_redirects_after_initial_match() -> None:
+    expected_id = "1234567890123456789"
+    unrelated_id = "7674851605736459546"
+
+    class DetailPage:
+        url = f"https://www.douyin.com/video/{expected_id}"
+
+        def __init__(self) -> None:
+            self.closed = False
+            self.guard_installed = False
+            self.wait_calls = 0
+
+        async def add_init_script(self, _script: str) -> None:
+            self.guard_installed = True
+
+        async def goto(self, _url: str, **_kwargs: object) -> None:
+            return None
+
+        async def wait_for_timeout(self, _milliseconds: int) -> None:
+            self.wait_calls += 1
+            if self.wait_calls == 2:
+                self.url = f"https://www.douyin.com/jingxuan?modal_id={unrelated_id}"
+
+        async def close(self) -> None:
+            self.closed = True
+
+    class Context:
+        def __init__(self) -> None:
+            self.page = DetailPage()
+
+        async def new_page(self) -> DetailPage:
+            return self.page
+
+    class TestableDouyinCollector(DouyinCollector):
+        detail_identity_stability_checks = 4
+
+        async def session_status(self, _page: object, _context: object) -> SessionStatus:
+            raise AssertionError("错配详情页不应进入会话检查和数据抽取")
+
+    item = CollectedContent(
+        platform=Platform.DOUYIN,
+        content_id=expected_id,
+        url=f"https://www.douyin.com/video/{expected_id}",
+        title="速探长物流投诉",
+        source_keyword="速探长",
+        brand_name="速探长",
+        navigation_url=f"https://www.douyin.com/video/{expected_id}",
+        raw_data={"screening": {"admitted": True}},
+    )
+    context = Context()
+    enriched = asyncio.run(
+        TestableDouyinCollector().enrich_items(
+            context,  # type: ignore[arg-type]
+            [item],
+            detail_limit=1,
+            comments_limit=1,
+            detail_candidate_ids={item.content_id},
+        )
+    )
+
+    assert context.page.guard_installed is True
+    assert context.page.closed is True
+    assert enriched[0].raw_data["detail_status"] == "failed"
+    assert unrelated_id in enriched[0].raw_data["detail_error"]
+    assert enriched[0].raw_data.get("detail_collected") is not True
+
+
 def test_soft_delete_rediscovery_is_new_opinion_and_recreates_notification(tmp_path) -> None:
     storage = Storage(tmp_path / "test.db")
     storage.initialize()

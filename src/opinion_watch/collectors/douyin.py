@@ -65,6 +65,11 @@ class DouyinCollector(BaseCollector):
     )
     require_detail_content_id = True
     prefer_direct_detail_navigation = True
+    # 抖音详情是 SPA 路由，初始目标 URL 可能在数秒后被推荐流替换。
+    # 持续约 4 秒确认内容 ID，并暂停视频，避免播放结束自动切换。
+    detail_identity_stability_checks = 17
+    detail_identity_poll_ms = 250
+    suspend_detail_media_playback = True
 
     def build_search_url(self, keyword: str) -> str:
         return f"https://www.douyin.com/jingxuan/search/{quote(keyword)}"

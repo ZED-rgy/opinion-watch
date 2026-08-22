@@ -48,6 +48,9 @@ class BaseCollector(ABC):
     detail_view_selectors: tuple[str, ...] = ()
     require_detail_content_id = False
     prefer_direct_detail_navigation = False
+    detail_identity_stability_checks = 1
+    detail_identity_poll_ms = 250
+    suspend_detail_media_playback = False
     # 平台可能在登录态健康时仍然弹出登录引导弹窗；这些选择器用于尝试
     # 关闭它而不是直接放弃本轮检索。
     login_modal_close_selectors: tuple[str, ...] = ()
@@ -417,6 +420,8 @@ class BaseCollector(ABC):
                     else:
                         detail_page = await context.new_page()
                         popup_page = detail_page
+                        if self.suspend_detail_media_playback:
+                            await self._install_media_playback_guard(detail_page)
                         await detail_page.goto(
                             item.navigation_url or item.url,
                             wait_until="domcontentloaded",
@@ -452,7 +457,7 @@ class BaseCollector(ABC):
                     continue
                 if detail_page is None:
                     continue
-                identity_matches, identity_error = await self._detail_identity_matches(
+                identity_matches, identity_error = await self._confirm_stable_detail_identity(
                     detail_page,
                     item,
                 )
@@ -473,6 +478,28 @@ class BaseCollector(ABC):
                     )
                     continue
                 await detail_page.wait_for_timeout(self._human_delay_ms(1_500))
+                if self.suspend_detail_media_playback:
+                    await self._suspend_media_playback(detail_page)
+                identity_matches, identity_error = await self._detail_identity_matches(
+                    detail_page,
+                    item,
+                )
+                if not identity_matches:
+                    if detail_page is not search_page:
+                        with suppress(Exception):
+                            await detail_page.close()
+                        popup_page = None
+                    detail_page = None
+                    enriched[index] = replace(
+                        item,
+                        raw_data={
+                            **attempting,
+                            "detail_status": DetailStatus.FAILED.value,
+                            "detail_checked_at": attempting["detail_checked_at"],
+                            "detail_error": identity_error,
+                        },
+                    )
+                    continue
                 status = await self.session_status(detail_page, context)
                 if (
                     status is SessionStatus.VERIFICATION_REQUIRED
@@ -547,6 +574,28 @@ class BaseCollector(ABC):
                     artifact_dir=artifact_dir,
                     content_id=item.content_id,
                 )
+                # 抖音等 SPA 可能在详情抽取期间自动切换到下一条推荐内容。
+                # 写入前必须再次确认页面仍属于当前候选，禁止混入其他视频证据。
+                identity_matches, identity_error = await self._detail_identity_matches(
+                    detail_page,
+                    item,
+                )
+                if not identity_matches:
+                    if detail_page is not search_page:
+                        with suppress(Exception):
+                            await detail_page.close()
+                        popup_page = None
+                    detail_page = None
+                    enriched[index] = replace(
+                        item,
+                        raw_data={
+                            **attempting,
+                            "detail_status": DetailStatus.FAILED.value,
+                            "detail_checked_at": attempting["detail_checked_at"],
+                            "detail_error": identity_error,
+                        },
+                    )
+                    continue
                 raw_data = {
                     **item.raw_data,
                     "detail_collected": True,
@@ -724,6 +773,58 @@ class BaseCollector(ABC):
         if self.accepts_url(page.url) or await self._has_detail_view(page):
             return True, ""
         return False, "卡片点击后未进入可识别的详情页"
+
+    async def _confirm_stable_detail_identity(
+        self,
+        page: Page,
+        item: CollectedContent,
+    ) -> tuple[bool, str]:
+        """在 SPA 路由稳定窗口内持续确认详情 ID，捕获延迟推荐跳转。"""
+        checks = max(1, self.detail_identity_stability_checks)
+        for check_index in range(checks):
+            matches, identity_error = await self._detail_identity_matches(page, item)
+            if not matches:
+                return False, identity_error
+            if check_index < checks - 1:
+                await page.wait_for_timeout(max(50, self.detail_identity_poll_ms))
+        return True, ""
+
+    async def _install_media_playback_guard(self, page: Page) -> None:
+        """在详情文档加载前阻止自动播放，避免播完后跳到下一条推荐。"""
+        script = """
+        (() => {
+          if (window.__opinionWatchPlaybackGuard) return;
+          window.__opinionWatchPlaybackGuard = true;
+          const pause = node => {
+            if (!(node instanceof HTMLMediaElement)) return;
+            node.autoplay = false;
+            node.loop = true;
+            try { node.pause(); } catch (_) {}
+          };
+          document.addEventListener('play', event => pause(event.target), true);
+          document.addEventListener('loadedmetadata', event => pause(event.target), true);
+          new MutationObserver(records => {
+            for (const record of records) {
+              for (const node of record.addedNodes) {
+                if (!(node instanceof Element)) continue;
+                pause(node);
+                node.querySelectorAll('video, audio').forEach(pause);
+              }
+            }
+          }).observe(document.documentElement, {childList: true, subtree: true});
+          document.querySelectorAll('video, audio').forEach(pause);
+        })();
+        """
+        with suppress(Exception):
+            await page.add_init_script(script)
+
+    async def _suspend_media_playback(self, page: Page) -> None:
+        """兜底暂停已经挂载的媒体元素。"""
+        with suppress(Exception):
+            await page.locator("video, audio").evaluate_all(
+                "elements => elements.forEach(element => {"
+                "element.autoplay = false; element.loop = true; element.pause();})"
+            )
 
     async def _has_detail_view(self, page: Page) -> bool:
         selectors = self.detail_view_selectors or self.title_selectors
