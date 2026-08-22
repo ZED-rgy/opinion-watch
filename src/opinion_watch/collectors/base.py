@@ -154,6 +154,9 @@ class BaseCollector(ABC):
         await self._open_search_page(page, search_url, keyword)
 
         await page.wait_for_timeout(self._human_delay_ms(1_500))
+        upstream_error = await self._upstream_error(page)
+        if upstream_error:
+            raise CollectorRuntimeError(SessionStatus.ERROR, upstream_error)
         status = await self.session_status(page, context)
         # 登录态健康但页面盖着登录引导弹窗时（session_status 已经用 cookie
         # 区分了这种情况），先尝试关闭弹窗再继续，而不是把整个平台的本轮
@@ -223,6 +226,27 @@ class BaseCollector(ABC):
                     for item in results
                 ]
         return results
+
+    async def _upstream_error(self, page: Page) -> str | None:
+        """识别网关错误页，避免把平台故障当成零搜索结果。"""
+        title = ""
+        body = ""
+        with suppress(Exception):
+            title = await page.title()
+        with suppress(Exception):
+            body = (await page.locator("body").inner_text(timeout=2_000))[:8_000]
+        text = f"{title}\n{body}"
+        if not re.search(r"\b(?:502|503|504)\b", text):
+            return None
+        if not re.search(
+            r"bad gateway|service unavailable|gateway timeout|upstream|tengine|网关|上游服务",
+            text,
+            re.IGNORECASE,
+        ):
+            return None
+        status_code = re.search(r"\b(?:502|503|504)\b", text)
+        code = status_code.group(0) if status_code else "5xx"
+        return f"平台搜索页返回 HTTP {code} 网关错误（可能是上游服务异常），将按重试策略处理。"
 
     @staticmethod
     def search_quality(items: list[CollectedContent]) -> dict[str, Any]:

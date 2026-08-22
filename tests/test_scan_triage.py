@@ -252,6 +252,171 @@ class PartialSuspectCollector(ZeroDetailCollector):
         ]
 
 
+class ConcurrentPage:
+    def __init__(self, marker: str) -> None:
+        self.marker = marker
+        self.url = f"https://example.test/search/{marker}"
+        self.closed = False
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class ConcurrentContext:
+    def __init__(self) -> None:
+        self.next_marker = 0
+
+    async def new_page(self) -> ConcurrentPage:
+        self.next_marker += 1
+        return ConcurrentPage(f"prefetch-{self.next_marker}")
+
+
+class ConcurrentBrowserSession:
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        self.active_context = ConcurrentContext()
+        self.main_page = ConcurrentPage("main")
+
+    async def __aenter__(self) -> "ConcurrentBrowserSession":
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        return None
+
+    async def page(self) -> ConcurrentPage:
+        return self.main_page
+
+    async def capture_diagnostic(self, page: ConcurrentPage, label: str) -> None:
+        return None
+
+
+class ConcurrentCollector(ZeroDetailCollector):
+    def __init__(self) -> None:
+        self.detail_bindings: list[tuple[str, str]] = []
+
+    async def search(
+        self,
+        page: ConcurrentPage,
+        context: object,
+        keyword: str,
+        *,
+        limit: int,
+    ) -> list[CollectedContent]:
+        await asyncio.sleep(0)
+        return [
+            make_item(
+                f"card-{keyword}",
+                f"配达人投诉 {keyword}",
+                raw_data={"search_card_text": f"配达人投诉 {keyword}", "page": page.marker},
+            )
+        ]
+
+    async def enrich_items(
+        self,
+        context: object,
+        items: list[CollectedContent],
+        *,
+        detail_limit: int,
+        comments_limit: int,
+        detail_candidate_ids: set[str] | None = None,
+        artifact_dir: Path | None = None,
+        search_page: ConcurrentPage | None = None,
+    ) -> list[CollectedContent]:
+        assert search_page is not None
+        for item in items:
+            self.detail_bindings.append((str(item.raw_data["page"]), search_page.marker))
+        return [
+            replace(item, raw_data={**item.raw_data, "detail_collected": True}) for item in items
+        ]
+
+
+def test_concurrency_two_keeps_each_search_page_for_details(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    storage = Storage(tmp_path / "scan.db")
+    storage.initialize()
+    storage.add_brand("配达人")
+    default_keyword_id = storage.list_keywords(brand_name="配达人")[0]["id"]
+    storage.set_keyword_enabled(int(default_keyword_id), False)
+    storage.add_keyword("配达人", "速探长")
+    storage.add_keyword("配达人", "优速卖")
+    account_id = storage.add_account(Platform.XIAOHONGSHU.value, "测试账号")
+    storage.update_account_status(account_id, "ready")
+    settings = Settings(
+        runtime_dir=tmp_path / "runtime",
+        database_path=tmp_path / "scan.db",
+        artifact_dir=tmp_path / "artifacts",
+    )
+    collector = ConcurrentCollector()
+    monkeypatch.setattr("opinion_watch.runner.BrowserSession", ConcurrentBrowserSession)
+    monkeypatch.setattr("opinion_watch.runner.collector_for", lambda platform: collector)
+
+    exit_code = asyncio.run(
+        run_scan(
+            settings,
+            storage,
+            [Platform.XIAOHONGSHU],
+            options=ScanOptions(
+                limit=20,
+                detail_limit=2,
+                comments_limit=0,
+                retries=0,
+                brand_delay_seconds=0,
+                concurrency=2,
+            ),
+        )
+    )
+
+    run = storage.get_scan_run(1)
+    assert exit_code == 0
+    assert run is not None
+    assert run["status"] == "succeeded"
+    assert run["detailed_count"] == 2
+    assert all(expected == actual for expected, actual in collector.detail_bindings)
+    assert all(actual != "main" for _, actual in collector.detail_bindings)
+
+
+def test_partial_run_aggregates_repeated_runtime_warnings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    storage = Storage(tmp_path / "scan.db")
+    storage.initialize()
+    storage.add_brand("配达人")
+    default_keyword_id = storage.list_keywords(brand_name="配达人")[0]["id"]
+    storage.set_keyword_enabled(int(default_keyword_id), False)
+    for keyword in ("速探长", "优速卖", "配达人"):
+        storage.add_keyword("配达人", keyword)
+    account_id = storage.add_account(Platform.XIAOHONGSHU.value, "测试账号")
+    storage.update_account_status(account_id, "ready")
+    settings = Settings(
+        runtime_dir=tmp_path / "runtime",
+        database_path=tmp_path / "scan.db",
+        artifact_dir=tmp_path / "artifacts",
+    )
+    monkeypatch.setattr("opinion_watch.runner.BrowserSession", ZeroDetailBrowserSession)
+    monkeypatch.setattr(
+        "opinion_watch.runner.collector_for", lambda platform: ZeroDetailCollector()
+    )
+
+    asyncio.run(
+        run_scan(
+            settings,
+            storage,
+            [Platform.XIAOHONGSHU],
+            options=ScanOptions(
+                limit=20,
+                detail_limit=2,
+                comments_limit=0,
+                retries=0,
+                brand_delay_seconds=0,
+            ),
+        )
+    )
+
+    warnings = [alert for alert in storage.list_alerts() if alert["kind"] == "zero_detail_coverage"]
+    assert len(warnings) == 1
+    assert "本轮巡检共 3 项" in warnings[0]["message"]
+
+
 def test_brand_match_with_zero_details_is_partial_and_alerts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

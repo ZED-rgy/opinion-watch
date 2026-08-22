@@ -462,6 +462,31 @@ async def _run_scan_locked(
     totals = ScanTotals()
     coverage_shortfalls: list[str] = []
     llm_budget = LLMCallBudget(int(llm_config.get("max_candidates") or 20))
+    run_warning_groups: dict[str, dict[str, Any]] = {}
+
+    def record_run_warning(
+        kind: str,
+        message: str,
+        *,
+        severity: str = "warning",
+        screenshot_path: str | None = None,
+    ) -> None:
+        """合并同一轮同类告警，避免每个关键词各生成一条播报。"""
+        clean_message = message.strip()
+        if clean_message and clean_message not in coverage_shortfalls:
+            coverage_shortfalls.append(clean_message)
+        group = run_warning_groups.setdefault(
+            kind,
+            {"messages": [], "severity": "warning", "screenshot_path": None},
+        )
+        messages = group["messages"]
+        if clean_message and clean_message not in messages:
+            messages.append(clean_message)
+        if severity == "error":
+            group["severity"] = "error"
+        if screenshot_path and not group["screenshot_path"]:
+            group["screenshot_path"] = screenshot_path
+
     print(
         serialize_event(
             "scan.started",
@@ -606,6 +631,7 @@ async def _run_scan_locked(
                     prefetched_search: dict[str, list[CollectedContent] | Exception] = {}
                     prefetched_started_at: dict[str, str] = {}
                     prefetched_diagnostics: dict[str, str | None] = {}
+                    prefetched_pages: dict[str, object] = {}
                     if options.concurrency > 1 and len(targets) > 1:
                         # Keep one persistent profile/context per account, but use
                         # separate tabs for independent keyword searches. This is
@@ -622,6 +648,7 @@ async def _run_scan_locked(
                             ),
                             started_at_cache: dict[str, str] = prefetched_started_at,
                             diagnostics_cache: dict[str, str | None] = prefetched_diagnostics,
+                            pages_cache: dict[str, object] = prefetched_pages,
                             target_platform: str = platform.value,
                             target_collector=collector,
                         ) -> None:
@@ -647,10 +674,21 @@ async def _run_scan_locked(
                                     diagnostics_cache[cache_key] = _pop_search_diagnostic(
                                         target_collector, cache_key
                                     )
+                                    # Keep the page alive: detail enrichment must click
+                                    # the same live card that produced these candidates.
+                                    pages_cache[cache_key] = prefetch_page
+                                    prefetch_page = None
                                 except Exception as exc:
                                     # 缓存异常而不是抛出：gather 一旦抛出，其余
                                     # 预取任务会继续挂在即将关闭的浏览器上下文上。
                                     cache[cache_key] = exc
+                                    if prefetch_page is not None:
+                                        diagnostics_cache[
+                                            cache_key
+                                        ] = await session.capture_diagnostic(
+                                            prefetch_page,
+                                            f"{target_platform}-search-error",
+                                        )
                                 finally:
                                     if prefetch_page is not None:
                                         with suppress(Exception):
@@ -660,10 +698,11 @@ async def _run_scan_locked(
                     for target_index, target in enumerate(targets):
                         brand = str(target["brand_name"])
                         keyword = str(target["keyword"])
-                        cached_search = prefetched_search.pop(f"{brand}\x00{keyword}", None)
+                        cache_key = f"{brand}\x00{keyword}"
+                        cached_search = prefetched_search.pop(cache_key, None)
+                        detail_search_page = prefetched_pages.pop(cache_key, None) or page
                         platform_blocked = False
                         for attempt_no in range(1, options.retries + 2):
-                            cache_key = f"{brand}\x00{keyword}"
                             attempt_id = storage.create_scan_attempt(
                                 run_id=run_id,
                                 platform=platform.value,
@@ -687,7 +726,7 @@ async def _run_scan_locked(
                                     cached_search = None
                                 else:
                                     search_items = await collector.search(
-                                        page,
+                                        detail_search_page,
                                         session.active_context,
                                         keyword,
                                         **_collector_search_kwargs(
@@ -750,14 +789,10 @@ async def _run_scan_locked(
                                             error_message=quality_message,
                                             screenshot_path=diagnostic_path,
                                         )
-                                        storage.create_alert(
-                                            run_id=run_id,
-                                            attempt_id=attempt_id,
-                                            platform=platform.value,
-                                            keyword=keyword,
-                                            kind="search_data_quality",
+                                        record_run_warning(
+                                            "search_data_quality",
+                                            quality_message,
                                             severity="error",
-                                            message=quality_message,
                                             screenshot_path=diagnostic_path,
                                         )
                                         totals.failed += 1
@@ -823,14 +858,9 @@ async def _run_scan_locked(
                                     invalid_count = quality["total"] - len(search_items)
                                     screening_stats["scanned"] = quality["total"]
                                     screening_stats["filtered"] += invalid_count
-                                    storage.create_alert(
-                                        run_id=run_id,
-                                        attempt_id=attempt_id,
-                                        platform=platform.value,
-                                        keyword=keyword,
-                                        kind="search_data_quality",
-                                        severity="warning",
-                                        message=quality_message,
+                                    record_run_warning(
+                                        "search_data_quality",
+                                        quality_message,
                                         screenshot_path=diagnostic_path,
                                     )
                                 enriched_items = await collector.enrich_items(
@@ -844,7 +874,7 @@ async def _run_scan_locked(
                                         artifact_dir=settings.artifact_dir
                                         / platform.value
                                         / "media",
-                                        search_page=page,
+                                        search_page=detail_search_page,
                                     ),
                                 )
                                 items, detail_filter_reasons, final_suspected_count = (
@@ -912,11 +942,15 @@ async def _run_scan_locked(
                                         ),
                                     )
                             except CollectorRuntimeError as exc:
-                                screenshot = await session.capture_diagnostic(
-                                    page,
-                                    f"{platform.value}-{exc.status.value}",
+                                screenshot = None
+                                if not diagnostic_path:
+                                    screenshot = await session.capture_diagnostic(
+                                        detail_search_page,
+                                        f"{platform.value}-{exc.status.value}",
+                                    )
+                                screenshot_path = diagnostic_path or (
+                                    str(screenshot) if screenshot else None
                                 )
-                                screenshot_path = str(screenshot) if screenshot else None
                                 storage.finish_scan_attempt(
                                     attempt_id,
                                     status="failed",
@@ -969,11 +1003,15 @@ async def _run_scan_locked(
                                 platform_blocked = exc.status in _BLOCKING_STATUSES
                                 break
                             except Exception as exc:
-                                screenshot = await session.capture_diagnostic(
-                                    page,
-                                    f"{platform.value}-unexpected-error",
+                                screenshot = None
+                                if not diagnostic_path:
+                                    screenshot = await session.capture_diagnostic(
+                                        detail_search_page,
+                                        f"{platform.value}-unexpected-error",
+                                    )
+                                screenshot_path = diagnostic_path or (
+                                    str(screenshot) if screenshot else None
                                 )
-                                screenshot_path = str(screenshot) if screenshot else None
                                 storage.finish_scan_attempt(
                                     attempt_id,
                                     status="failed",
@@ -1051,14 +1089,9 @@ async def _run_scan_locked(
                                         "请检查详情页加载、登录态或平台页面结构。"
                                     )
                                     coverage_shortfalls.append(detail_coverage_message)
-                                    storage.create_alert(
-                                        run_id=run_id,
-                                        attempt_id=attempt_id,
-                                        platform=platform.value,
-                                        keyword=keyword,
-                                        kind="zero_detail_coverage",
-                                        severity="warning",
-                                        message=detail_coverage_message,
+                                    record_run_warning(
+                                        "zero_detail_coverage",
+                                        detail_coverage_message,
                                         screenshot_path=diagnostic_path,
                                     )
                                 # Zero results can be a legitimate no-match
@@ -1071,33 +1104,19 @@ async def _run_scan_locked(
                                         f"低于目标 {options.limit} 条"
                                     )
                                     coverage_shortfalls.append(shortfall)
-                                    storage.create_alert(
-                                        run_id=run_id,
-                                        attempt_id=attempt_id,
-                                        platform=platform.value,
-                                        keyword=keyword,
-                                        kind="coverage_shortfall",
-                                        severity="warning",
-                                        message=(
-                                            "平台当前可见结果不足目标数量，已完成可见范围扫描："
-                                            + shortfall
-                                        ),
+                                    record_run_warning(
+                                        "coverage_shortfall",
+                                        "平台当前可见结果不足目标数量，已完成可见范围扫描："
+                                        + shortfall,
                                     )
                                 elif scanned_count == 0:
                                     # A silent selector break looks identical to
                                     # "no results"; surface it for human triage.
-                                    storage.create_alert(
-                                        run_id=run_id,
-                                        attempt_id=attempt_id,
-                                        platform=platform.value,
-                                        keyword=keyword,
-                                        kind="zero_results",
-                                        severity="warning",
-                                        message=(
-                                            f"{platform.value}/{keyword} 检索结果为 0 条。"
-                                            "可能确实没有公开结果，也可能是页面结构变化导致"
-                                            "选择器失效，建议人工打开搜索页核对一次。"
-                                        ),
+                                    record_run_warning(
+                                        "zero_results",
+                                        f"{platform.value}/{keyword} 检索结果为 0 条。"
+                                        "可能确实没有公开结果，也可能是页面结构变化导致"
+                                        "选择器失效，建议人工打开搜索页核对一次。",
                                         screenshot_path=diagnostic_path,
                                     )
                                 totals.scanned += scanned_count
@@ -1121,8 +1140,6 @@ async def _run_scan_locked(
                                 )
                                 if quality_partial or detail_coverage_partial:
                                     totals.partial += 1
-                                    if quality_partial:
-                                        coverage_shortfalls.append(quality_message)
                                 else:
                                     totals.succeeded += 1
                                 storage.link_scan_contents(
@@ -1189,6 +1206,9 @@ async def _run_scan_locked(
                                 )
                                 break
 
+                        if detail_search_page is not page:
+                            with suppress(Exception):
+                                await detail_search_page.close()  # type: ignore[attr-defined]
                         if platform_blocked:
                             break
                         if target_index < len(targets) - 1 and options.brand_delay_seconds > 0:
@@ -1234,6 +1254,24 @@ async def _run_scan_locked(
             error_message="任务被取消",
         )
         raise
+
+    for kind, group in run_warning_groups.items():
+        messages = group["messages"]
+        if not messages:
+            continue
+        if totals.partial > 0:
+            summary = f"本轮巡检共 {len(messages)} 项{kind}：\n" + "\n".join(
+                f"- {message}" for message in messages
+            )
+            messages = [summary]
+        for message in messages:
+            storage.create_alert(
+                run_id=run_id,
+                kind=kind,
+                severity=str(group["severity"]),
+                message=message,
+                screenshot_path=group["screenshot_path"],
+            )
 
     classification_summary: dict[str, Any] | None = None
     model_summary: dict[str, Any] | None = None

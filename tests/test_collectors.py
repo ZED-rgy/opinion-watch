@@ -39,6 +39,26 @@ def test_xiaohongshu_parses_explore_link() -> None:
     )
 
 
+def test_gateway_error_page_is_not_treated_as_empty_search() -> None:
+    class BodyLocator:
+        async def inner_text(self, timeout: int) -> str:
+            return "502 Bad Gateway\\nTengine\\nupstream service unavailable"
+
+    class FakePage:
+        async def title(self) -> str:
+            return "502 Bad Gateway"
+
+        def locator(self, selector: str) -> BodyLocator:
+            assert selector == "body"
+            return BodyLocator()
+
+    message = asyncio.run(DouyinCollector()._upstream_error(FakePage()))  # type: ignore[arg-type]
+
+    assert message is not None
+    assert "HTTP 502" in message
+    assert "重试" in message
+
+
 def test_session_status_accepts_visible_authenticated_avatar_when_cookie_name_changes() -> None:
     class FakeLocator:
         def __init__(self, visible: bool) -> None:
