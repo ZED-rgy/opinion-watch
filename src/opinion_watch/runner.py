@@ -1091,12 +1091,30 @@ async def _run_scan_locked(
                                         "但详情核查为 0 条；"
                                         "请检查详情页加载、登录态或平台页面结构。"
                                     )
+                                    detail_errors = [
+                                        str(item.raw_data.get("detail_error") or "").strip()
+                                        for item in enriched_items
+                                        if str(item.raw_data.get("detail_error") or "").strip()
+                                    ]
+                                    if detail_errors:
+                                        detail_coverage_message += (
+                                            f"首条详情错误：{detail_errors[0][:240]}"
+                                        )
+                                    coverage_diagnostic = diagnostic_path
+                                    if not coverage_diagnostic:
+                                        captured = await session.capture_diagnostic(
+                                            detail_search_page,
+                                            f"{platform.value}-zero-detail",
+                                        )
+                                        coverage_diagnostic = str(captured) if captured else None
                                     coverage_shortfalls.append(detail_coverage_message)
                                     record_run_warning(
                                         "zero_detail_coverage",
                                         detail_coverage_message,
-                                        screenshot_path=diagnostic_path,
+                                        screenshot_path=coverage_diagnostic,
                                     )
+                                else:
+                                    coverage_diagnostic = diagnostic_path
                                 # Zero results can be a legitimate no-match
                                 # search. Warn when the platform returned a
                                 # partial page, which is the actionable case
@@ -1182,7 +1200,7 @@ async def _run_scan_locked(
                                         if detail_coverage_partial
                                         else ""
                                     ),
-                                    screenshot_path=diagnostic_path,
+                                    screenshot_path=coverage_diagnostic,
                                 )
                                 print(
                                     serialize_event(

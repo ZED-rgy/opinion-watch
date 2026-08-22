@@ -5,7 +5,9 @@ from pathlib import Path
 import pytest
 
 pytest.importorskip("PySide6")
+from PySide6.QtWidgets import QTableWidget  # noqa: E402
 
+from opinion_watch.desktop.dialogs import RunDetailDialog  # noqa: E402
 from opinion_watch.desktop.pages import (  # noqa: E402
     AccountsPage,
     KeywordsPage,
@@ -89,3 +91,25 @@ def test_settings_refresh_keeps_secret_input(qtbot, desktop_storage: Storage, tm
     page.llm_api_key.setText("sk-typing-in-progress")
     page.refresh()
     assert page.llm_api_key.text() == "sk-typing-in-progress"
+
+
+def test_scheduler_stop_button_starts_hidden(qtbot, desktop_storage: Storage) -> None:
+    page = SchedulerPage(desktop_storage)
+    qtbot.addWidget(page)
+    assert not page.stop_button.isVisible()
+    assert not page.stop_button.isEnabled()
+
+
+def test_run_detail_table_keeps_columns_separated_by_horizontal_scroll(
+    qtbot, desktop_storage: Storage
+) -> None:
+    run_id = desktop_storage.create_scan_run(
+        trigger="manual", platforms=["douyin"], brands=["速探长"], options={}
+    )
+    run = desktop_storage.get_scan_run(run_id)
+    assert run is not None
+    dialog = RunDetailDialog(desktop_storage, run)
+    qtbot.addWidget(dialog)
+    table = dialog.findChild(QTableWidget)
+    assert table is not None
+    assert table.minimumWidth() >= 1400

@@ -1787,6 +1787,46 @@ class Storage:
             )
         return cursor.rowcount
 
+    def cancel_scan_run(self, run_id: int, *, reason: str = "用户手动停止巡检") -> bool:
+        """Mark a running scan as cancelled and release leases left by its worker."""
+        now = datetime.now(UTC).isoformat()
+        clean_reason = reason.strip() or "用户手动停止巡检"
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            run = connection.execute(
+                "SELECT status FROM scan_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+            if run is None or str(run["status"]) != "running":
+                return False
+            connection.execute(
+                """
+                UPDATE scan_attempts
+                SET status = 'cancelled', finished_at = ?,
+                    error_status = 'cancelled', error_message = ?
+                WHERE run_id = ? AND status = 'running'
+                """,
+                (now, clean_reason, run_id),
+            )
+            connection.execute(
+                """
+                UPDATE scan_runs
+                SET status = 'cancelled', finished_at = ?, error_message = ?
+                WHERE id = ? AND status = 'running'
+                """,
+                (now, clean_reason, run_id),
+            )
+            # The worker owns the scan lease and the account leases it acquired.
+            # Once the desktop has terminated that worker, none of these leases
+            # should block the next user-initiated inspection.
+            connection.execute(
+                """
+                DELETE FROM task_leases
+                WHERE name = 'scan'
+                   OR owner IN (SELECT owner FROM task_leases WHERE name = 'scan')
+                """
+            )
+        return True
+
     def acquire_task_lease(self, name: str, owner: str, *, lease_seconds: int = 21_600) -> bool:
         now = datetime.now(UTC)
         now_iso = now.isoformat()

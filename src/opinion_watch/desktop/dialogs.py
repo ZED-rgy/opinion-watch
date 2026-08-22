@@ -161,19 +161,42 @@ class RunDetailDialog(QDialog):
                 attempt.get("error_message", "") or "—",
             )
             for column, value in enumerate(values):
-                item = QTableWidgetItem(str(value))
-                if column == table.columnCount() - 1 and str(value) != "—":
-                    item.setToolTip(str(value))
+                full_text = str(value)
+                display_text = full_text
+                if column == table.columnCount() - 1 and len(full_text) > 72:
+                    display_text = full_text[:72] + "…"
+                item = QTableWidgetItem(display_text)
+                if full_text != "—":
+                    item.setToolTip(full_text)
                 table.setItem(row, column, item)
         table.setWordWrap(False)
-        table.setTextElideMode(Qt.TextElideMode.ElideNone)
+        table.setTextElideMode(Qt.TextElideMode.ElideRight)
         table.setMinimumHeight(160)
         table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         header = table.horizontalHeader()
-        for column in range(table.columnCount()):
-            header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(table.columnCount() - 1, QHeaderView.ResizeMode.Stretch)
+        column_widths = (
+            70,
+            110,
+            75,
+            78,
+            78,
+            75,
+            78,
+            78,
+            78,
+            60,
+            60,
+            60,
+            60,
+            60,
+            60,
+            60,
+            260,
+        )
+        table.setMinimumWidth(sum(column_widths))
+        for column, width in enumerate(column_widths):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.Fixed)
+            table.setColumnWidth(column, width)
         table.resizeRowsToContents()
         root.addWidget(table, 1)
         alerts = storage.list_alerts(run_id=int(run["id"]), unacknowledged_only=False)

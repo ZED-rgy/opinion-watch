@@ -173,6 +173,94 @@ def test_douyin_login_confirmation_overrides_cookie_health() -> None:
     assert status is SessionStatus.VERIFICATION_REQUIRED
 
 
+def test_douyin_detail_uses_direct_navigation_when_card_click_is_unavailable() -> None:
+    class EmptyLocator:
+        first = None
+
+        async def count(self) -> int:
+            return 0
+
+    class SearchPage:
+        url = "https://www.douyin.com/jingxuan/search/速探长"
+
+        def locator(self, _selector: str) -> EmptyLocator:
+            locator = EmptyLocator()
+            locator.first = locator
+            return locator
+
+    class BodyLocator:
+        async def inner_text(self, timeout: int) -> str:
+            return "速探长物流投诉详情"
+
+    class DetailPage:
+        url = "https://www.douyin.com/video/1234567890123456789"
+
+        async def goto(self, _url: str, **_kwargs: object) -> None:
+            return None
+
+        async def wait_for_timeout(self, _milliseconds: int) -> None:
+            return None
+
+        async def title(self) -> str:
+            return "速探长物流投诉"
+
+        def locator(self, selector: str) -> BodyLocator:
+            assert selector == "body"
+            return BodyLocator()
+
+    class Context:
+        def __init__(self) -> None:
+            self.page = DetailPage()
+            self.new_page_calls = 0
+
+        async def new_page(self) -> DetailPage:
+            self.new_page_calls += 1
+            return self.page
+
+    class TestableDouyinCollector(DouyinCollector):
+        async def session_status(self, _page: object, _context: object) -> SessionStatus:
+            return SessionStatus.HEALTHY
+
+        @staticmethod
+        async def _first_text(_page: object, selectors: tuple[str, ...]) -> str:
+            return "速探长物流投诉" if selectors else ""
+
+        @staticmethod
+        async def _all_text(_page: object, _selectors: tuple[str, ...], *, limit: int) -> list[str]:
+            return [] if limit >= 0 else []
+
+        async def _extract_media_evidence(
+            self, _page: object, *, artifact_dir: object, content_id: str
+        ) -> list[dict[str, object]]:
+            return []
+
+    item = CollectedContent(
+        platform=Platform.DOUYIN,
+        content_id="1234567890123456789",
+        url="https://www.douyin.com/video/1234567890123456789",
+        title="速探长物流投诉",
+        source_keyword="速探长",
+        brand_name="速探长",
+        navigation_url="https://www.douyin.com/video/1234567890123456789",
+        raw_data={"screening": {"admitted": True}},
+    )
+    context = Context()
+    enriched = asyncio.run(
+        TestableDouyinCollector().enrich_items(
+            context,
+            [item],
+            detail_limit=1,
+            comments_limit=1,
+            detail_candidate_ids={item.content_id},
+            search_page=SearchPage(),  # type: ignore[arg-type]
+        )
+    )
+
+    assert context.new_page_calls == 1
+    assert enriched[0].raw_data["detail_status"] == "succeeded"
+    assert enriched[0].raw_data["detail_collected"] is True
+
+
 def test_soft_delete_rediscovery_is_new_opinion_and_recreates_notification(tmp_path) -> None:
     storage = Storage(tmp_path / "test.db")
     storage.initialize()

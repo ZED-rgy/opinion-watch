@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import subprocess
 import sys
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QProcess, QSize, Qt, QTime, QTimer, Signal
@@ -53,6 +55,16 @@ from opinion_watch.storage import Storage
 _TERMINAL_ATTEMPT_EVENTS = {"scan.attempt_succeeded", "scan.attempt_failed", "scan.attempt_error"}
 
 
+def _windowless_python() -> str:
+    """Use pythonw for scan workers so Windows does not flash a console window."""
+    executable = Path(sys.executable)
+    if sys.platform == "win32":
+        windowless = executable.with_name("pythonw.exe")
+        if windowless.exists():
+            return str(windowless)
+    return sys.executable
+
+
 class SchedulerPage(QWidget):
     scan_finished = Signal()
     manage_scope_requested = Signal()
@@ -71,6 +83,7 @@ class SchedulerPage(QWidget):
         self.current_run_id: int | None = None
         self._finished_keywords = 0
         self._restore_scan_button: Any = None
+        self._stop_requested = False
 
         self.setObjectName("page")
         root = QVBoxLayout(self)
@@ -100,6 +113,10 @@ class SchedulerPage(QWidget):
         header.addSpacing(8)
         self.scan_button = button("立即巡检", self.start_scan, icon_name="fa6s.play")
         header.addWidget(self.scan_button)
+        self.stop_button = button("停止巡检", self.stop_scan, icon_name="fa6s.stop", role="danger")
+        self.stop_button.setVisible(False)
+        self.stop_button.setEnabled(False)
+        header.addWidget(self.stop_button)
         root.addLayout(header)
 
         hero = QFrame()
@@ -441,11 +458,15 @@ class SchedulerPage(QWidget):
     def _set_scan_busy(self, busy: bool) -> None:
         if busy and self._restore_scan_button is None:
             self._restore_scan_button = run_busy(self.scan_button, "巡检中…")
+            self.stop_button.setVisible(True)
+            self.stop_button.setEnabled(True)
             if self.empty_timeline.action_button is not None:
                 self.empty_timeline.action_button.setEnabled(False)
         elif not busy and self._restore_scan_button is not None:
             self._restore_scan_button()
             self._restore_scan_button = None
+            self.stop_button.setVisible(False)
+            self.stop_button.setEnabled(False)
             if self.empty_timeline.action_button is not None:
                 self.empty_timeline.action_button.setEnabled(True)
 
@@ -459,11 +480,12 @@ class SchedulerPage(QWidget):
         self.output_buffer.clear()
         self.output.clear()
         self.output.setVisible(False)
+        self._stop_requested = False
         self._set_scan_busy(True)
         self.run_status.setText(
             "正在检索抖音和小红书…" + ("（大模型复判已启用）" if llm_enabled else "（规则筛选）")
         )
-        self.process.setProgram(sys.executable)
+        self.process.setProgram(_windowless_python())
         self.process.setArguments(
             [
                 "-m",
@@ -487,10 +509,37 @@ class SchedulerPage(QWidget):
         )
         self.process.start()
 
+    def stop_scan(self) -> None:
+        if self.process.state() == QProcess.ProcessState.NotRunning:
+            return
+        self._stop_requested = True
+        self.timer.stop()
+        self.stop_button.setEnabled(False)
+        self.run_status.setText("正在停止巡检…")
+        self.process.terminate()
+        QTimer.singleShot(3_000, self._force_stop_scan)
+
+    def _force_stop_scan(self) -> None:
+        if self.process.state() == QProcess.ProcessState.NotRunning:
+            return
+        process_id = int(self.process.processId())
+        if sys.platform == "win32" and process_id > 0:
+            with suppress(Exception):
+                subprocess.run(
+                    ["taskkill", "/PID", str(process_id), "/T", "/F"],
+                    check=False,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+        else:
+            self.process.kill()
+
     def _scan_process_error(self, error: QProcess.ProcessError) -> None:
         # 启动失败时 finished 不会触发，状态会一直停在“正在检索…”。
         if error is QProcess.ProcessError.FailedToStart:
             self._set_scan_busy(False)
+            self._stop_requested = False
             self.run_status.setText("巡检子进程无法启动，请检查 Python 运行环境")
 
     def read_output(self) -> None:
@@ -540,8 +589,30 @@ class SchedulerPage(QWidget):
         cursor.insertText(value)
 
     def process_finished(self, exit_code: int, _status: QProcess.ExitStatus) -> None:
+        was_stopped = self._stop_requested
+        cancelled = False
+        if was_stopped:
+            run_id = self.current_run_id
+            if run_id is None:
+                running = next(
+                    (
+                        item
+                        for item in self.storage.list_scan_runs(limit=20)
+                        if str(item.get("status")) == "running"
+                    ),
+                    None,
+                )
+                run_id = int(running["id"]) if running is not None else None
+            if run_id is not None:
+                cancelled = self.storage.cancel_scan_run(run_id)
         self._set_scan_busy(False)
-        self.run_status.setText("巡检已完成" if exit_code == 0 else "巡检未完成，请查看运行详情")
+        self.run_status.setText(
+            "巡检已停止"
+            if was_stopped and cancelled
+            else "巡检已完成"
+            if exit_code == 0
+            else "巡检未完成，请查看运行详情"
+        )
         if self.current_run_id is not None:
             # 用本次子进程在 scan.started 里上报的 run_id；取“最新一条记录”
             # 会在并发 CLI 巡检时指向别人的运行。
@@ -550,6 +621,7 @@ class SchedulerPage(QWidget):
         else:
             runs = self.storage.list_scan_runs(limit=1)
             self.latest_run_id = int(runs[0]["id"]) if runs else None
+        self._stop_requested = False
         if self.auto_enabled.isChecked():
             self.configure_timer(True)
         self.refresh()

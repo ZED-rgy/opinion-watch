@@ -400,16 +400,32 @@ class BaseCollector(ABC):
                             click_error,
                         ) = await self._open_detail_by_click(search_page, item)
                         if detail_page is None:
-                            enriched[index] = replace(
-                                item,
-                                raw_data={
-                                    **attempting,
-                                    "detail_status": DetailStatus.FAILED.value,
-                                    "detail_checked_at": attempting["detail_checked_at"],
-                                    "detail_error": click_error or "搜索卡片点击后未进入详情页",
-                                },
-                            )
-                            continue
+                            # 抖音搜索卡片的可点击锚点会随登录态和前端版本变化。
+                            # 点击失败时只对抖音使用规范 URL 兜底，避免把小红书
+                            # 的临时访问参数绕过卡片上下文直接持久化或访问。
+                            if self.platform is Platform.DOUYIN:
+                                detail_page = await context.new_page()
+                                popup_page = detail_page
+                                await detail_page.goto(
+                                    item.navigation_url or item.url,
+                                    wait_until="domcontentloaded",
+                                    timeout=60_000,
+                                )
+                                if not self.accepts_url(detail_page.url):
+                                    raise PlaywrightError(
+                                        click_error or "抖音详情直达后未进入目标内容页"
+                                    )
+                            else:
+                                enriched[index] = replace(
+                                    item,
+                                    raw_data={
+                                        **attempting,
+                                        "detail_status": DetailStatus.FAILED.value,
+                                        "detail_checked_at": attempting["detail_checked_at"],
+                                        "detail_error": click_error or "搜索卡片点击后未进入详情页",
+                                    },
+                                )
+                                continue
                         if detail_page is not search_page:
                             popup_page = detail_page
                     else:

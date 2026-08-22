@@ -34,11 +34,31 @@ def test_brand_keywords_are_configurable_scan_targets(tmp_path: Path) -> None:
         ("速探长", "速探长"),
         ("速探长", "速探长物流"),
     ]
-
     assert storage.rename_keyword(keyword_id, "速探长货代")
     assert storage.set_keyword_enabled(keyword_id, False)
     assert [item["keyword"] for item in storage.list_scan_targets()] == ["速探长"]
     assert storage.delete_keyword(keyword_id)
+
+
+def test_cancel_scan_run_closes_attempts_and_releases_worker_leases(tmp_path: Path) -> None:
+    storage = make_storage(tmp_path)
+    run_id = storage.create_scan_run(
+        trigger="manual", platforms=["douyin"], brands=["速探长"], options={}
+    )
+    storage.create_scan_attempt(run_id=run_id, platform="douyin", keyword="速探长", attempt_no=1)
+    assert storage.acquire_task_lease("scan", "scan-owner")
+    assert storage.acquire_task_lease("account:1", "scan-owner")
+
+    assert storage.cancel_scan_run(run_id)
+
+    run = storage.get_scan_run(run_id)
+    assert run is not None
+    assert run["status"] == "cancelled"
+    assert run["error_message"] == "用户手动停止巡检"
+    assert run["attempts"][0]["status"] == "cancelled"
+    with storage.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM task_leases").fetchone()[0] == 0
+    assert not storage.cancel_scan_run(run_id)
 
 
 def test_platform_accounts_are_isolated_records(tmp_path: Path) -> None:
