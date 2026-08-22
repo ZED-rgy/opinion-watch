@@ -52,6 +52,8 @@ class AnchorCandidate:
     href: str
     text: str = ""
     media_kind: str = ""
+    author_name: str = ""
+    raw_text: str = ""
 
 
 @dataclass(frozen=True, slots=True)

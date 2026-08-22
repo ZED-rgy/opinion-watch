@@ -4,7 +4,7 @@ from playwright.async_api import Error as PlaywrightError
 
 from opinion_watch.collectors.douyin import DouyinCollector
 from opinion_watch.collectors.xiaohongshu import XiaohongshuCollector
-from opinion_watch.models import AnchorCandidate, Platform, SessionStatus
+from opinion_watch.models import AnchorCandidate, CollectedContent, Platform, SessionStatus
 
 
 def test_douyin_extracts_and_deduplicates_at_storage_boundary() -> None:
@@ -188,4 +188,60 @@ def test_douyin_card_text_cleaning_strips_metrics_and_dates() -> None:
     sample = "图文\n25 我是dy团长，速探长物流靠谱吗大家避雷 #物流\n@某某用户\n1.2万\n08-21"
     assert (
         DouyinCollector._clean_card_text(sample) == "25 我是dy团长，速探长物流靠谱吗大家避雷 #物流"
+    )
+
+
+def test_xiaohongshu_anchor_metadata_is_preserved_for_card_extraction() -> None:
+    collector = XiaohongshuCollector()
+    items = collector.items_from_anchors(
+        [
+            AnchorCandidate(
+                "https://www.xiaohongshu.com/explore/66fad51c000000001b0224b8",
+                "速探长物流体验",
+                "image",
+                "小红书用户",
+                "速探长物流体验\n小红书用户\n收藏 12",
+            )
+        ],
+        "速探长",
+    )
+
+    assert items[0].title == "速探长物流体验"
+    assert items[0].author_name == "小红书用户"
+    assert items[0].raw_data["search_card_text"].startswith("速探长物流体验")
+
+
+def test_search_quality_flags_empty_titles() -> None:
+    items = [collector_item("one", ""), collector_item("two", "")]
+
+    quality = XiaohongshuCollector.search_quality(items)
+
+    assert quality["all_titles_empty"]
+    assert quality["needs_diagnostic"]
+    assert quality["empty_title_ratio"] == 1.0
+
+
+def collector_item(content_id: str, title: str) -> CollectedContent:
+    return CollectedContent(
+        platform=Platform.XIAOHONGSHU,
+        content_id=content_id,
+        url=f"https://www.xiaohongshu.com/explore/{content_id}",
+        title=title,
+        source_keyword="速探长",
+        raw_data={"search_card_text": "卡片正文"},
+    )
+
+
+def test_media_filter_rejects_static_and_tiny_assets() -> None:
+    assert not XiaohongshuCollector._is_relevant_media(
+        {"width": 64, "height": 64, "className": "avatar"},
+        "https://cdn.example.com/avatar.png",
+    )
+    assert not XiaohongshuCollector._is_relevant_media(
+        {"width": 800, "height": 600, "className": "note-image"},
+        "data:image/png;base64,abc",
+    )
+    assert XiaohongshuCollector._is_relevant_media(
+        {"width": 800, "height": 600, "className": "note-image"},
+        "https://cdn.example.com/note-image.jpg",
     )

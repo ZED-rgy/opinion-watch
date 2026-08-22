@@ -268,6 +268,7 @@ def _content_text(content: dict[str, Any]) -> str:
         str(content.get("title") or ""),
         str(raw.get("page_title") or ""),
         str(raw.get("description") or ""),
+        str(raw.get("search_card_text") or ""),
     ]
     comments = raw.get("comments")
     if isinstance(comments, list):

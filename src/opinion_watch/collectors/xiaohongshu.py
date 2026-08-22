@@ -9,7 +9,7 @@ from playwright.async_api import Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from opinion_watch.collectors.base import BaseCollector
-from opinion_watch.models import Platform
+from opinion_watch.models import AnchorCandidate, Platform
 
 
 class XiaohongshuCollector(BaseCollector):
@@ -52,6 +52,13 @@ class XiaohongshuCollector(BaseCollector):
         '.comment-item [class*="content"]',
         '[class*="comment-item"] [class*="content"]',
         '[class*="commentItem"] [class*="content"]',
+    )
+    media_container_selectors = (
+        "#noteContainer",
+        '[class*="note-content" i]',
+        '[class*="note-detail" i]',
+        '[class*="media-container" i]',
+        '[class*="swiper" i]',
     )
 
     def build_search_url(self, keyword: str) -> str:
@@ -106,3 +113,92 @@ class XiaohongshuCollector(BaseCollector):
 
     def accepts_url(self, url: str) -> bool:
         return "xiaohongshu.com" in url and self._content_pattern.search(url) is not None
+
+    async def _extract_anchors(self, page: Page) -> list[AnchorCandidate]:
+        """从笔记卡片容器抽取标题和作者，而不是只读封面链接文本。
+
+        小红书的搜索卡片经常把 `/explore/...` 链接只放在封面图片上，标题、作者
+        位于同级节点。这里从链接向上寻找卡片容器，再在容器内提取结构化字段，
+        同时保留整张卡片文本供品牌归属和规则筛选使用。
+        """
+        raw_items = await self._evaluate_elements(
+            page,
+            self.content_link_selector,
+            """
+            anchors => {
+              const clean = value => (value || '').replace(/\\s+/g, ' ').trim();
+              const noise = new RegExp(
+                '^(图文|视频|笔记|直播|关注|分享|收藏|评论|'
+                + '\\d+(?:\\.\\d+)?[万亿]?|\\d{2}-\\d{2}|\\d{4}-\\d{2}-\\d{2})$'
+              );
+              const textOf = node => clean(node && (node.innerText || node.textContent || ''));
+              const firstText = (root, selectors) => {
+                for (const selector of selectors) {
+                  const node = root.querySelector(selector);
+                  const value = textOf(node) || clean(node && (
+                    node.getAttribute('title') || node.getAttribute('aria-label')
+                  ));
+                  if (value && !noise.test(value)) return value;
+                }
+                return '';
+              };
+              const findCard = anchor => {
+                let node = anchor;
+                let fallback = anchor.parentElement || anchor;
+                for (let depth = 0; node && depth < 7; depth += 1, node = node.parentElement) {
+                  const value = textOf(node);
+                  if (value.length >= 12 && value.length <= 2500) fallback = node;
+                  const isSmallSection = node.matches('section')
+                    && node.querySelectorAll(
+                      'a[href*="/explore/"], a[href*="/search_result/"]'
+                    ).length <= 2;
+                  if (isSmallSection || node.matches(
+                    'article, [class*="note" i], [class*="card" i], [id*="note" i]'
+                  )) return node;
+                }
+                return fallback;
+              };
+              const fallbackTitle = card => {
+                const values = textOf(card).split(/\\n+/).map(clean).filter(Boolean);
+                const candidates = values.filter(
+                  value => value.length >= 3 && !noise.test(value) && !value.startsWith('@')
+                );
+                return candidates.sort((left, right) => right.length - left.length)[0] || '';
+              };
+              return anchors.map(anchor => {
+                const card = findCard(anchor);
+                const cardText = textOf(card);
+                const title = firstText(card, [
+                  '[class*="title" i]', '[data-testid*="title" i]',
+                  '[aria-label*="标题" i]', 'h1', 'h2', 'h3'
+                ]) || clean(anchor.getAttribute('title')) || clean(
+                  anchor.querySelector('img')?.getAttribute('alt')
+                ) || fallbackTitle(card);
+                const author = firstText(card, [
+                  '[class*="author" i] [class*="name" i]', '[class*="user" i] [class*="name" i]',
+                  '[class*="author" i]', '[class*="user" i]', 'a[href*="/user/profile/"]'
+                ]);
+                const mediaKind = card.querySelector('video')
+                  || /video/i.test(card.className || '') ? 'video' : 'image';
+                return {
+                  href: anchor.href || '',
+                  text: clean(title),
+                  author_name: clean(author).replace(/^@/, ''),
+                  raw_text: cardText,
+                  media_kind: mediaKind
+                };
+              });
+            }
+            """,
+        )
+        return [
+            AnchorCandidate(
+                href=str(item.get("href", "")),
+                text=str(item.get("text", "")),
+                media_kind=str(item.get("media_kind", "")),
+                author_name=str(item.get("author_name", "")),
+                raw_text=str(item.get("raw_text", "")),
+            )
+            for item in raw_items
+            if item.get("href")
+        ]

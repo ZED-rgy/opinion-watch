@@ -35,12 +35,20 @@ class DouyinCollector(BaseCollector):
     )
     author_selectors = (
         '[data-e2e="video-author-name"]',
-        'a[href*="/user/"]',
+        '[data-e2e*="author" i]',
+        '[class*="author-name" i]',
+        'main a[href*="/user/"]',
     )
     comment_selectors = (
         '[data-e2e="comment-item"]',
         '[class*="comment-item"]',
         '[class*="commentItem"]',
+    )
+    media_container_selectors = (
+        '[data-e2e="video-player"]',
+        '[data-e2e*="player" i]',
+        '[class*="video-player" i]',
+        '[class*="player-container" i]',
     )
 
     def build_search_url(self, keyword: str) -> str:

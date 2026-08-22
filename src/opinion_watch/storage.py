@@ -959,6 +959,7 @@ class Storage:
                 LEFT JOIN content_matches cm ON cm.content_item_id = ci.id
                 LEFT JOIN brands b ON b.id = cm.brand_id
                 WHERE (oa.requires_review = 1 OR oa.severity IN ('P0', 'P1', 'P2'))
+                  AND coalesce(json_extract(ci.raw_json, '$.screening.brand_matched'), 1) = 1
                   {run_filter}
                 GROUP BY ci.id, ci.platform, ci.title
                 ORDER BY ci.last_seen_at DESC
@@ -1505,8 +1506,9 @@ class Storage:
         platform: str,
         keyword: str,
         attempt_no: int,
+        started_at: str | None = None,
     ) -> int:
-        now = datetime.now(UTC).isoformat()
+        now = started_at or datetime.now(UTC).isoformat()
         with self.connect() as connection:
             cursor = connection.execute(
                 """
@@ -1715,8 +1717,23 @@ class Storage:
                 (run_id,),
             ).fetchone()[0]
         result = self._scan_run_dict(run_row)
-        result["attempts"] = [dict(row) for row in attempt_rows]
+        result["attempts"] = [self._scan_attempt_dict(row) for row in attempt_rows]
         result["content_count"] = int(content_count)
+        return result
+
+    @staticmethod
+    def _scan_attempt_dict(row: sqlite3.Row) -> dict[str, Any]:
+        result = dict(row)
+        started = str(result.get("started_at") or "")
+        finished = str(result.get("finished_at") or "")
+        try:
+            started_at = datetime.fromisoformat(started)
+            finished_at = datetime.fromisoformat(finished) if finished else datetime.now(UTC)
+            result["duration_seconds"] = round(
+                max(0.0, (finished_at - started_at).total_seconds()), 1
+            )
+        except ValueError:
+            result["duration_seconds"] = None
         return result
 
     def list_scan_run_choices(self, *, limit: int = 30) -> list[dict[str, Any]]:

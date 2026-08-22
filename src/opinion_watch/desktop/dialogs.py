@@ -113,6 +113,7 @@ class RunDetailDialog(QDialog):
                 "平台",
                 "关键词",
                 "状态",
+                "耗时",
                 "检索",
                 "入库",
                 "过滤",
@@ -131,6 +132,9 @@ class RunDetailDialog(QDialog):
                 PLATFORM_NAMES.get(str(attempt.get("platform")), attempt.get("platform", "")),
                 attempt.get("keyword", ""),
                 RUN_STATUS_NAMES.get(str(attempt.get("status")), attempt.get("status", "")),
+                f"{attempt.get('duration_seconds', 0):.1f} 秒"
+                if attempt.get("duration_seconds") is not None
+                else "—",
                 attempt.get("scanned_count", 0),
                 attempt.get("collected_count", 0),
                 attempt.get("filtered_count", 0),
@@ -143,7 +147,7 @@ class RunDetailDialog(QDialog):
             )
             for column, value in enumerate(values):
                 item = QTableWidgetItem(str(value))
-                if column == 11 and str(value) != "—":
+                if column == 12 and str(value) != "—":
                     item.setToolTip(str(value))
                 table.setItem(row, column, item)
         table.setWordWrap(False)
@@ -154,7 +158,7 @@ class RunDetailDialog(QDialog):
         for column in range(table.columnCount()):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(11, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(12, QHeaderView.ResizeMode.Stretch)
         table.resizeRowsToContents()
         root.addWidget(table, 1)
         alerts = storage.list_alerts(run_id=int(run["id"]), unacknowledged_only=False)

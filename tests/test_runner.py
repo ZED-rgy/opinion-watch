@@ -137,6 +137,29 @@ def test_model_screening_skips_clean_content_before_storage(
     assert stats["filtered"] == 1
 
 
+def test_search_noise_without_brand_mention_is_not_admitted(
+    tmp_path: Path,
+) -> None:
+    storage = Storage(tmp_path / "test.db")
+    storage.initialize()
+    item = CollectedContent(
+        platform=Platform.DOUYIN,
+        content_id="unrelated-negative",
+        url="https://www.douyin.com/video/unrelated-negative",
+        title="达人说骗子跑路了，大家避雷",
+        source_keyword="配达人",
+        brand_name="配达人",
+    )
+
+    admitted, detail_candidates, stats = asyncio.run(
+        _screen_items_for_admission(storage, [item], brand="配达人")
+    )
+
+    assert admitted == []
+    assert detail_candidates == set()
+    assert stats["filtered"] == 1
+
+
 def test_model_screening_only_sends_uncertain_content(
     tmp_path: Path,
     monkeypatch: object,

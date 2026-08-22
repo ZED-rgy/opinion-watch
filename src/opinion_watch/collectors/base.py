@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import random
 import re
 from abc import ABC, abstractmethod
@@ -35,6 +36,7 @@ class BaseCollector(ABC):
     description_selectors: tuple[str, ...] = ()
     author_selectors: tuple[str, ...] = ()
     comment_selectors: tuple[str, ...] = ()
+    media_container_selectors: tuple[str, ...] = ()
     # 平台可能在登录态健康时仍然弹出登录引导弹窗；这些选择器用于尝试
     # 关闭它而不是直接放弃本轮检索。
     login_modal_close_selectors: tuple[str, ...] = ()
@@ -51,6 +53,9 @@ class BaseCollector(ABC):
         "验证码",
     )
     rate_limit_phrases = ("访问频繁", "操作频繁", "请求过于频繁", "请稍后再试")
+
+    def __init__(self) -> None:
+        self._search_diagnostics: dict[str, str] = {}
 
     @staticmethod
     def _human_delay_ms(base_ms: int, *, jitter: float = 0.45) -> int:
@@ -117,6 +122,8 @@ class BaseCollector(ABC):
         keyword: str,
         *,
         limit: int = 20,
+        artifact_dir: Path | None = None,
+        diagnostic_key: str | None = None,
     ) -> list[CollectedContent]:
         search_url = self.build_search_url(keyword)
         await self._open_search_page(page, search_url, keyword)
@@ -152,7 +159,10 @@ class BaseCollector(ABC):
                 seen_ids.add(item.content_id)
                 results.append(item)
                 if len(results) >= limit:
-                    return results
+                    break
+
+            if len(results) >= limit:
+                break
 
             unchanged_rounds = unchanged_rounds + 1 if len(results) == before else 0
             if unchanged_rounds >= self._search_unchanged_rounds:
@@ -165,7 +175,89 @@ class BaseCollector(ABC):
             await page.wait_for_timeout(self._human_delay_ms(1_800))
             anchors = await self._extract_anchors(page)
 
+        quality = self.search_quality(results)
+        if quality["needs_diagnostic"] and artifact_dir is not None:
+            diagnostic_path = await self._save_search_diagnostic(
+                page,
+                artifact_dir=artifact_dir,
+                keyword=keyword,
+                quality=quality,
+            )
+            if diagnostic_path:
+                key = diagnostic_key or keyword
+                self._search_diagnostics[key] = diagnostic_path
+                results = [
+                    replace(
+                        item,
+                        raw_data={
+                            **item.raw_data,
+                            "search_diagnostic_path": diagnostic_path,
+                            "search_quality": quality,
+                        },
+                    )
+                    for item in results
+                ]
         return results
+
+    @staticmethod
+    def search_quality(items: list[CollectedContent]) -> dict[str, Any]:
+        total = len(items)
+        empty_title = sum(not str(item.title or "").strip() for item in items)
+        usable_text = sum(
+            bool(
+                str(item.title or "").strip()
+                or str(item.raw_data.get("search_card_text") or "").strip()
+            )
+            for item in items
+        )
+        empty_title_ratio = empty_title / total if total else 0.0
+        return {
+            "total": total,
+            "empty_title": empty_title,
+            "usable_text": usable_text,
+            "empty_title_ratio": round(empty_title_ratio, 3),
+            "needs_diagnostic": total == 0 or empty_title_ratio >= 0.3,
+            "all_titles_empty": total > 0 and empty_title == total,
+        }
+
+    def pop_search_diagnostic(self, key: str) -> str | None:
+        return self._search_diagnostics.pop(key, None)
+
+    async def _save_search_diagnostic(
+        self,
+        page: Page,
+        *,
+        artifact_dir: Path,
+        keyword: str,
+        quality: dict[str, Any],
+    ) -> str | None:
+        """保存搜索页截图和可复盘的 URL/选择器/质量信息。"""
+        safe_keyword = re.sub(r"[^a-zA-Z0-9_-]+", "-", keyword).strip("-")[:80] or "keyword"
+        timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+        base = artifact_dir / f"{timestamp}-{safe_keyword}-search-quality"
+        screenshot_path = base.with_suffix(".png")
+        metadata_path = base.with_suffix(".json")
+        metadata = {
+            "captured_at": datetime.now(UTC).isoformat(),
+            "platform": self.platform.value,
+            "keyword": keyword,
+            "url": page.url,
+            "selector": self.content_link_selector,
+            "quality": quality,
+        }
+        try:
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            await page.screenshot(path=str(screenshot_path), full_page=False, timeout=5_000)
+            metadata_path.write_text(
+                json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            return str(screenshot_path)
+        except Exception:
+            with suppress(Exception):
+                metadata_path.write_text(
+                    json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
+            return None
 
     async def _open_search_page(self, page: Page, search_url: str, keyword: str) -> None:
         """先加载平台首页建立前端环境，再打开搜索页。"""
@@ -294,7 +386,22 @@ class BaseCollector(ABC):
         # 元数据和截图必须来自同一个元素句柄。懒加载页面的 DOM 顺序会变，
         # 先快照再按下标重新定位会把截图挂到别的媒体条目上。
         try:
-            handles = await page.locator("img, video").element_handles()
+            media_locator = None
+            for selector in self.media_container_selectors:
+                candidate = page.locator(selector).first
+                if await candidate.count() and await candidate.is_visible():
+                    media_locator = candidate
+                    break
+            if media_locator is None:
+                media_locator = page.locator("main img, main video")
+            handles = []
+            with suppress(PlaywrightError):
+                tag_name = str(await media_locator.evaluate("node => node.tagName.toLowerCase()"))
+                if tag_name in {"img", "video"}:
+                    own_handle = await media_locator.element_handle()
+                    if own_handle is not None:
+                        handles.append(own_handle)
+            handles.extend(await media_locator.locator("img, video").element_handles())
         except PlaywrightError:
             return []
         evidence: list[dict[str, Any]] = []
@@ -309,7 +416,17 @@ class BaseCollector(ABC):
                             poster: node.poster || '',
                             alt: node.alt || node.getAttribute('aria-label') || '',
                             width: node.naturalWidth || node.videoWidth || 0,
-                            height: node.naturalHeight || node.videoHeight || 0
+                            height: node.naturalHeight || node.videoHeight || 0,
+                            id: node.id || '',
+                            className: typeof node.className === 'string' ? node.className : '',
+                            parentClass: node.parentElement
+                              && typeof node.parentElement.className === 'string'
+                              ? node.parentElement.className
+                              : '',
+                            ancestorClass: node.parentElement && node.parentElement.parentElement
+                              && typeof node.parentElement.parentElement.className === 'string'
+                              ? node.parentElement.parentElement.className
+                              : ''
                         })
                         """
                     ),
@@ -322,9 +439,14 @@ class BaseCollector(ABC):
             kind = str(node.get("kind") or "")
             if kind not in {"img", "video"}:
                 continue
+            source_url = str(node.get("src") or "")
+            if source_url.startswith(("data:", "blob:")):
+                source_url = str(node.get("poster") or "")
+            if not self._is_relevant_media(node, source_url):
+                continue
             entry: dict[str, Any] = {
                 "kind": "image" if kind == "img" else "video_keyframe",
-                "url": str(node.get("src") or "")[:2000],
+                "url": source_url[:2000],
                 "poster": str(node.get("poster") or "")[:2000],
                 "alt": str(node.get("alt") or "")[:500],
                 "width": int(node.get("width") or 0),
@@ -340,6 +462,41 @@ class BaseCollector(ABC):
                     entry["evidence_path"] = str(path)
             evidence.append(entry)
         return evidence
+
+    @staticmethod
+    def _is_relevant_media(node: dict[str, Any], source_url: str) -> bool:
+        """过滤头像、图标、徽章、占位图和过小的静态资源。"""
+        if not source_url or source_url.startswith(("data:", "blob:")):
+            return False
+        lowered = " ".join(
+            str(node.get(key) or "")
+            for key in ("id", "className", "parentClass", "ancestorClass", "alt")
+        ).lower()
+        static_tokens = (
+            "avatar",
+            "logo",
+            "icon",
+            "favicon",
+            "sprite",
+            "badge",
+            "emoji",
+            "qrcode",
+            "qr-code",
+            "header",
+            "nav",
+            "头像",
+            "网站图标",
+            "小图标",
+            "默认头像",
+        )
+        if any(token in lowered for token in static_tokens):
+            return False
+        width = int(node.get("width") or 0)
+        height = int(node.get("height") or 0)
+        if width < 120 or height < 120 or width * height < 22_500:
+            return False
+        ratio = width / height if height else 0
+        return 0.1 <= ratio <= 10
 
     def items_from_anchors(
         self, anchors: list[AnchorCandidate], keyword: str
@@ -360,7 +517,9 @@ class BaseCollector(ABC):
                     raw_data={
                         "source": "browser_dom",
                         "media_kind": anchor.media_kind,
+                        "search_card_text": anchor.raw_text or anchor.text,
                     },
+                    author_name=anchor.author_name,
                 )
             )
         return items

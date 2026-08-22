@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import random
 import uuid
 from collections.abc import Sequence
 from contextlib import suppress
 from dataclasses import asdict, dataclass, replace
+from datetime import UTC, datetime
 from typing import Any
 
 from opinion_watch.browser import BrowserSession
 from opinion_watch.classification import classify_batch, classify_content, is_suspected
 from opinion_watch.collectors import collector_for
-from opinion_watch.collectors.base import CollectorRuntimeError
+from opinion_watch.collectors.base import BaseCollector, CollectorRuntimeError
 from opinion_watch.config import Settings
 from opinion_watch.events import serialize_event
 from opinion_watch.llm import LLMAssessment, LLMCallBudget, classify_with_llm, screen_items_with_llm
@@ -24,6 +26,35 @@ from opinion_watch.models import (
 )
 from opinion_watch.storage import Storage
 from opinion_watch.wecom import send_daily_report_if_due
+
+
+def _collector_search_kwargs(
+    collector: object,
+    *,
+    limit: int,
+    artifact_dir: object,
+    diagnostic_key: str,
+) -> dict[str, object]:
+    """兼容离线测试替身，同时让真实采集器获得诊断参数。"""
+    kwargs: dict[str, object] = {"limit": limit}
+    parameters = inspect.signature(collector.search).parameters  # type: ignore[attr-defined]
+    if "artifact_dir" in parameters:
+        kwargs["artifact_dir"] = artifact_dir
+    if "diagnostic_key" in parameters:
+        kwargs["diagnostic_key"] = diagnostic_key
+    return kwargs
+
+
+def _collector_search_quality(collector: object, items: list[CollectedContent]) -> dict[str, Any]:
+    quality = getattr(collector, "search_quality", None)
+    if callable(quality):
+        return quality(items)
+    return BaseCollector.search_quality(items)
+
+
+def _pop_search_diagnostic(collector: object, key: str) -> str | None:
+    pop = getattr(collector, "pop_search_diagnostic", None)
+    return pop(key) if callable(pop) else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,7 +125,7 @@ def _screen_items_for_detail(
         result = classify_content(
             {
                 "title": getattr(item, "title", ""),
-                "brand_names": [],
+                "brand_names": [item.brand_name] if item.brand_name else [],
                 "raw_data": raw_data,
             }
         )
@@ -107,6 +138,9 @@ def _screen_items_for_detail(
             "matched_signals": result.matched_signals,
             "rationale": result.rationale,
             "requires_review": result.requires_review,
+            "brand_matched": not item.brand_name
+            or item.brand_name.lower()
+            in (f"{item.title}\n{raw_data.get('search_card_text', '')}").lower(),
         }
         screened_item = replace(item, raw_data=raw_data)
         screened.append(screened_item)
@@ -131,7 +165,7 @@ async def _screen_items_for_admission(
             continue
         # Ordinary/uncertain negative content is worth a model review. Clean
         # search cards never reach the model and are filtered by local rules.
-        if (
+        if precheck.get("brand_matched", True) and (
             precheck.get("category") == "ordinary_grievance"
             or bool(precheck.get("requires_review"))
             or bool(precheck.get("matched_signals"))
@@ -170,7 +204,8 @@ async def _screen_items_for_admission(
     for item in screened:
         key = f"{item.platform.value}:{item.content_id}"
         rule_data = item.raw_data.get("precheck", {})
-        rule_admitted = item.content_id in rule_candidates
+        brand_matched = bool(rule_data.get("brand_matched", True))
+        rule_admitted = item.content_id in rule_candidates and brand_matched
         model_result = model_assessments.get(key)
         if model_result is None:
             keep = rule_admitted
@@ -184,12 +219,16 @@ async def _screen_items_for_admission(
                 "severity": rule_data.get("severity", "P3"),
                 "matched_signals": rule_data.get("matched_signals", []),
                 "rationale": rule_data.get("rationale", ""),
+                "brand_matched": brand_matched,
             }
         else:
             keep = model_result.category.value not in {"other", "irrelevant"}
             keep = keep or model_result.requires_review
+            # 模型只有文本候选阶段的证据，不能把没有目标品牌精确提及的
+            # 搜索噪声提升为正式舆情；这类内容仅保留在候选留痕中。
+            keep = keep and brand_matched
             source = "model"
-            suspected = keep
+            suspected = keep and brand_matched
             screening_data = {
                 "source": source,
                 "admitted": keep,
@@ -199,6 +238,7 @@ async def _screen_items_for_admission(
                 "confidence": model_result.confidence,
                 "matched_signals": model_result.matched_signals,
                 "rationale": model_result.rationale,
+                "brand_matched": brand_matched,
             }
         raw_data = {**item.raw_data, "screening": screening_data}
         item = replace(item, raw_data=raw_data)
@@ -419,6 +459,8 @@ async def _run_scan_locked(
                         continue
                     storage.update_account_status(int(account["id"]), "ready")
                     prefetched_search: dict[str, list[CollectedContent] | Exception] = {}
+                    prefetched_started_at: dict[str, str] = {}
+                    prefetched_diagnostics: dict[str, str | None] = {}
                     if options.concurrency > 1 and len(targets) > 1:
                         # Keep one persistent profile/context per account, but use
                         # separate tabs for independent keyword searches. This is
@@ -433,6 +475,9 @@ async def _run_scan_locked(
                             cache: dict[str, list[CollectedContent] | Exception] = (
                                 prefetched_search
                             ),
+                            started_at_cache: dict[str, str] = prefetched_started_at,
+                            diagnostics_cache: dict[str, str | None] = prefetched_diagnostics,
+                            target_platform: str = platform.value,
                             target_collector=collector,
                         ) -> None:
                             brand = str(target["brand_name"])
@@ -442,11 +487,20 @@ async def _run_scan_locked(
                                 prefetch_page = None
                                 try:
                                     prefetch_page = await session.active_context.new_page()
+                                    started_at_cache[cache_key] = datetime.now(UTC).isoformat()
                                     cache[cache_key] = await target_collector.search(
                                         prefetch_page,
                                         session.active_context,
                                         keyword,
-                                        limit=options.limit,
+                                        **_collector_search_kwargs(
+                                            target_collector,
+                                            limit=options.limit,
+                                            artifact_dir=settings.artifact_dir / target_platform,
+                                            diagnostic_key=cache_key,
+                                        ),
+                                    )
+                                    diagnostics_cache[cache_key] = _pop_search_diagnostic(
+                                        target_collector, cache_key
                                     )
                                 except Exception as exc:
                                     # 缓存异常而不是抛出：gather 一旦抛出，其余
@@ -464,12 +518,17 @@ async def _run_scan_locked(
                         cached_search = prefetched_search.pop(f"{brand}\x00{keyword}", None)
                         platform_blocked = False
                         for attempt_no in range(1, options.retries + 2):
+                            cache_key = f"{brand}\x00{keyword}"
                             attempt_id = storage.create_scan_attempt(
                                 run_id=run_id,
                                 platform=platform.value,
                                 keyword=keyword,
                                 attempt_no=attempt_no,
+                                started_at=prefetched_started_at.pop(cache_key, None),
                             )
+                            diagnostic_path = prefetched_diagnostics.pop(cache_key, None)
+                            quality_partial = False
+                            quality_message = ""
                             try:
                                 if isinstance(cached_search, Exception):
                                     search_items = None
@@ -484,15 +543,91 @@ async def _run_scan_locked(
                                         page,
                                         session.active_context,
                                         keyword,
-                                        limit=options.limit,
+                                        **_collector_search_kwargs(
+                                            collector,
+                                            limit=options.limit,
+                                            artifact_dir=settings.artifact_dir / platform.value,
+                                            diagnostic_key=cache_key,
+                                        ),
                                     )
+                                    diagnostic_path = _pop_search_diagnostic(collector, cache_key)
                                 search_items = [
                                     replace(item, brand_name=brand) for item in search_items
                                 ]
+                                raw_search_items = search_items
+                                quality = _collector_search_quality(collector, search_items)
+                                if quality["needs_diagnostic"] and quality["total"] > 0:
+                                    diagnostic_path = diagnostic_path or next(
+                                        (
+                                            str(item.raw_data.get("search_diagnostic_path"))
+                                            for item in search_items
+                                            if item.raw_data.get("search_diagnostic_path")
+                                        ),
+                                        None,
+                                    )
+                                    quality_message = (
+                                        f"{platform.value}/{keyword} 检索到 "
+                                        f"{quality['total']} 条候选，"
+                                        f"其中 {quality['empty_title']} 条标题为空"
+                                        f"（{quality['empty_title_ratio']:.0%}），"
+                                        "搜索卡片文本质量不足，已保存搜索页诊断。"
+                                    )
+                                    if quality["all_titles_empty"]:
+                                        storage.save_scan_candidates(
+                                            run_id=run_id,
+                                            attempt_id=attempt_id,
+                                            items=search_items,
+                                        )
+                                        storage.mark_scan_candidates(
+                                            attempt_id=attempt_id,
+                                            admitted_content_ids=(),
+                                            filter_reason="搜索卡片标题全部为空，未进入详情和入库",
+                                        )
+                                        storage.finish_scan_attempt(
+                                            attempt_id,
+                                            status="failed",
+                                            scanned=quality["total"],
+                                            filtered=quality["total"],
+                                            error_status="data_quality_error",
+                                            error_message=quality_message,
+                                            screenshot_path=diagnostic_path,
+                                        )
+                                        storage.create_alert(
+                                            run_id=run_id,
+                                            attempt_id=attempt_id,
+                                            platform=platform.value,
+                                            keyword=keyword,
+                                            kind="search_data_quality",
+                                            severity="error",
+                                            message=quality_message,
+                                            screenshot_path=diagnostic_path,
+                                        )
+                                        totals.failed += 1
+                                        print(
+                                            serialize_event(
+                                                "scan.attempt_failed",
+                                                {
+                                                    "run_id": run_id,
+                                                    "attempt_id": attempt_id,
+                                                    "platform": platform.value,
+                                                    "keyword": keyword,
+                                                    "status": "data_quality_error",
+                                                    "message": quality_message,
+                                                    "screenshot": diagnostic_path,
+                                                },
+                                                ensure_ascii=False,
+                                            )
+                                        )
+                                        break
+                                    if quality["empty_title_ratio"] >= 0.3:
+                                        quality_partial = True
+                                        search_items = [
+                                            item for item in search_items if item.title.strip()
+                                        ]
                                 storage.save_scan_candidates(
                                     run_id=run_id,
                                     attempt_id=attempt_id,
-                                    items=search_items,
+                                    items=raw_search_items,
                                 )
                                 (
                                     items,
@@ -504,6 +639,20 @@ async def _run_scan_locked(
                                     brand=brand,
                                     budget=llm_budget,
                                 )
+                                if quality_partial:
+                                    invalid_count = quality["total"] - len(search_items)
+                                    screening_stats["scanned"] = quality["total"]
+                                    screening_stats["filtered"] += invalid_count
+                                    storage.create_alert(
+                                        run_id=run_id,
+                                        attempt_id=attempt_id,
+                                        platform=platform.value,
+                                        keyword=keyword,
+                                        kind="search_data_quality",
+                                        severity="warning",
+                                        message=quality_message,
+                                        screenshot_path=diagnostic_path,
+                                    )
                                 storage.mark_scan_candidates(
                                     attempt_id=attempt_id,
                                     admitted_content_ids=(item.content_id for item in items),
@@ -687,6 +836,7 @@ async def _run_scan_locked(
                                             "可能确实没有公开结果，也可能是页面结构变化导致"
                                             "选择器失效，建议人工打开搜索页核对一次。"
                                         ),
+                                        screenshot_path=diagnostic_path,
                                     )
                                 totals.scanned += scanned_count
                                 totals.filtered += filtered_count
@@ -696,7 +846,12 @@ async def _run_scan_locked(
                                 totals.collected += len(items)
                                 totals.inserted += stats.inserted
                                 totals.updated += stats.updated
-                                totals.succeeded += 1
+                                attempt_status = "partial" if quality_partial else "succeeded"
+                                if quality_partial:
+                                    totals.failed += 1
+                                    coverage_shortfalls.append(quality_message)
+                                else:
+                                    totals.succeeded += 1
                                 storage.link_scan_contents(
                                     run_id=run_id,
                                     attempt_id=attempt_id,
@@ -704,7 +859,7 @@ async def _run_scan_locked(
                                 )
                                 storage.finish_scan_attempt(
                                     attempt_id,
-                                    status="succeeded",
+                                    status=attempt_status,
                                     collected=len(items),
                                     scanned=scanned_count,
                                     filtered=filtered_count,
@@ -713,6 +868,11 @@ async def _run_scan_locked(
                                     suspected=suspected_count,
                                     detailed=detailed_count,
                                     media_items=media_count,
+                                    error_status=(
+                                        "data_quality_warning" if quality_partial else ""
+                                    ),
+                                    error_message=quality_message if quality_partial else "",
+                                    screenshot_path=diagnostic_path,
                                 )
                                 print(
                                     serialize_event(
@@ -724,7 +884,7 @@ async def _run_scan_locked(
                                             "platform": platform.value,
                                             "brand": brand,
                                             "keyword": keyword,
-                                            "status": "succeeded",
+                                            "status": attempt_status,
                                             "scanned": scanned_count,
                                             "collected": len(items),
                                             "filtered": filtered_count,

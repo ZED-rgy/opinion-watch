@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import json
 import re
 from datetime import UTC, datetime
 from pathlib import Path
@@ -69,7 +71,13 @@ class BrowserSession:
         pages = self.active_context.pages
         return pages[0] if pages else await self.active_context.new_page()
 
-    async def capture_diagnostic(self, page: Page, label: str) -> Path | None:
+    async def capture_diagnostic(
+        self,
+        page: Page,
+        label: str,
+        *,
+        metadata: dict[str, object] | None = None,
+    ) -> Path | None:
         if self.artifact_dir is None:
             return None
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -80,4 +88,15 @@ class BrowserSession:
             await page.screenshot(path=str(path), full_page=False, timeout=5_000)
         except Error:
             return None
+        if metadata is not None:
+            details = {
+                "captured_at": datetime.now(UTC).isoformat(),
+                "url": page.url,
+                "label": label,
+                **metadata,
+            }
+            with contextlib.suppress(OSError):
+                path.with_suffix(".json").write_text(
+                    json.dumps(details, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
         return path
