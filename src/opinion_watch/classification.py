@@ -124,6 +124,10 @@ def classify_content(content: dict[str, Any]) -> AssessmentResult:
             matched_signals=[],
             requires_review=False,
         )
+    # 命中负面信号但全文没出现品牌名：多为搜索排序带出的它牌负面或
+    # 泛化吐槽。不能按品牌舆情的等级定级，否则台账里全是误报。
+    # 降为 P3 并保留复核标记，由人工或大模型二次判断归属。
+    brand_matched = not brands or any(brand.lower() in text for brand in brands)
 
     rules = (
         (
@@ -158,6 +162,18 @@ def classify_content(content: dict[str, Any]) -> AssessmentResult:
     for signals, category, severity, confidence, rationale in rules:
         matched = _matched_signals(text, signals)
         if matched:
+            if not brand_matched:
+                return AssessmentResult(
+                    category=category,
+                    severity=RiskSeverity.P3,
+                    confidence=0.5,
+                    rationale=(
+                        "命中负面信号但可提取文本未出现品牌名称，可能是同页其他主体的内容；"
+                        "降级为低优先级线索，待人工确认归属。"
+                    ),
+                    matched_signals=matched,
+                    requires_review=True,
+                )
             return AssessmentResult(
                 category=category,
                 severity=severity,
@@ -170,6 +186,17 @@ def classify_content(content: dict[str, Any]) -> AssessmentResult:
     complaint_matches = _matched_signals(text, _COMPLAINT_SIGNALS)
     service_matches = _matched_signals(text, _SERVICE_SIGNALS)
     if complaint_matches and service_matches:
+        if not brand_matched:
+            return AssessmentResult(
+                category=OpinionCategory.REASONABLE_CONSUMER_COMPLAINT,
+                severity=RiskSeverity.P3,
+                confidence=0.5,
+                rationale=(
+                    "命中投诉信号但可提取文本未出现品牌名称；降级为低优先级线索，待人工确认归属。"
+                ),
+                matched_signals=[*complaint_matches, *service_matches],
+                requires_review=True,
+            )
         return AssessmentResult(
             category=OpinionCategory.REASONABLE_CONSUMER_COMPLAINT,
             severity=RiskSeverity.P2,

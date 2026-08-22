@@ -69,6 +69,10 @@ class XiaohongshuCollector(BaseCollector):
         触发概率。搜索框不可用时回退到深链方式。
         """
         await super()._open_search_page(page, self.home_url, keyword)
+        # 首页也可能直接盖登录引导弹窗，挡住搜索框；先关掉。
+        with suppress(Exception):
+            await self._dismiss_login_modal(page)
+            await page.wait_for_timeout(500)
         search_box = page.locator("#search-input, input[placeholder*='搜索']").first
         with suppress(PlaywrightError):
             await search_box.wait_for(state="visible", timeout=5_000)
@@ -82,9 +86,16 @@ class XiaohongshuCollector(BaseCollector):
                 await page.wait_for_timeout(300)
             await search_box.press("Enter")
             try:
-                await page.wait_for_url("**/search_result**", timeout=15_000)
+                await page.wait_for_url("**/search_result**", timeout=8_000)
             except PlaywrightTimeoutError:
-                pass
+                # 部分版本的搜索框不响应回车，需要点搜索按钮。
+                search_button = page.locator(
+                    ".search-icon, .input-button, #search-input ~ * [class*='search' i]"
+                ).first
+                with suppress(PlaywrightError):
+                    await search_button.click(timeout=3_000)
+                    await page.wait_for_url("**/search_result**", timeout=8_000)
+                    return
             else:
                 return
         await super()._open_search_page(page, search_url, keyword)

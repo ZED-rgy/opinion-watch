@@ -46,6 +46,21 @@ class DouyinCollector(BaseCollector):
     def build_search_url(self, keyword: str) -> str:
         return f"https://www.douyin.com/jingxuan/search/{quote(keyword)}"
 
+    @staticmethod
+    def _clean_card_text(text: str) -> str:
+        """从搜索卡片整段文本中提取正文标题。
+
+        卡片 innerText 形如 "图文\n标题内容#话题\n@作者\n1.2万\n08-21"，
+        直接入库会把媒体标记、点赞数和日期都带进标题。
+        """
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        noise = re.compile(
+            r"^(图文|视频|直播)$|^@|^\d+(\.\d+)?[万亿]?$|^\d{2}-\d{2}$|^\d{4}-\d{2}-\d{2}$"
+        )
+        candidates = [line for line in lines if not noise.match(line)]
+        # 取最长的一行作为标题主体；卡片里正文几乎总是最长的文本行。
+        return max(candidates, key=len) if candidates else " ".join(lines)
+
     async def _extract_anchors(self, page: Page) -> list[AnchorCandidate]:
         raw_cards = await self._evaluate_elements(
             page,
@@ -68,7 +83,7 @@ class DouyinCollector(BaseCollector):
             cards.append(
                 AnchorCandidate(
                     href=f"https://www.douyin.com/{content_kind}/{content_id}",
-                    text=text,
+                    text=self._clean_card_text(text),
                     media_kind="image" if content_kind == "note" else "video",
                 )
             )

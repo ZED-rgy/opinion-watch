@@ -177,8 +177,15 @@ def test_anchor_extraction_retries_when_navigation_replaces_context() -> None:
     assert anchors == [
         AnchorCandidate(
             "https://www.douyin.com/note/7512345678901234567",
-            "图文\n结果",
+            "结果",  # "图文" 媒体标记被标题清洗剔除
             "image",
         )
     ]
     assert page.waits == [750]
+
+
+def test_douyin_card_text_cleaning_strips_metrics_and_dates() -> None:
+    sample = "图文\n25 我是dy团长，速探长物流靠谱吗大家避雷 #物流\n@某某用户\n1.2万\n08-21"
+    assert (
+        DouyinCollector._clean_card_text(sample) == "25 我是dy团长，速探长物流靠谱吗大家避雷 #物流"
+    )

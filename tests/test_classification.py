@@ -34,6 +34,34 @@ def test_rule_classifier_flags_suspected_false_information_for_review() -> None:
     assert result.matched_signals == ["虚假宣传"]
 
 
+def test_negative_signals_without_brand_mention_are_downgraded() -> None:
+    result = classify_content(
+        {
+            "title": "被薅倒闭我就跑路了，这公司是骗子",
+            "brand_names": ["优速卖"],
+            "raw_data": {},
+        }
+    )
+
+    # 命中"跑路/骗子"但全文没有品牌名：保留复核线索，但不能按 P1 定级。
+    assert result.severity is RiskSeverity.P3
+    assert result.requires_review
+    assert "未出现品牌名称" in result.rationale
+
+
+def test_negative_signals_with_brand_mention_keep_high_severity() -> None:
+    result = classify_content(
+        {
+            "title": "优速卖就是骗子公司，大家别用",
+            "brand_names": ["优速卖"],
+            "raw_data": {},
+        }
+    )
+
+    assert result.severity is RiskSeverity.P1
+    assert result.requires_review
+
+
 def test_rule_classifier_matches_latin_brand_names_case_insensitively() -> None:
     result = classify_content(
         {
