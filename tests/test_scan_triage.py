@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from opinion_watch.collectors.base import CollectorRuntimeError
 from opinion_watch.config import Settings
 from opinion_watch.models import CollectedContent, Platform, SessionStatus
 from opinion_watch.runner import (
@@ -285,7 +286,7 @@ class ConcurrentBrowserSession:
     async def page(self) -> ConcurrentPage:
         return self.main_page
 
-    async def capture_diagnostic(self, page: ConcurrentPage, label: str) -> None:
+    async def capture_diagnostic(self, page: ConcurrentPage, label: str) -> Path | None:
         return None
 
 
@@ -327,6 +328,141 @@ class ConcurrentCollector(ZeroDetailCollector):
         return [
             replace(item, raw_data={**item.raw_data, "detail_collected": True}) for item in items
         ]
+
+
+class PrefetchGatewayBrowserSession(ConcurrentBrowserSession):
+    diagnostic_path: Path | None = None
+
+    async def capture_diagnostic(self, page: ConcurrentPage, label: str) -> Path | None:
+        return self.diagnostic_path
+
+
+class PrefetchGatewayCollector(ConcurrentCollector):
+    def __init__(self, *, always_fail: bool) -> None:
+        super().__init__()
+        self.always_fail = always_fail
+        self.search_calls: dict[str, int] = {}
+
+    async def search(
+        self,
+        page: ConcurrentPage,
+        context: object,
+        keyword: str,
+        *,
+        limit: int,
+    ) -> list[CollectedContent]:
+        calls = self.search_calls.get(keyword, 0) + 1
+        self.search_calls[keyword] = calls
+        if keyword == "502关键词" and (self.always_fail or calls == 1):
+            raise CollectorRuntimeError(SessionStatus.ERROR, "HTTP 502 Bad Gateway")
+        return await super().search(page, context, keyword, limit=limit)
+
+
+def _prepare_concurrent_gateway_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    always_fail: bool,
+) -> tuple[Storage, PrefetchGatewayCollector, Path]:
+    storage = Storage(tmp_path / "scan.db")
+    storage.initialize()
+    storage.add_brand("配达人")
+    default_keyword_id = storage.list_keywords(brand_name="配达人")[0]["id"]
+    storage.set_keyword_enabled(int(default_keyword_id), False)
+    storage.add_keyword("配达人", "正常关键词")
+    storage.add_keyword("配达人", "502关键词")
+    account_id = storage.add_account(Platform.XIAOHONGSHU.value, "测试账号")
+    storage.update_account_status(account_id, "ready")
+    diagnostic_path = tmp_path / "artifacts" / "gateway.png"
+    PrefetchGatewayBrowserSession.diagnostic_path = diagnostic_path
+    collector = PrefetchGatewayCollector(always_fail=always_fail)
+    monkeypatch.setattr("opinion_watch.runner.BrowserSession", PrefetchGatewayBrowserSession)
+    monkeypatch.setattr("opinion_watch.runner.collector_for", lambda platform: collector)
+    return storage, collector, diagnostic_path
+
+
+def test_concurrent_prefetch_502_retry_success_persists_diagnostic_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    storage, collector, diagnostic_path = _prepare_concurrent_gateway_scan(
+        tmp_path, monkeypatch, always_fail=False
+    )
+    settings = Settings(
+        runtime_dir=tmp_path / "runtime",
+        database_path=tmp_path / "scan.db",
+        artifact_dir=tmp_path / "artifacts",
+    )
+
+    exit_code = asyncio.run(
+        run_scan(
+            settings,
+            storage,
+            [Platform.XIAOHONGSHU],
+            options=ScanOptions(
+                limit=20,
+                detail_limit=0,
+                comments_limit=0,
+                retries=1,
+                retry_delay_seconds=0,
+                brand_delay_seconds=0,
+                concurrency=2,
+            ),
+        )
+    )
+
+    run = storage.get_scan_run(1)
+    assert exit_code == 0
+    assert run is not None
+    assert run["status"] == "succeeded"
+    assert collector.search_calls["502关键词"] == 2
+    failed_attempt = next(item for item in run["attempts"] if item["status"] == "failed")
+    assert failed_attempt["screenshot_path"] == str(diagnostic_path)
+    assert all(
+        isinstance(item["screenshot_path"], str)
+        for item in run["attempts"]
+        if item["screenshot_path"]
+    )
+
+
+def test_concurrent_prefetch_502_retry_failure_persists_attempt_and_alert(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    storage, collector, diagnostic_path = _prepare_concurrent_gateway_scan(
+        tmp_path, monkeypatch, always_fail=True
+    )
+    settings = Settings(
+        runtime_dir=tmp_path / "runtime",
+        database_path=tmp_path / "scan.db",
+        artifact_dir=tmp_path / "artifacts",
+    )
+
+    exit_code = asyncio.run(
+        run_scan(
+            settings,
+            storage,
+            [Platform.XIAOHONGSHU],
+            options=ScanOptions(
+                limit=20,
+                detail_limit=0,
+                comments_limit=0,
+                retries=1,
+                retry_delay_seconds=0,
+                brand_delay_seconds=0,
+                concurrency=2,
+            ),
+        )
+    )
+
+    run = storage.get_scan_run(1)
+    assert exit_code == 2
+    assert run is not None
+    assert run["status"] == "partial"
+    assert collector.search_calls["502关键词"] == 2
+    failed_attempts = [item for item in run["attempts"] if item["status"] == "failed"]
+    assert len(failed_attempts) == 2
+    assert all(item["screenshot_path"] == str(diagnostic_path) for item in failed_attempts)
+    alerts = storage.list_alerts(run_id=1)
+    assert any(alert["kind"] == "error" and "HTTP 502" in alert["message"] for alert in alerts)
 
 
 def test_concurrency_two_keeps_each_search_page_for_details(

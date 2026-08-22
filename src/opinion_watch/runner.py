@@ -683,11 +683,14 @@ async def _run_scan_locked(
                                     # 预取任务会继续挂在即将关闭的浏览器上下文上。
                                     cache[cache_key] = exc
                                     if prefetch_page is not None:
-                                        diagnostics_cache[
-                                            cache_key
-                                        ] = await session.capture_diagnostic(
+                                        diagnostic = await session.capture_diagnostic(
                                             prefetch_page,
                                             f"{target_platform}-search-error",
+                                        )
+                                        # Path 对象不能作为 SQLite 参数绑定；预取阶段
+                                        # 缓存的诊断路径必须与后续 attempt 持久化边界一致。
+                                        diagnostics_cache[cache_key] = (
+                                            str(diagnostic) if diagnostic else None
                                         )
                                 finally:
                                     if prefetch_page is not None:
