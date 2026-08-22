@@ -235,6 +235,16 @@ class BaseCollector(ABC):
                         continue
                 await detail_page.wait_for_timeout(self._human_delay_ms(1_500))
                 status = await self.session_status(detail_page, context)
+                if (
+                    status is SessionStatus.VERIFICATION_REQUIRED
+                    and await self._dismiss_login_modal(detail_page)
+                ):
+                    await detail_page.wait_for_timeout(800)
+                    status = await self.session_status(detail_page, context)
+                if status is SessionStatus.VERIFICATION_REQUIRED:
+                    # cookie 有效但详情页仍被登录引导墙盖住：跳过这一条的
+                    # 详情补充，保留浅层结果，不让整个关键词的采集作废。
+                    continue
                 if status is not SessionStatus.HEALTHY:
                     raise CollectorRuntimeError(
                         status,
