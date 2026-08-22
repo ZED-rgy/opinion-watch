@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 import uuid
 from collections.abc import Sequence
 from contextlib import suppress
@@ -741,7 +742,10 @@ async def _run_scan_locked(
                         if platform_blocked:
                             break
                         if target_index < len(targets) - 1 and options.brand_delay_seconds > 0:
-                            await asyncio.sleep(options.brand_delay_seconds)
+                            # 关键词间隔加随机抖动，避免形成机械的固定访问节奏。
+                            await asyncio.sleep(
+                                options.brand_delay_seconds * random.uniform(0.7, 1.6)
+                            )
             except Exception as exc:
                 totals.failed += 1
                 storage.update_account_status(int(account["id"]), "error")

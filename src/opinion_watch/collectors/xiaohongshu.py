@@ -28,7 +28,11 @@ class XiaohongshuCollector(BaseCollector):
         '[class*="loginContainer" i] [class*="close" i]',
     )
     _content_pattern = re.compile(r"/(?:explore|discovery/item|search_result)/([0-9a-fA-F]{16,32})")
-    content_link_selector = 'a.title[href*="/search_result/"]'
+    # 主选择器失效时回退到通用锚点扫描：accepts_url 仍会按内容 ID 模式
+    # 过滤，宁可多抓再过滤，也不要因为一次改版而静默归零。
+    content_link_selector = (
+        'a.title[href*="/search_result/"], section a[href*="/search_result/"], a[href*="/explore/"]'
+    )
     title_selectors = (
         "#detail-title",
         '[class*="title"]',

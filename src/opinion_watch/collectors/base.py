@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import random
 import re
 from abc import ABC, abstractmethod
 from contextlib import suppress
@@ -50,6 +51,13 @@ class BaseCollector(ABC):
         "验证码",
     )
     rate_limit_phrases = ("访问频繁", "操作频繁", "请求过于频繁", "请稍后再试")
+
+    @staticmethod
+    def _human_delay_ms(base_ms: int, *, jitter: float = 0.45) -> int:
+        """给固定等待加随机抖动；机械的固定节奏是风控的显著特征。"""
+        low = int(base_ms * (1 - jitter))
+        high = int(base_ms * (1 + jitter))
+        return random.randint(max(200, low), max(400, high))
 
     @abstractmethod
     def build_search_url(self, keyword: str) -> str:
@@ -113,7 +121,7 @@ class BaseCollector(ABC):
         search_url = self.build_search_url(keyword)
         await self._open_search_page(page, search_url, keyword)
 
-        await page.wait_for_timeout(1_500)
+        await page.wait_for_timeout(self._human_delay_ms(1_500))
         status = await self.session_status(page, context)
         # 登录态健康但页面盖着登录引导弹窗时（session_status 已经用 cookie
         # 区分了这种情况），先尝试关闭弹窗再继续，而不是把整个平台的本轮
@@ -149,12 +157,12 @@ class BaseCollector(ABC):
             unchanged_rounds = unchanged_rounds + 1 if len(results) == before else 0
             if unchanged_rounds >= self._search_unchanged_rounds:
                 break
-            await page.mouse.wheel(0, 1_200)
+            await page.mouse.wheel(0, random.randint(900, 1_600))
             # Some platform pages render the next batch asynchronously after
             # the scroll event. Give the DOM a little more time before taking
             # the next snapshot, otherwise a quick scan can stop at 9-10 cards
             # even though more public results are available.
-            await page.wait_for_timeout(1_800)
+            await page.wait_for_timeout(self._human_delay_ms(1_800))
             anchors = await self._extract_anchors(page)
 
         return results
@@ -164,7 +172,7 @@ class BaseCollector(ABC):
         if not page.url.startswith(self.home_url):
             with suppress(PlaywrightTimeoutError):
                 await page.goto(self.home_url, wait_until="domcontentloaded", timeout=30_000)
-            await page.wait_for_timeout(1_000)
+            await page.wait_for_timeout(self._human_delay_ms(1_000))
         try:
             await page.goto(search_url, wait_until="domcontentloaded", timeout=30_000)
         except PlaywrightTimeoutError as exc:
@@ -225,7 +233,7 @@ class BaseCollector(ABC):
                     # 正文、评论和媒体写进当前条目。跳过详情补充，保留浅层结果。
                     if self.canonical_url(detail_page.url) != self.canonical_url(item.url):
                         continue
-                await detail_page.wait_for_timeout(1_500)
+                await detail_page.wait_for_timeout(self._human_delay_ms(1_500))
                 status = await self.session_status(detail_page, context)
                 if status is not SessionStatus.HEALTHY:
                     raise CollectorRuntimeError(
