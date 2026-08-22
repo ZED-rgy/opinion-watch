@@ -46,6 +46,8 @@ class BaseCollector(ABC):
     comment_selectors: tuple[str, ...] = ()
     media_container_selectors: tuple[str, ...] = ()
     detail_view_selectors: tuple[str, ...] = ()
+    require_detail_content_id = False
+    prefer_direct_detail_navigation = False
     # 平台可能在登录态健康时仍然弹出登录引导弹窗；这些选择器用于尝试
     # 关闭它而不是直接放弃本轮检索。
     login_modal_close_selectors: tuple[str, ...] = ()
@@ -393,39 +395,23 @@ class BaseCollector(ABC):
                 enriched[index] = replace(item, raw_data=attempting)
                 click_error = ""
                 try:
-                    if search_page is not None:
+                    if search_page is not None and not self.prefer_direct_detail_navigation:
                         (
                             detail_page,
                             restore_search_url,
                             click_error,
                         ) = await self._open_detail_by_click(search_page, item)
                         if detail_page is None:
-                            # 抖音搜索卡片的可点击锚点会随登录态和前端版本变化。
-                            # 点击失败时只对抖音使用规范 URL 兜底，避免把小红书
-                            # 的临时访问参数绕过卡片上下文直接持久化或访问。
-                            if self.platform is Platform.DOUYIN:
-                                detail_page = await context.new_page()
-                                popup_page = detail_page
-                                await detail_page.goto(
-                                    item.navigation_url or item.url,
-                                    wait_until="domcontentloaded",
-                                    timeout=60_000,
-                                )
-                                if not self.accepts_url(detail_page.url):
-                                    raise PlaywrightError(
-                                        click_error or "抖音详情直达后未进入目标内容页"
-                                    )
-                            else:
-                                enriched[index] = replace(
-                                    item,
-                                    raw_data={
-                                        **attempting,
-                                        "detail_status": DetailStatus.FAILED.value,
-                                        "detail_checked_at": attempting["detail_checked_at"],
-                                        "detail_error": click_error or "搜索卡片点击后未进入详情页",
-                                    },
-                                )
-                                continue
+                            enriched[index] = replace(
+                                item,
+                                raw_data={
+                                    **attempting,
+                                    "detail_status": DetailStatus.FAILED.value,
+                                    "detail_checked_at": attempting["detail_checked_at"],
+                                    "detail_error": click_error or "搜索卡片点击后未进入详情页",
+                                },
+                            )
+                            continue
                         if detail_page is not search_page:
                             popup_page = detail_page
                     else:
@@ -465,6 +451,26 @@ class BaseCollector(ABC):
                     )
                     continue
                 if detail_page is None:
+                    continue
+                identity_matches, identity_error = await self._detail_identity_matches(
+                    detail_page,
+                    item,
+                )
+                if not identity_matches:
+                    if detail_page is not search_page:
+                        with suppress(Exception):
+                            await detail_page.close()
+                        popup_page = None
+                    detail_page = None
+                    enriched[index] = replace(
+                        item,
+                        raw_data={
+                            **attempting,
+                            "detail_status": DetailStatus.FAILED.value,
+                            "detail_checked_at": attempting["detail_checked_at"],
+                            "detail_error": identity_error,
+                        },
+                    )
                     continue
                 await detail_page.wait_for_timeout(self._human_delay_ms(1_500))
                 status = await self.session_status(detail_page, context)
@@ -684,20 +690,40 @@ class BaseCollector(ABC):
                 with suppress(Exception):
                     await popup.wait_for_load_state("domcontentloaded", timeout=10_000)
                 await popup.wait_for_timeout(500)
-                if self.accepts_url(popup.url) or await self._has_detail_view(popup):
+                matches, identity_error = await self._detail_identity_matches(popup, item)
+                if matches:
                     return popup, None, ""
                 with suppress(Exception):
                     await popup.close()
-                return None, None, "卡片新窗口未进入可识别的详情页"
+                return None, None, identity_error
 
             await search_page.wait_for_timeout(800)
-            if search_page.url != before_url and self.accepts_url(search_page.url):
+            matches, identity_error = await self._detail_identity_matches(search_page, item)
+            if matches:
                 return search_page, before_url, ""
-            if await self._has_detail_view(search_page):
-                return search_page, before_url, ""
-            return None, None, "卡片点击后未进入详情页"
+            return None, None, identity_error
         except PlaywrightError as exc:
             return None, None, str(exc)[:1000]
+
+    async def _detail_identity_matches(
+        self,
+        page: Page,
+        item: CollectedContent,
+    ) -> tuple[bool, str]:
+        """确认详情页属于当前候选，防止推荐弹窗污染证据。"""
+        actual_content_id = self.parse_content_id(page.url)
+        if actual_content_id:
+            if actual_content_id == item.content_id:
+                return True, ""
+            return (
+                False,
+                f"详情内容错配：期望 {item.content_id}，实际 {actual_content_id}",
+            )
+        if self.require_detail_content_id:
+            return False, f"详情页无法确认内容 ID：期望 {item.content_id}"
+        if self.accepts_url(page.url) or await self._has_detail_view(page):
+            return True, ""
+        return False, "卡片点击后未进入可识别的详情页"
 
     async def _has_detail_view(self, page: Page) -> bool:
         selectors = self.detail_view_selectors or self.title_selectors

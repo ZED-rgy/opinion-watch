@@ -173,20 +173,147 @@ def test_douyin_login_confirmation_overrides_cookie_health() -> None:
     assert status is SessionStatus.VERIFICATION_REQUIRED
 
 
-def test_douyin_detail_uses_direct_navigation_when_card_click_is_unavailable() -> None:
-    class EmptyLocator:
+def test_douyin_detail_rejects_unrelated_recommendation_popup() -> None:
+    expected_id = "7652677355172941066"
+    unrelated_id = "7676355993751637283"
+
+    class Popup:
+        def __init__(self) -> None:
+            self.url = f"https://www.douyin.com/jingxuan?modal_id={unrelated_id}"
+            self.closed = False
+
+        async def wait_for_load_state(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+        async def wait_for_timeout(self, _milliseconds: int) -> None:
+            return None
+
+        async def close(self) -> None:
+            self.closed = True
+
+    popup = Popup()
+
+    class PopupExpectation:
+        value = asyncio.sleep(0, result=popup)
+
+        async def __aenter__(self) -> "PopupExpectation":
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+    class CardLocator:
         first = None
 
         async def count(self) -> int:
-            return 0
+            return 1
+
+        async def click(self, **_kwargs: object) -> None:
+            return None
 
     class SearchPage:
         url = "https://www.douyin.com/jingxuan/search/速探长"
 
-        def locator(self, _selector: str) -> EmptyLocator:
-            locator = EmptyLocator()
+        def locator(self, _selector: str) -> CardLocator:
+            locator = CardLocator()
             locator.first = locator
             return locator
+
+        def expect_popup(self, **_kwargs: object) -> PopupExpectation:
+            return PopupExpectation()
+
+    item = CollectedContent(
+        platform=Platform.DOUYIN,
+        content_id=expected_id,
+        url=f"https://www.douyin.com/video/{expected_id}",
+        title="速探长空运小包",
+        source_keyword="速探长",
+    )
+
+    target, restore_url, error = asyncio.run(
+        DouyinCollector()._open_detail_by_click(SearchPage(), item)  # type: ignore[arg-type]
+    )
+
+    assert target is None
+    assert restore_url is None
+    assert popup.closed is True
+    assert expected_id in error
+    assert unrelated_id in error
+    assert "错配" in error
+
+
+def test_douyin_detail_accepts_matching_modal_popup() -> None:
+    content_id = "7652677355172941066"
+
+    class Popup:
+        def __init__(self) -> None:
+            self.url = f"https://www.douyin.com/jingxuan?modal_id={content_id}"
+            self.closed = False
+
+        async def wait_for_load_state(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+        async def wait_for_timeout(self, _milliseconds: int) -> None:
+            return None
+
+        async def close(self) -> None:
+            self.closed = True
+
+    popup = Popup()
+
+    class PopupExpectation:
+        value = asyncio.sleep(0, result=popup)
+
+        async def __aenter__(self) -> "PopupExpectation":
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+    class CardLocator:
+        first = None
+
+        async def count(self) -> int:
+            return 1
+
+        async def click(self, **_kwargs: object) -> None:
+            return None
+
+    class SearchPage:
+        url = "https://www.douyin.com/jingxuan/search/速探长"
+
+        def locator(self, _selector: str) -> CardLocator:
+            locator = CardLocator()
+            locator.first = locator
+            return locator
+
+        def expect_popup(self, **_kwargs: object) -> PopupExpectation:
+            return PopupExpectation()
+
+    item = CollectedContent(
+        platform=Platform.DOUYIN,
+        content_id=content_id,
+        url=f"https://www.douyin.com/video/{content_id}",
+        title="速探长空运小包",
+        source_keyword="速探长",
+    )
+
+    target, restore_url, error = asyncio.run(
+        DouyinCollector()._open_detail_by_click(SearchPage(), item)  # type: ignore[arg-type]
+    )
+
+    assert target is popup
+    assert restore_url is None
+    assert popup.closed is False
+    assert error == ""
+
+
+def test_douyin_detail_prefers_direct_navigation_without_clicking_search_card() -> None:
+    class SearchPage:
+        url = "https://www.douyin.com/jingxuan/search/速探长"
+
+        def locator(self, _selector: str) -> object:
+            raise AssertionError("抖音详情不应点击搜索卡片")
 
     class BodyLocator:
         async def inner_text(self, timeout: int) -> str:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from contextlib import suppress
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, urlsplit
 
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Page
@@ -63,6 +63,8 @@ class DouyinCollector(BaseCollector):
         '[class*="video-player" i]',
         '[class*="player-container" i]',
     )
+    require_detail_content_id = True
+    prefer_direct_detail_navigation = True
 
     def build_search_url(self, keyword: str) -> str:
         return f"https://www.douyin.com/jingxuan/search/{quote(keyword)}"
@@ -135,8 +137,16 @@ class DouyinCollector(BaseCollector):
         await super()._open_search_page(page, search_url, keyword)
 
     def parse_content_id(self, url: str) -> str | None:
-        match = self._content_pattern.search(url)
-        return match.group(1) if match else None
+        parts = urlsplit(url)
+        hostname = (parts.hostname or "").lower()
+        if hostname != "douyin.com" and not hostname.endswith(".douyin.com"):
+            return None
+        match = self._content_pattern.search(parts.path)
+        if match:
+            return match.group(1)
+        modal_ids = parse_qs(parts.query).get("modal_id", [])
+        modal_id = str(modal_ids[0]) if modal_ids else ""
+        return modal_id if modal_id.isdigit() else None
 
     def accepts_url(self, url: str) -> bool:
-        return "douyin.com" in url and self._content_pattern.search(url) is not None
+        return self.parse_content_id(url) is not None

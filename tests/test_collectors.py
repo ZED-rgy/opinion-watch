@@ -23,6 +23,19 @@ def test_douyin_extracts_and_deduplicates_at_storage_boundary() -> None:
     assert items[0].title == "示例 视频"
 
 
+def test_douyin_parses_jingxuan_modal_content_id() -> None:
+    collector = DouyinCollector()
+    content_id = "7676355993751637283"
+
+    assert (
+        collector.parse_content_id(f"https://www.douyin.com/jingxuan?modal_id={content_id}")
+        == content_id
+    )
+    assert collector.accepts_url(f"https://www.douyin.com/jingxuan?modal_id={content_id}")
+    assert collector.parse_content_id(f"https://example.com/jingxuan?modal_id={content_id}") is None
+    assert collector.parse_content_id(f"https://example.com/video/{content_id}") is None
+
+
 def test_xiaohongshu_parses_explore_link() -> None:
     collector = XiaohongshuCollector()
     note_id = "66fad51c000000001b0224b8"
