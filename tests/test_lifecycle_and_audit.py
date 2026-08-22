@@ -99,6 +99,53 @@ def test_xhs_detail_prefers_live_card_click_over_tokenized_href() -> None:
     assert error == ""
 
 
+def test_xhs_detail_click_uses_visible_card_link() -> None:
+    class PopupExpectation:
+        def __init__(self) -> None:
+            self.value = asyncio.sleep(0, result=None)
+
+        async def __aenter__(self) -> "PopupExpectation":
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+    class Locator:
+        first = None
+
+        async def count(self) -> int:
+            return 1
+
+        async def click(self, **_kwargs: object) -> None:
+            page.url = "https://www.xiaohongshu.com/search_result/0123456789abcdef"
+
+    class SearchPage:
+        url = "https://www.xiaohongshu.com/search_result?keyword=配达人"
+        selector = ""
+
+        def locator(self, selector: str) -> Locator:
+            self.selector = selector
+            locator = Locator()
+            locator.first = locator
+            return locator
+
+        def expect_popup(self, **_kwargs: object) -> PopupExpectation:
+            return PopupExpectation()
+
+        async def wait_for_timeout(self, _milliseconds: int) -> None:
+            return None
+
+    page = SearchPage()
+    item = _item(content_id="0123456789abcdef")
+    target, restore_url, error = asyncio.run(
+        XiaohongshuCollector()._open_detail_by_click(page, item)  # type: ignore[arg-type]
+    )
+    assert target is page
+    assert restore_url == "https://www.xiaohongshu.com/search_result?keyword=配达人"
+    assert error == ""
+    assert ":visible" in page.selector
+
+
 def test_douyin_login_confirmation_overrides_cookie_health() -> None:
     class Locator:
         first = None

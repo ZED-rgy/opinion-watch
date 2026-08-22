@@ -624,7 +624,10 @@ class BaseCollector(ABC):
         item: CollectedContent,
     ) -> tuple[Page | None, str | None, str]:
         """Open a detail view through the live search card, never its tokenized href."""
-        locator = search_page.locator(f'a[href*="{item.content_id}"]').first
+        # 小红书卡片通常同时渲染一个隐藏的规范链接和一个真正可见的
+        # 带临时访问参数的卡片链接。必须点击可见节点，不能取 DOM 中的
+        # 第一个链接，否则 Playwright 会一直等待隐藏锚点变为可点击。
+        locator = search_page.locator(f'a[href*="{item.content_id}"]:visible').first
         try:
             if not await locator.count():
                 return None, None, "搜索页找不到对应卡片"
