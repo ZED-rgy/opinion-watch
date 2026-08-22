@@ -798,7 +798,7 @@ async def _run_scan_locked(
                                         message=quality_message,
                                         screenshot_path=diagnostic_path,
                                     )
-                                items = await collector.enrich_items(
+                                enriched_items = await collector.enrich_items(
                                     session.active_context,
                                     items,
                                     detail_limit=options.detail_limit,
@@ -807,7 +807,7 @@ async def _run_scan_locked(
                                     artifact_dir=settings.artifact_dir / platform.value / "media",
                                 )
                                 items, detail_filter_reasons, final_suspected_count = (
-                                    _recheck_detail_items(items, brand=brand)
+                                    _recheck_detail_items(enriched_items, brand=brand)
                                 )
                                 screening_stats["filter_reasons"].update(detail_filter_reasons)
                                 screening_stats["admitted"] = len(items)
@@ -944,7 +944,7 @@ async def _run_scan_locked(
                             else:
                                 detailed_count = sum(
                                     int(bool(item.raw_data.get("detail_collected")))
-                                    for item in items
+                                    for item in enriched_items
                                 )
                                 media_count = sum(
                                     len(item.raw_data.get("media", []))

@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -207,6 +208,31 @@ class ZeroDetailCollector:
         return items
 
 
+class CleanDetailCollector(ZeroDetailCollector):
+    async def enrich_items(
+        self,
+        context: object,
+        items: list[CollectedContent],
+        *,
+        detail_limit: int,
+        comments_limit: int,
+        detail_candidate_ids: set[str] | None = None,
+        artifact_dir: Path | None = None,
+    ) -> list[CollectedContent]:
+        return [
+            replace(
+                item,
+                raw_data={
+                    **item.raw_data,
+                    "detail_collected": True,
+                    "description": "今天分享仓配行业常识。",
+                    "comments": ["学习了"],
+                },
+            )
+            for item in items
+        ]
+
+
 def test_brand_match_with_zero_details_is_partial_and_alerts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -248,6 +274,52 @@ def test_brand_match_with_zero_details_is_partial_and_alerts(
     assert any(alert["kind"] == "zero_detail_coverage" for alert in storage.list_alerts())
     assert run["attempts"][0]["scanned_count"] == 1
     assert run["attempts"][0]["detailed_count"] == 0
+
+
+def test_clean_detail_success_counts_before_filtered_from_admission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    storage = Storage(tmp_path / "scan.db")
+    storage.initialize()
+    storage.add_brand("配达人")
+    storage.add_keyword("配达人", "配达人")
+    account_id = storage.add_account(Platform.XIAOHONGSHU.value, "测试账号")
+    storage.update_account_status(account_id, "ready")
+    settings = Settings(
+        runtime_dir=tmp_path / "runtime",
+        database_path=tmp_path / "scan.db",
+        artifact_dir=tmp_path / "artifacts",
+    )
+    monkeypatch.setattr("opinion_watch.runner.BrowserSession", ZeroDetailBrowserSession)
+    monkeypatch.setattr(
+        "opinion_watch.runner.collector_for", lambda platform: CleanDetailCollector()
+    )
+
+    exit_code = asyncio.run(
+        run_scan(
+            settings,
+            storage,
+            [Platform.XIAOHONGSHU],
+            options=ScanOptions(
+                limit=20,
+                detail_limit=2,
+                comments_limit=0,
+                retries=0,
+                brand_delay_seconds=0,
+            ),
+        )
+    )
+
+    run = storage.get_scan_run(1)
+    alerts = storage.list_alerts()
+    assert exit_code == 0
+    assert run is not None
+    assert run["status"] == "succeeded"
+    assert run["attempts"][0]["status"] == "succeeded"
+    assert run["attempts"][0]["detailed_count"] == 1
+    assert not any(alert["kind"] == "zero_detail_coverage" for alert in alerts)
+    with storage.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM content_items").fetchone()[0] == 0
 
 
 def test_filter_reasons_are_specific_and_not_placeholder(tmp_path: Path) -> None:
