@@ -97,6 +97,42 @@ def test_xiaohongshu_search_login_modal_with_session_cookie_is_verification() ->
     assert status is SessionStatus.VERIFICATION_REQUIRED
 
 
+def test_dismiss_login_modal_clicks_close_selector_before_escape() -> None:
+    clicked: list[str] = []
+    pressed: list[str] = []
+
+    class FakeLocator:
+        def __init__(self, selector: str, visible: bool) -> None:
+            self.selector = selector
+            self.visible = visible
+            self.first = self
+
+        async def count(self) -> int:
+            return 1 if self.visible else 0
+
+        async def is_visible(self) -> bool:
+            return self.visible
+
+        async def click(self, timeout: int) -> None:
+            clicked.append(self.selector)
+
+    class FakeKeyboard:
+        async def press(self, key: str) -> None:
+            pressed.append(key)
+
+    class FakePage:
+        keyboard = FakeKeyboard()
+
+        def locator(self, selector: str) -> FakeLocator:
+            return FakeLocator(selector, visible="login-container" in selector)
+
+    collector = XiaohongshuCollector()
+    dismissed = asyncio.run(collector._dismiss_login_modal(FakePage()))  # type: ignore[arg-type]
+    assert dismissed
+    assert clicked and "login-container" in clicked[0]
+    assert pressed == []  # 命中关闭按钮后不再按 Esc
+
+
 def test_canonical_url_removes_rotating_query_parameters() -> None:
     collector = XiaohongshuCollector()
 

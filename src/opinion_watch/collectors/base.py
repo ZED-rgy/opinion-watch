@@ -34,6 +34,9 @@ class BaseCollector(ABC):
     description_selectors: tuple[str, ...] = ()
     author_selectors: tuple[str, ...] = ()
     comment_selectors: tuple[str, ...] = ()
+    # 平台可能在登录态健康时仍然弹出登录引导弹窗；这些选择器用于尝试
+    # 关闭它而不是直接放弃本轮检索。
+    login_modal_close_selectors: tuple[str, ...] = ()
     _dom_evaluation_timeout_seconds = 6
     _search_scroll_rounds = 12
     _search_unchanged_rounds = 3
@@ -112,6 +115,12 @@ class BaseCollector(ABC):
 
         await page.wait_for_timeout(1_500)
         status = await self.session_status(page, context)
+        # 登录态健康但页面盖着登录引导弹窗时（session_status 已经用 cookie
+        # 区分了这种情况），先尝试关闭弹窗再继续，而不是把整个平台的本轮
+        # 巡检直接判死。
+        if status is SessionStatus.VERIFICATION_REQUIRED and await self._dismiss_login_modal(page):
+            await page.wait_for_timeout(800)
+            status = await self.session_status(page, context)
         if status is not SessionStatus.HEALTHY:
             raise CollectorRuntimeError(status, f"{self.platform.value} 会话状态：{status.value}")
 
@@ -166,6 +175,20 @@ class BaseCollector(ABC):
                     SessionStatus.ERROR,
                     f"{self.platform.value} 搜索页导航超时，未能进入目标搜索结果页。",
                 ) from exc
+
+    async def _dismiss_login_modal(self, page: Page) -> bool:
+        """尝试关闭登录引导弹窗；成功关闭任意一个即返回 True。"""
+        for selector in self.login_modal_close_selectors:
+            with suppress(Exception):
+                locator = page.locator(selector).first
+                if await locator.count() and await locator.is_visible():
+                    await locator.click(timeout=2_000)
+                    return True
+        # 通用回退：多数登录弹窗都响应 Esc。
+        with suppress(Exception):
+            await page.keyboard.press("Escape")
+            return True
+        return False
 
     async def enrich_items(
         self,
