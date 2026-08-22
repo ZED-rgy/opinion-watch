@@ -168,6 +168,7 @@ class OpinionsPage(QWidget):
         self.review_button = button("人工复核", self.review, role="secondary")
         self.edit_button = button("编辑选中", self.edit_assessment, role="secondary")
         self.delete_button = button("删除选中", self.delete_selected, role="danger")
+        self.ignore_button = button("永久忽略", self.ignore_selected, role="danger")
         self.select_all_button = button("全选", self.select_all, role="secondary")
         actions.addWidget(self.open_button)
         actions.addWidget(self.review_button)
@@ -175,6 +176,7 @@ class OpinionsPage(QWidget):
         actions.addStretch()
         actions.addWidget(self.select_all_button)
         actions.addWidget(self.delete_button)
+        actions.addWidget(self.ignore_button)
         layout.addLayout(actions)
         self.scope_label = QLabel()
         self.scope_label.setObjectName("muted")
@@ -724,10 +726,24 @@ class OpinionsPage(QWidget):
             "删除舆情记录",
             f"确定删除选中的 {len(ids)} 条舆情记录吗？原始采集内容仍会保留。",
         ):
-            self.storage.delete_assessments(ids)
+            self.storage.soft_delete_opinions(ids)
             self.refresh()
             self.changed.emit()
             show_toast(self, f"已删除 {len(ids)} 条舆情记录")
+
+    def ignore_selected(self) -> None:
+        ids = checked_ids(self.table, 1)
+        if not ids:
+            return
+        if confirm_destructive(
+            self,
+            "永久忽略舆情",
+            f"确定永久忽略选中的 {len(ids)} 条内容吗？后续重新巡检也不会再次入库或播报。",
+        ):
+            self.storage.set_permanent_ignore(ids)
+            self.refresh()
+            self.changed.emit()
+            show_toast(self, f"已永久忽略 {len(ids)} 条内容")
 
     def open_source(self) -> None:
         item = self.selected()

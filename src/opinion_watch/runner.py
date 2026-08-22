@@ -62,6 +62,29 @@ def _pop_search_diagnostic(collector: object, key: str) -> str | None:
     return pop(key) if callable(pop) else None
 
 
+def _collector_enrich_kwargs(
+    collector: object,
+    *,
+    detail_limit: int,
+    comments_limit: int,
+    detail_candidate_ids: set[str],
+    artifact_dir: object,
+    search_page: object,
+) -> dict[str, object]:
+    """Pass new detail-audit arguments without breaking offline collector fakes."""
+    kwargs: dict[str, object] = {
+        "detail_limit": detail_limit,
+        "comments_limit": comments_limit,
+        "detail_candidate_ids": detail_candidate_ids,
+    }
+    parameters = inspect.signature(collector.enrich_items).parameters  # type: ignore[attr-defined]
+    if "artifact_dir" in parameters:
+        kwargs["artifact_dir"] = artifact_dir
+    if "search_page" in parameters:
+        kwargs["search_page"] = search_page
+    return kwargs
+
+
 @dataclass(frozen=True, slots=True)
 class ScanOptions:
     mode: str = "quick"
@@ -679,6 +702,17 @@ async def _run_scan_locked(
                                     replace(item, brand_name=brand) for item in search_items
                                 ]
                                 raw_search_items = search_items
+                                ignored_ids = storage.ignored_content_ids(
+                                    platform.value, (item.content_id for item in search_items)
+                                )
+                                ignored_filter_reasons = {
+                                    content_id: "永久忽略" for content_id in ignored_ids
+                                }
+                                search_items = [
+                                    item
+                                    for item in search_items
+                                    if item.content_id not in ignored_ids
+                                ]
                                 quality = _collector_search_quality(collector, search_items)
                                 if quality["needs_diagnostic"] and quality["total"] > 0:
                                     diagnostic_path = diagnostic_path or next(
@@ -764,6 +798,7 @@ async def _run_scan_locked(
                                     budget=llm_budget,
                                     baseline_limit=2,
                                 )
+                                screening_stats["filter_reasons"].update(ignored_filter_reasons)
                                 detail_ids = _select_detail_candidates(
                                     items,
                                     detail_candidate_ids,
@@ -801,10 +836,16 @@ async def _run_scan_locked(
                                 enriched_items = await collector.enrich_items(
                                     session.active_context,
                                     items,
-                                    detail_limit=options.detail_limit,
-                                    comments_limit=options.comments_limit,
-                                    detail_candidate_ids=detail_ids,
-                                    artifact_dir=settings.artifact_dir / platform.value / "media",
+                                    **_collector_enrich_kwargs(
+                                        collector,
+                                        detail_limit=options.detail_limit,
+                                        comments_limit=options.comments_limit,
+                                        detail_candidate_ids=detail_ids,
+                                        artifact_dir=settings.artifact_dir
+                                        / platform.value
+                                        / "media",
+                                        search_page=page,
+                                    ),
                                 )
                                 items, detail_filter_reasons, final_suspected_count = (
                                     _recheck_detail_items(enriched_items, brand=brand)
@@ -815,10 +856,43 @@ async def _run_scan_locked(
                                     items
                                 )
                                 screening_stats["suspected"] = final_suspected_count
+                                detail_audits: dict[str, dict[str, Any]] = {
+                                    item.content_id: {
+                                        "detail_status": "not_selected",
+                                        "detail_checked_at": None,
+                                        "detail_error": "",
+                                        "triage_decision": (
+                                            "永久忽略"
+                                            if item.content_id in ignored_ids
+                                            else "直接过滤"
+                                        ),
+                                    }
+                                    for item in raw_search_items
+                                }
+                                for item in enriched_items:
+                                    screening = item.raw_data.get("screening", {})
+                                    detail_audits[item.content_id] = {
+                                        "detail_status": (
+                                            item.raw_data.get("detail_status")
+                                            or (
+                                                "succeeded"
+                                                if item.raw_data.get("detail_collected")
+                                                else "not_selected"
+                                            )
+                                        ),
+                                        "detail_checked_at": item.raw_data.get("detail_checked_at"),
+                                        "detail_error": item.raw_data.get("detail_error", ""),
+                                        "triage_decision": (
+                                            screening.get("decision", "")
+                                            if isinstance(screening, dict)
+                                            else ""
+                                        ),
+                                    }
                                 storage.mark_scan_candidates(
                                     attempt_id=attempt_id,
                                     admitted_content_ids=(item.content_id for item in items),
                                     filter_reasons=screening_stats["filter_reasons"],
+                                    detail_audits=detail_audits,
                                 )
                                 stats = storage.upsert_contents(items)
                                 if screening_stats["model_errors"]:
@@ -864,7 +938,7 @@ async def _run_scan_locked(
                                             "platform": platform.value,
                                             "brand": brand,
                                             "keyword": keyword,
-                                            "url": page.url,
+                                            "url": BaseCollector.canonical_url(page.url),
                                             "status": (
                                                 "retrying" if retrying else exc.status.value
                                             ),
@@ -943,7 +1017,18 @@ async def _run_scan_locked(
                                 break
                             else:
                                 detailed_count = sum(
-                                    int(bool(item.raw_data.get("detail_collected")))
+                                    int(
+                                        item.raw_data.get("detail_status") == "succeeded"
+                                        or (
+                                            not item.raw_data.get("detail_status")
+                                            and bool(item.raw_data.get("detail_collected"))
+                                        )
+                                    )
+                                    for item in enriched_items
+                                )
+                                detail_attempted_count = len(detail_ids)
+                                detail_unavailable_count = sum(
+                                    int(item.raw_data.get("detail_status") == "unavailable")
                                     for item in enriched_items
                                 )
                                 media_count = sum(
@@ -1020,9 +1105,15 @@ async def _run_scan_locked(
                                 totals.suspected += suspected_count
                                 totals.detailed += detailed_count
                                 totals.media_items += media_count
+                                totals.brand_matched += int(screening_stats.get("brand_matched", 0))
+                                totals.detail_attempted += detail_attempted_count
+                                totals.detail_unavailable += detail_unavailable_count
                                 totals.collected += len(items)
                                 totals.inserted += stats.inserted
                                 totals.updated += stats.updated
+                                totals.content_inserted += stats.content_inserted
+                                totals.new_opinion += stats.new_opinion
+                                totals.rediscovered += stats.rediscovered
                                 attempt_status = (
                                     "partial"
                                     if quality_partial or detail_coverage_partial
@@ -1050,6 +1141,12 @@ async def _run_scan_locked(
                                     suspected=suspected_count,
                                     detailed=detailed_count,
                                     media_items=media_count,
+                                    brand_matched=int(screening_stats.get("brand_matched", 0)),
+                                    detail_attempted=detail_attempted_count,
+                                    detail_unavailable=detail_unavailable_count,
+                                    content_inserted=stats.content_inserted,
+                                    new_opinion=stats.new_opinion,
+                                    rediscovered=stats.rediscovered,
                                     error_status=(
                                         "data_quality_warning"
                                         if quality_partial
@@ -1214,6 +1311,12 @@ async def _run_scan_locked(
         suspected=totals.suspected,
         detailed=totals.detailed,
         media_items=totals.media_items,
+        brand_matched=totals.brand_matched,
+        detail_attempted=totals.detail_attempted,
+        detail_unavailable=totals.detail_unavailable,
+        content_inserted=totals.content_inserted,
+        new_opinion=totals.new_opinion,
+        rediscovered=totals.rediscovered,
         note=("；".join(coverage_shortfalls) if coverage_shortfalls else ""),
         classification_summary=classification_summary,
         model_summary=model_summary,

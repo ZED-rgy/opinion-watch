@@ -17,7 +17,13 @@ from playwright.async_api import BrowserContext, Page
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
-from opinion_watch.models import AnchorCandidate, CollectedContent, Platform, SessionStatus
+from opinion_watch.models import (
+    AnchorCandidate,
+    CollectedContent,
+    DetailStatus,
+    Platform,
+    SessionStatus,
+)
 
 
 class CollectorRuntimeError(RuntimeError):
@@ -32,6 +38,8 @@ class BaseCollector(ABC):
     authenticated_cookie_names: frozenset[str]
     authenticated_ui_selectors: tuple[str, ...] = ()
     login_required_phrases: tuple[str, ...] = ()
+    login_confirmation_phrases: tuple[str, ...] = ()
+    login_wall_selectors: tuple[str, ...] = ()
     title_selectors: tuple[str, ...] = ()
     description_selectors: tuple[str, ...] = ()
     author_selectors: tuple[str, ...] = ()
@@ -53,6 +61,15 @@ class BaseCollector(ABC):
         "验证码",
     )
     rate_limit_phrases = ("访问频繁", "操作频繁", "请求过于频繁", "请稍后再试")
+    unavailable_phrases = (
+        "当前笔记无法浏览",
+        "你访问的页面不见了",
+        "页面不见了",
+        "笔记已删除",
+        "笔记不存在",
+        "内容不存在",
+        "暂时无法浏览",
+    )
 
     def __init__(self) -> None:
         self._search_diagnostics: dict[str, str] = {}
@@ -85,10 +102,17 @@ class BaseCollector(ABC):
         with suppress(Exception):
             body_text = (await page.locator("body").inner_text(timeout=3_000))[:20_000]
 
-        if any(phrase in body_text for phrase in self.rate_limit_phrases):
-            return SessionStatus.RATE_LIMITED
+        if any(phrase in body_text for phrase in self.login_confirmation_phrases):
+            return SessionStatus.VERIFICATION_REQUIRED
+        for selector in self.login_wall_selectors:
+            with suppress(Exception):
+                locator = page.locator(selector).first
+                if await locator.count() and await locator.is_visible():
+                    return SessionStatus.VERIFICATION_REQUIRED
         if any(phrase in body_text for phrase in self.verification_phrases):
             return SessionStatus.VERIFICATION_REQUIRED
+        if any(phrase in body_text for phrase in self.rate_limit_phrases):
+            return SessionStatus.RATE_LIMITED
         if any(phrase in body_text for phrase in self.login_required_phrases):
             # A platform can show a login modal on a search route while the
             # account cookie is still present. Report this as a route-level
@@ -241,7 +265,9 @@ class BaseCollector(ABC):
             "captured_at": datetime.now(UTC).isoformat(),
             "platform": self.platform.value,
             "keyword": keyword,
-            "url": page.url,
+            # Search links can contain short-lived xsec_token parameters.  A
+            # diagnostic must remain useful without becoming a credential log.
+            "url": self.canonical_url(page.url),
             "selector": self.content_link_selector,
             "quality": quality,
         }
@@ -299,12 +325,22 @@ class BaseCollector(ABC):
         comments_limit: int = 20,
         detail_candidate_ids: set[str] | None = None,
         artifact_dir: Path | None = None,
+        search_page: Page | None = None,
     ) -> list[CollectedContent]:
         """只打开疑似内容的详情页，补充正文、评论和媒体证据。"""
         if detail_limit <= 0 or not items:
             return items
 
-        enriched = list(items)
+        enriched = [
+            replace(
+                item,
+                raw_data={
+                    **item.raw_data,
+                    "detail_status": DetailStatus.NOT_SELECTED.value,
+                },
+            )
+            for item in items
+        ]
         detail_page = await context.new_page()
         try:
             candidate_indexes = [
@@ -314,17 +350,36 @@ class BaseCollector(ABC):
             ][:detail_limit]
             for index in candidate_indexes:
                 item = items[index]
+                attempting = {
+                    **item.raw_data,
+                    "detail_status": DetailStatus.ATTEMPTING.value,
+                    "detail_checked_at": datetime.now(UTC).isoformat(),
+                    "detail_error": "",
+                }
+                enriched[index] = replace(item, raw_data=attempting)
+                navigation_url = await self._detail_navigation_url(search_page, item)
                 try:
                     await detail_page.goto(
-                        item.url,
+                        navigation_url,
                         wait_until="domcontentloaded",
                         timeout=60_000,
                     )
-                except PlaywrightTimeoutError:
+                except PlaywrightTimeoutError as exc:
                     # 超时后详情页可能仍停留在上一条内容上；此时抽取会把别人的
                     # 正文、评论和媒体写进当前条目。跳过详情补充，保留浅层结果。
                     if self.canonical_url(detail_page.url) != self.canonical_url(item.url):
+                        enriched[index] = replace(
+                            item,
+                            raw_data={
+                                **attempting,
+                                "detail_status": DetailStatus.FAILED.value,
+                                "detail_checked_at": attempting["detail_checked_at"],
+                                "detail_error": "详情页导航超时或未进入目标内容页",
+                            },
+                        )
                         continue
+                    # A timeout can still leave a usable detail document.
+                    _ = exc
                 await detail_page.wait_for_timeout(self._human_delay_ms(1_500))
                 status = await self.session_status(detail_page, context)
                 if (
@@ -336,17 +391,60 @@ class BaseCollector(ABC):
                 if status is SessionStatus.VERIFICATION_REQUIRED:
                     # cookie 有效但详情页仍被登录引导墙盖住：跳过这一条的
                     # 详情补充，保留浅层结果，不让整个关键词的采集作废。
+                    enriched[index] = replace(
+                        item,
+                        raw_data={
+                            **attempting,
+                            "detail_status": DetailStatus.FAILED.value,
+                            "detail_checked_at": attempting["detail_checked_at"],
+                            "detail_error": "详情页被登录确认或验证拦截",
+                        },
+                    )
                     continue
                 if status is not SessionStatus.HEALTHY:
-                    raise CollectorRuntimeError(
-                        status,
-                        f"{self.platform.value} 详情页会话状态：{status.value}",
+                    enriched[index] = replace(
+                        item,
+                        raw_data={
+                            **attempting,
+                            "detail_status": DetailStatus.FAILED.value,
+                            "detail_checked_at": attempting["detail_checked_at"],
+                            "detail_error": f"详情页会话状态：{status.value}",
+                        },
                     )
+                    continue
 
                 page_title = await detail_page.title()
                 title = await self._first_text(detail_page, self.title_selectors)
                 description = await self._first_text(detail_page, self.description_selectors)
                 author_name = await self._first_text(detail_page, self.author_selectors)
+                body_text = ""
+                with suppress(Exception):
+                    body_text = (await detail_page.locator("body").inner_text(timeout=2_000))[
+                        :20_000
+                    ]
+                unavailable_reason = self._unavailable_reason(page_title, body_text)
+                valid_title = self._valid_detail_text(title, page_title)
+                valid_author = self._valid_detail_author(author_name)
+                if unavailable_reason:
+                    enriched[index] = replace(
+                        item,
+                        raw_data={
+                            **attempting,
+                            "card_title": item.raw_data.get("card_title", item.title),
+                            "card_author_name": item.raw_data.get(
+                                "card_author_name", item.author_name
+                            ),
+                            "detail_title": title[:500],
+                            "display_title": item.title[:500],
+                            "detail_status": DetailStatus.UNAVAILABLE.value,
+                            "detail_checked_at": attempting["detail_checked_at"],
+                            "detail_error": unavailable_reason,
+                            "unavailable_reason": unavailable_reason,
+                            "detail_collected": False,
+                            "page_title": page_title[:500],
+                        },
+                    )
+                    continue
                 comments = await self._all_text(
                     detail_page,
                     self.comment_selectors,
@@ -361,14 +459,21 @@ class BaseCollector(ABC):
                     **item.raw_data,
                     "detail_collected": True,
                     "page_title": page_title,
+                    "card_title": item.raw_data.get("card_title", item.title),
+                    "card_author_name": item.raw_data.get("card_author_name", item.author_name),
+                    "detail_title": title[:500],
+                    "display_title": (title if valid_title else item.title or page_title)[:500],
+                    "detail_status": DetailStatus.SUCCEEDED.value,
+                    "detail_checked_at": attempting["detail_checked_at"],
+                    "detail_error": "",
                     "description": description,
                     "comments": comments,
                     "media": media,
                 }
                 enriched[index] = replace(
                     item,
-                    title=(title or item.title or page_title)[:500],
-                    author_name=(author_name or item.author_name)[:200],
+                    title=(title if valid_title else item.title or page_title)[:500],
+                    author_name=(author_name if valid_author else item.author_name)[:200],
                     raw_data=raw_data,
                 )
         finally:
@@ -463,6 +568,40 @@ class BaseCollector(ABC):
             evidence.append(entry)
         return evidence
 
+    async def _detail_navigation_url(
+        self,
+        search_page: Page | None,
+        item: CollectedContent,
+    ) -> str:
+        """Resolve a one-round detail URL without persisting its token.
+
+        XHS search cards can expose a tokenized href only after hydration.  If
+        the initial anchor did not have one, read the live card href from the
+        original search page before falling back to the canonical URL.  This
+        preserves the search-page route context and avoids inventing a URL.
+        """
+        navigation_url = item.navigation_url or ""
+        if navigation_url and urlsplit(navigation_url).query:
+            return navigation_url
+        if search_page is not None:
+            with suppress(Exception):
+                locator = search_page.locator(f'a[href*="{item.content_id}"]').first
+                before_url = search_page.url
+                await locator.click(timeout=3_000)
+                await search_page.wait_for_timeout(500)
+                clicked_url = search_page.url
+                if clicked_url != before_url and self.accepts_url(clicked_url):
+                    with suppress(Exception):
+                        await search_page.go_back(wait_until="domcontentloaded", timeout=10_000)
+                    return clicked_url
+                href = await locator.get_attribute("href")
+                if href:
+                    if not href.startswith("http"):
+                        href = f"{self.home_url.rstrip('/')}/{href.lstrip('/')}"
+                    if self.accepts_url(href):
+                        return href
+        return navigation_url or item.url
+
     @staticmethod
     def _is_relevant_media(node: dict[str, Any], source_url: str) -> bool:
         """过滤头像、图标、徽章、占位图和过小的静态资源。"""
@@ -507,19 +646,24 @@ class BaseCollector(ABC):
                 continue
             content_id = self.parse_content_id(anchor.href) or self._fallback_id(anchor.href)
             title = " ".join(anchor.text.split())[:500]
+            canonical = self.canonical_url(anchor.href)
             items.append(
                 CollectedContent(
                     platform=self.platform,
                     content_id=content_id,
-                    url=anchor.href,
+                    url=canonical,
                     title=title,
                     source_keyword=keyword,
                     raw_data={
                         "source": "browser_dom",
                         "media_kind": anchor.media_kind,
                         "search_card_text": anchor.raw_text or anchor.text,
+                        "card_title": title,
+                        "card_author_name": anchor.author_name,
+                        "detail_status": DetailStatus.NOT_SELECTED.value,
                     },
                     author_name=anchor.author_name,
+                    navigation_url=anchor.href,
                 )
             )
         return items
@@ -607,6 +751,26 @@ class BaseCollector(ABC):
     def canonical_url(url: str) -> str:
         parts = urlsplit(url)
         return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path, "", ""))
+
+    @classmethod
+    def _unavailable_reason(cls, *values: str) -> str:
+        text = " ".join(value for value in values if value).strip()
+        for phrase in cls.unavailable_phrases:
+            if phrase in text:
+                return phrase
+        return ""
+
+    @classmethod
+    def _valid_detail_text(cls, value: str, page_title: str = "") -> bool:
+        clean = " ".join(value.split())
+        if not clean or cls._unavailable_reason(clean, page_title):
+            return False
+        return clean not in {"抖音", "小红书", "无标题", "页面"}
+
+    @staticmethod
+    def _valid_detail_author(value: str) -> bool:
+        clean = " ".join(value.split()).lstrip("@")
+        return bool(clean) and clean not in {"我的", "关注", "登录", "收藏", "分享", "用户"}
 
     def _fallback_id(self, url: str) -> str:
         canonical = self.canonical_url(url).encode()

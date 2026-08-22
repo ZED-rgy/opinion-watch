@@ -20,6 +20,14 @@ class SessionStatus(StrEnum):
     ERROR = "error"
 
 
+class DetailStatus(StrEnum):
+    NOT_SELECTED = "not_selected"
+    ATTEMPTING = "attempting"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    UNAVAILABLE = "unavailable"
+
+
 class ScanRunStatus(StrEnum):
     RUNNING = "running"
     INTERRUPTED = "interrupted"
@@ -69,6 +77,9 @@ class CollectedContent:
     metrics: dict[str, int | float | str] = field(default_factory=dict)
     raw_data: dict[str, Any] = field(default_factory=dict)
     discovered_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
+    # Full result links may contain short-lived access parameters.  Keep this
+    # navigation-only value out of persistence, logs, and model payloads.
+    navigation_url: str | None = field(default=None, repr=False, compare=False)
 
     @property
     def fingerprint(self) -> str:
@@ -80,6 +91,10 @@ class CollectedContent:
 class UpsertStats:
     inserted: int = 0
     updated: int = 0
+    content_inserted: int = 0
+    new_opinion: int = 0
+    rediscovered: int = 0
+    ignored: int = 0
 
     @property
     def total(self) -> int:
@@ -98,3 +113,9 @@ class ScanTotals:
     suspected: int = 0
     detailed: int = 0
     media_items: int = 0
+    brand_matched: int = 0
+    detail_attempted: int = 0
+    detail_unavailable: int = 0
+    content_inserted: int = 0
+    new_opinion: int = 0
+    rediscovered: int = 0

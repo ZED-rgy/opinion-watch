@@ -22,6 +22,19 @@ class DouyinCollector(BaseCollector):
         'header [class*="avatar" i]',
         'header img[alt*="头像"]',
     )
+    login_confirmation_phrases = (
+        "登录后即可搜索更多精彩视频",
+        "登录后查看更多精彩视频",
+        "登录确认中",
+        "请在抖音APP确认登录",
+        "请在抖音 app 确认登录",
+    )
+    login_wall_selectors = (
+        '[class*="login-modal" i]',
+        '[class*="login-panel" i]',
+        '[class*="device-confirm" i]',
+        '[class*="verify" i][role="dialog"]',
+    )
     _content_pattern = re.compile(r"/(?:video|note)/(\d+)")
     content_link_selector = 'a[href*="/video/"], a[href*="/note/"]'
     title_selectors = (

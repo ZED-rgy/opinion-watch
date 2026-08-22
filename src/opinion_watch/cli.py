@@ -10,6 +10,7 @@ from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
@@ -25,6 +26,11 @@ from opinion_watch.runner import ScanOptions, _screen_items_for_admission, run_s
 from opinion_watch.scheduling import next_scheduled_datetime
 from opinion_watch.storage import Storage
 from opinion_watch.wecom import WeComClient
+
+
+def _safe_url(value: str) -> str:
+    parts = urlsplit(value)
+    return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path, "", ""))
 
 
 def _configure_utf8_output() -> None:
@@ -382,7 +388,7 @@ async def _search_one(
             payload = {
                 "platform": platform.value,
                 "keyword": keyword,
-                "url": page.url,
+                "url": _safe_url(page.url),
                 "status": exc.status.value,
                 "message": str(exc),
                 "screenshot": str(screenshot) if screenshot else None,
@@ -402,7 +408,7 @@ async def _search_one(
                 {
                     "platform": platform.value,
                     "keyword": keyword,
-                    "url": page.url,
+                    "url": _safe_url(page.url),
                     "scanned": screening_stats["scanned"],
                     "collected": len(items),
                     "filtered": screening_stats["filtered"],

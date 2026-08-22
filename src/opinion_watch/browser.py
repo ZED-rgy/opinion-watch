@@ -5,12 +5,18 @@ import json
 import re
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 from playwright.async_api import BrowserContext, Error, Page, Playwright, async_playwright
 
 
 class BrowserProfileLocked(RuntimeError):
     """浏览器档案已经被其他 Chrome/Playwright 进程占用。"""
+
+
+def _safe_url(value: str) -> str:
+    parts = urlsplit(value)
+    return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path, "", ""))
 
 
 class BrowserSession:
@@ -91,7 +97,7 @@ class BrowserSession:
         if metadata is not None:
             details = {
                 "captured_at": datetime.now(UTC).isoformat(),
-                "url": page.url,
+                "url": _safe_url(page.url),
                 "label": label,
                 **metadata,
             }

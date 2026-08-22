@@ -24,7 +24,9 @@ def build_daily_report(storage: Storage, report_date: str | None = None) -> str:
             """
             SELECT status, scanned_count, filtered_count, collected_count,
                    inserted_count, updated_count, suspected_count,
-                   detailed_count, media_count
+                   detailed_count, media_count, brand_matched_count,
+                   detail_attempted_count, detail_unavailable_count,
+                   content_inserted_count, new_opinion_count, rediscovered_count
             FROM scan_runs
             WHERE started_at >= ? AND started_at < ?
             ORDER BY started_at
@@ -38,7 +40,8 @@ def build_daily_report(storage: Storage, report_date: str | None = None) -> str:
                 SUM(CASE WHEN discovered_at >= ? AND discovered_at < ? THEN 1 ELSE 0 END)
                     AS inserted
             FROM content_items
-            WHERE last_seen_at >= ? AND last_seen_at < ?
+            WHERE deleted_at IS NULL AND ignored_at IS NULL
+              AND last_seen_at >= ? AND last_seen_at < ?
             """,
             (start_utc, end_utc, start_utc, end_utc),
         ).fetchone()
@@ -47,7 +50,8 @@ def build_daily_report(storage: Storage, report_date: str | None = None) -> str:
             SELECT oa.severity, COUNT(*) AS count
             FROM opinion_assessments oa
             JOIN content_items ci ON ci.id = oa.content_item_id
-            WHERE ci.last_seen_at >= ? AND ci.last_seen_at < ?
+            WHERE ci.deleted_at IS NULL AND ci.ignored_at IS NULL
+              AND ci.last_seen_at >= ? AND ci.last_seen_at < ?
             GROUP BY oa.severity
             ORDER BY CASE oa.severity
                 WHEN 'P0' THEN 0 WHEN 'P1' THEN 1 WHEN 'P2' THEN 2 ELSE 3 END
@@ -59,7 +63,8 @@ def build_daily_report(storage: Storage, report_date: str | None = None) -> str:
             SELECT COUNT(*) AS count
             FROM opinion_assessments oa
             JOIN content_items ci ON ci.id = oa.content_item_id
-            WHERE ci.last_seen_at >= ? AND ci.last_seen_at < ?
+            WHERE ci.deleted_at IS NULL AND ci.ignored_at IS NULL
+              AND ci.last_seen_at >= ? AND ci.last_seen_at < ?
               AND oa.review_status = 'pending'
             """,
             (start_utc, end_utc),
@@ -69,7 +74,8 @@ def build_daily_report(storage: Storage, report_date: str | None = None) -> str:
             SELECT COUNT(DISTINCT ecm.cluster_id) AS count
             FROM event_cluster_members ecm
             JOIN content_items ci ON ci.id = ecm.content_item_id
-            WHERE ci.last_seen_at >= ? AND ci.last_seen_at < ?
+            WHERE ci.deleted_at IS NULL AND ci.ignored_at IS NULL
+              AND ci.last_seen_at >= ? AND ci.last_seen_at < ?
             """,
             (start_utc, end_utc),
         ).fetchone()["count"]
@@ -102,6 +108,8 @@ def build_daily_report(storage: Storage, report_date: str | None = None) -> str:
 
     status_counts: dict[str, int] = {}
     scanned = filtered = collected = inserted = updated = 0
+    brand_matched = detail_attempted = detail_unavailable = 0
+    content_inserted = new_opinion = rediscovered = 0
     suspected = detailed = media_items = 0
     for row in run_rows:
         status = str(row["status"])
@@ -114,6 +122,12 @@ def build_daily_report(storage: Storage, report_date: str | None = None) -> str:
         suspected += int(row["suspected_count"] or 0)
         detailed += int(row["detailed_count"] or 0)
         media_items += int(row["media_count"] or 0)
+        brand_matched += int(row["brand_matched_count"] or 0)
+        detail_attempted += int(row["detail_attempted_count"] or 0)
+        detail_unavailable += int(row["detail_unavailable_count"] or 0)
+        content_inserted += int(row["content_inserted_count"] or 0)
+        new_opinion += int(row["new_opinion_count"] or 0)
+        rediscovered += int(row["rediscovered_count"] or 0)
 
     severity_counts = {str(row["severity"]): int(row["count"]) for row in severity_rows}
     lines = [
@@ -121,9 +135,12 @@ def build_daily_report(storage: Storage, report_date: str | None = None) -> str:
         "",
         f"巡检轮次：{len(run_rows)} 次（成功 {status_counts.get('succeeded', 0)}，"
         f"部分完成 {status_counts.get('partial', 0)}，失败 {status_counts.get('failed', 0)}）",
-        f"检索结果：{scanned} 条，入库 {collected} 条，过滤普通内容 {filtered} 条 "
-        f"（新增 {inserted}，更新 {updated}）",
-        f"疑似舆情：{suspected} 条，详情调查：{detailed} 条，媒体证据：{media_items} 条",
+        f"卡片扫描：{scanned} 条，品牌命中：{brand_matched} 条，过滤普通内容 {filtered} 条",
+        f"详情核查：尝试 {detail_attempted} 条，成功 {detailed} 条，"
+        f"不可访问 {detail_unavailable} 条",
+        f"原始内容新增：{content_inserted or inserted}，新增舆情：{new_opinion}，"
+        f"重新发现：{rediscovered}，更新：{updated}",
+        f"疑似舆情：{suspected} 条，媒体证据：{media_items} 条",
         f"聚合事件：{int(cluster_count or 0)} 个（仅统计疑似/高风险内容）",
         f"当日去重内容：{int(content_stats['total'] or 0)} 条，"
         f"待复核：{int(pending_reviews)} 条，运行告警：{int(alert_count)} 条",

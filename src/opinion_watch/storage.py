@@ -12,7 +12,7 @@ from types import TracebackType
 from typing import Any, Literal
 from urllib.parse import urlparse
 
-from opinion_watch.models import CollectedContent, Platform, UpsertStats
+from opinion_watch.models import CollectedContent, DetailStatus, Platform, UpsertStats
 
 
 class _ManagedConnection(sqlite3.Connection):
@@ -470,10 +470,39 @@ class Storage:
     @staticmethod
     def _run_migrations(connection: sqlite3.Connection) -> None:
         """Apply data migrations once; normal startup must be data-preserving."""
+        versions = {
+            int(row[0])
+            for row in connection.execute("SELECT version FROM schema_migrations").fetchall()
+        }
+        # A crash can leave the intermediate table behind after version 2 was
+        # removed but before its migration record was committed.  Do not let
+        # a later version mask that gap; repair v2 first and let the next
+        # startup apply v3 normally.
+        if (
+            3 in versions
+            and 2 not in versions
+            and connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'content_matches_v2'"
+            ).fetchone()
+        ):
+            Storage._migrate_content_match_keys(connection)
+            connection.execute("DELETE FROM schema_migrations WHERE version >= 3")
+            connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (2, ?)",
+                (datetime.now(UTC).isoformat(),),
+            )
+            return
         current = connection.execute(
             "SELECT COALESCE(MAX(version), 0) FROM schema_migrations"
         ).fetchone()[0]
-        if int(current) >= 2:
+        if int(current) >= 4:
+            return
+        if int(current) == 3:
+            Storage._migrate_v4(connection)
+            connection.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (4, ?)",
+                (datetime.now(UTC).isoformat(),),
+            )
             return
         if int(current) == 1:
             now = datetime.now(UTC).isoformat()
@@ -481,6 +510,18 @@ class Storage:
             connection.execute(
                 "INSERT INTO schema_migrations(version, applied_at) VALUES (2, ?)",
                 (now,),
+            )
+            current = 2
+        if int(current) >= 2:
+            Storage._migrate_v3(connection)
+            connection.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (3, ?)",
+                (datetime.now(UTC).isoformat(),),
+            )
+            Storage._migrate_v4(connection)
+            connection.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (4, ?)",
+                (datetime.now(UTC).isoformat(),),
             )
             return
         now = datetime.now(UTC).isoformat()
@@ -628,6 +669,184 @@ class Storage:
             "INSERT INTO schema_migrations(version, applied_at) VALUES (2, ?)",
             (now,),
         )
+        Storage._migrate_v3(connection)
+        connection.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (3, ?)",
+            (datetime.now(UTC).isoformat(),),
+        )
+        Storage._migrate_v4(connection)
+        connection.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (4, ?)",
+            (datetime.now(UTC).isoformat(),),
+        )
+
+    @staticmethod
+    def _add_column(connection: sqlite3.Connection, table: str, definition: str) -> None:
+        try:
+            connection.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc).lower():
+                raise
+
+    @staticmethod
+    def _migrate_v3(connection: sqlite3.Connection) -> None:
+        """Add auditable detail state and reversible opinion lifecycle fields."""
+        for definition in (
+            "deleted_at TEXT",
+            "deleted_by TEXT NOT NULL DEFAULT ''",
+            "delete_reason TEXT NOT NULL DEFAULT ''",
+            "rediscovered_count INTEGER NOT NULL DEFAULT 0",
+            "last_rediscovered_at TEXT",
+            "ignored_at TEXT",
+            "ignored_by TEXT NOT NULL DEFAULT ''",
+            "ignore_reason TEXT NOT NULL DEFAULT ''",
+        ):
+            Storage._add_column(connection, "content_items", definition)
+        for definition in (
+            "detail_status TEXT NOT NULL DEFAULT 'not_selected'",
+            "detail_checked_at TEXT",
+            "detail_error TEXT NOT NULL DEFAULT ''",
+            "triage_decision TEXT NOT NULL DEFAULT ''",
+        ):
+            Storage._add_column(connection, "scan_candidates", definition)
+        for table in ("scan_runs", "scan_attempts"):
+            for definition in (
+                "brand_matched_count INTEGER NOT NULL DEFAULT 0",
+                "detail_attempted_count INTEGER NOT NULL DEFAULT 0",
+                "detail_unavailable_count INTEGER NOT NULL DEFAULT 0",
+                "content_inserted_count INTEGER NOT NULL DEFAULT 0",
+                "new_opinion_count INTEGER NOT NULL DEFAULT 0",
+                "rediscovered_count INTEGER NOT NULL DEFAULT 0",
+            ):
+                Storage._add_column(connection, table, definition)
+
+        # Remove any temporary query parameters that may have been persisted by
+        # an older build.  The in-memory navigation URL remains available to
+        # the collector, while canonical URLs are the only durable URLs.
+        for table in ("content_items", "scan_candidates"):
+            rows = connection.execute(f"SELECT id, url FROM {table}").fetchall()
+            for row in rows:
+                value = str(row["url"] or "")
+                safe = urlparse(value)._replace(query="", fragment="").geturl()
+                if safe != value:
+                    connection.execute(
+                        f"UPDATE {table} SET url = ? WHERE id = ?",
+                        (safe, row["id"]),
+                    )
+
+        # Repair records whose detail error page replaced the original card
+        # metadata.  Prefer the latest non-empty scan candidate title/author.
+        bad_title = (
+            "ci.title = '' OR ci.title LIKE '%当前笔记无法浏览%' "
+            "OR ci.title LIKE '%当前笔记暂时无法浏览%' OR ci.title LIKE '%页面不见了%' "
+            "OR ci.title LIKE '%内容不存在%' OR ci.title LIKE '%笔记已删除%'"
+        )
+        rows = connection.execute(
+            f"""
+            SELECT ci.id, sc.title, sc.author_name
+            FROM content_items ci
+            JOIN scan_candidates sc
+              ON sc.platform = ci.platform
+             AND sc.platform_content_id = ci.platform_content_id
+            WHERE ({bad_title}) AND TRIM(sc.title) <> ''
+            ORDER BY sc.created_at DESC, sc.id DESC
+            """
+        ).fetchall()
+        repaired: set[int] = set()
+        for row in rows:
+            item_id = int(row["id"])
+            if item_id in repaired:
+                continue
+            connection.execute(
+                """
+                UPDATE content_items
+                SET title = ?, author_name = CASE WHEN TRIM(?) <> '' THEN ? ELSE author_name END
+                WHERE id = ?
+                """,
+                (
+                    str(row["title"]),
+                    str(row["author_name"] or ""),
+                    str(row["author_name"] or ""),
+                    item_id,
+                ),
+            )
+            repaired.add(item_id)
+
+    @staticmethod
+    def _migrate_v4(connection: sqlite3.Connection) -> None:
+        """Restore card metadata overwritten by an unavailable detail page."""
+        unavailable_phrases = (
+            "当前笔记无法浏览",
+            "当前笔记暂时无法浏览",
+            "你访问的页面不见了",
+            "页面不见了",
+            "笔记已删除",
+            "笔记不存在",
+            "内容不存在",
+            "暂时无法浏览",
+        )
+
+        def invalid_title(value: object) -> bool:
+            text = str(value or "").strip()
+            return not text or any(phrase in text for phrase in unavailable_phrases)
+
+        def parse_raw(value: object) -> dict[str, Any]:
+            try:
+                parsed = json.loads(str(value or "{}"))
+            except (TypeError, ValueError):
+                return {}
+            return parsed if isinstance(parsed, dict) else {}
+
+        content_rows = connection.execute(
+            """
+            SELECT id, platform, platform_content_id, title, author_name, raw_json
+            FROM content_items
+            """
+        ).fetchall()
+        for content in content_rows:
+            if not invalid_title(content["title"]):
+                continue
+            candidates = connection.execute(
+                """
+                SELECT title, author_name, raw_json
+                FROM scan_candidates
+                WHERE platform = ? AND platform_content_id = ?
+                ORDER BY created_at DESC, id DESC
+                """,
+                (content["platform"], content["platform_content_id"]),
+            ).fetchall()
+            for candidate in candidates:
+                candidate_raw = parse_raw(candidate["raw_json"])
+                title = str(candidate["title"] or "").strip()
+                if invalid_title(title):
+                    title = str(candidate_raw.get("card_title") or "").strip()
+                if invalid_title(title):
+                    continue
+                author = str(candidate["author_name"] or "").strip()
+                if not author:
+                    author = str(candidate_raw.get("card_author_name") or "").strip()
+                content_raw = parse_raw(content["raw_json"])
+                content_raw["card_title"] = title[:500]
+                content_raw["display_title"] = title[:500]
+                if author:
+                    content_raw["card_author_name"] = author[:200]
+                connection.execute(
+                    """
+                    UPDATE content_items
+                    SET title = ?,
+                        author_name = CASE WHEN TRIM(?) <> '' THEN ? ELSE author_name END,
+                        raw_json = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        title[:500],
+                        author,
+                        author[:200],
+                        json.dumps(content_raw, ensure_ascii=False, sort_keys=True),
+                        content["id"],
+                    ),
+                )
+                break
 
     @staticmethod
     def _migrate_content_match_keys(connection: sqlite3.Connection) -> None:
@@ -693,7 +912,8 @@ class Storage:
             JOIN content_matches cm ON cm.content_item_id = ci.id
             JOIN brands b ON b.id = cm.brand_id
             LEFT JOIN opinion_assessments oa ON oa.content_item_id = ci.id
-            WHERE 1 = 1 {assessed_filter} {run_filter}
+            WHERE ci.deleted_at IS NULL AND ci.ignored_at IS NULL
+              AND 1 = 1 {assessed_filter} {run_filter}
             GROUP BY ci.id
             ORDER BY ci.last_seen_at DESC, ci.id DESC
             LIMIT ?
@@ -828,7 +1048,11 @@ class Storage:
         source: str | None = None,
         platform: str | None = None,
     ) -> list[dict[str, Any]]:
-        conditions: list[str] = ["NOT (oa.source = 'rules' AND oa.category = 'irrelevant')"]
+        conditions: list[str] = [
+            "ci.deleted_at IS NULL",
+            "ci.ignored_at IS NULL",
+            "NOT (oa.source = 'rules' AND oa.category = 'irrelevant')",
+        ]
         parameters: list[object] = []
         if severity is not None:
             conditions.append("oa.severity = ?")
@@ -958,7 +1182,8 @@ class Storage:
                 JOIN opinion_assessments oa ON oa.content_item_id = ci.id
                 LEFT JOIN content_matches cm ON cm.content_item_id = ci.id
                 LEFT JOIN brands b ON b.id = cm.brand_id
-                WHERE (oa.requires_review = 1 OR oa.severity IN ('P0', 'P1', 'P2'))
+                WHERE ci.deleted_at IS NULL AND ci.ignored_at IS NULL
+                  AND (oa.requires_review = 1 OR oa.severity IN ('P0', 'P1', 'P2'))
                   AND coalesce(json_extract(ci.raw_json, '$.screening.brand_matched'), 1) = 1
                   {run_filter}
                 GROUP BY ci.id, ci.platform, ci.title
@@ -1060,7 +1285,8 @@ class Storage:
                        oa.severity, COUNT(*) AS count
                 FROM opinion_assessments oa
                 JOIN content_items ci ON ci.id = oa.content_item_id
-                WHERE ci.last_seen_at >= datetime('now', ?)
+                WHERE ci.deleted_at IS NULL AND ci.ignored_at IS NULL
+                  AND ci.last_seen_at >= datetime('now', ?)
                   AND NOT (oa.source = 'rules' AND oa.category = 'irrelevant')
                 GROUP BY day, oa.severity
                 ORDER BY day
@@ -1078,7 +1304,7 @@ class Storage:
                 FROM event_cluster_members ecm
                 JOIN content_items ci ON ci.id = ecm.content_item_id
                 LEFT JOIN opinion_assessments oa ON oa.content_item_id = ci.id
-                WHERE ecm.cluster_id = ?
+                WHERE ecm.cluster_id = ? AND ci.deleted_at IS NULL AND ci.ignored_at IS NULL
                 ORDER BY ci.last_seen_at DESC
                 """,
                 (cluster_id,),
@@ -1278,6 +1504,7 @@ class Storage:
         return cursor.rowcount > 0
 
     def delete_assessments(self, content_item_ids: Iterable[int]) -> int:
+        """Legacy hard-delete API retained for data maintenance callers."""
         ids = sorted({int(value) for value in content_item_ids})
         if not ids:
             return 0
@@ -1296,6 +1523,101 @@ class Storage:
                 ids,
             )
         return cursor.rowcount
+
+    def soft_delete_opinions(
+        self,
+        content_item_ids: Iterable[int],
+        *,
+        deleted_by: str = "用户",
+        reason: str = "用户删除",
+    ) -> int:
+        ids = sorted({int(value) for value in content_item_ids})
+        if not ids:
+            return 0
+        placeholders = ", ".join("?" for _ in ids)
+        now = datetime.now(UTC).isoformat()
+        with self.connect() as connection:
+            connection.execute(
+                f"""
+                DELETE FROM app_notifications
+                WHERE kind = 'opinion_review' AND entity_type = 'content_item'
+                  AND entity_id IN ({placeholders})
+                """,
+                [str(value) for value in ids],
+            )
+            cursor = connection.execute(
+                f"""
+                UPDATE content_items
+                SET deleted_at = ?, deleted_by = ?, delete_reason = ?
+                WHERE id IN ({placeholders}) AND ignored_at IS NULL
+                """,
+                (now, deleted_by[:100], reason[:500], *ids),
+            )
+        return cursor.rowcount
+
+    def set_permanent_ignore(
+        self,
+        content_item_ids: Iterable[int],
+        *,
+        ignored_by: str = "用户",
+        reason: str = "永久忽略",
+    ) -> int:
+        ids = sorted({int(value) for value in content_item_ids})
+        if not ids:
+            return 0
+        placeholders = ", ".join("?" for _ in ids)
+        now = datetime.now(UTC).isoformat()
+        with self.connect() as connection:
+            connection.execute(
+                f"""
+                DELETE FROM app_notifications
+                WHERE kind = 'opinion_review' AND entity_type = 'content_item'
+                  AND entity_id IN ({placeholders})
+                """,
+                [str(value) for value in ids],
+            )
+            cursor = connection.execute(
+                f"""
+                UPDATE content_items
+                SET ignored_at = ?, ignored_by = ?, ignore_reason = ?,
+                    deleted_at = COALESCE(deleted_at, ?)
+                WHERE id IN ({placeholders})
+                """,
+                (now, ignored_by[:100], reason[:500], now, *ids),
+            )
+        return cursor.rowcount
+
+    def clear_permanent_ignore(self, content_item_ids: Iterable[int]) -> int:
+        ids = sorted({int(value) for value in content_item_ids})
+        if not ids:
+            return 0
+        placeholders = ", ".join("?" for _ in ids)
+        with self.connect() as connection:
+            cursor = connection.execute(
+                f"""
+                UPDATE content_items
+                SET ignored_at = NULL, ignored_by = '', ignore_reason = ''
+                WHERE id IN ({placeholders})
+                """,
+                ids,
+            )
+        return cursor.rowcount
+
+    def ignored_content_ids(self, platform: str, content_ids: Iterable[str]) -> set[str]:
+        ids = sorted({str(value) for value in content_ids})
+        if not ids:
+            return set()
+        placeholders = ", ".join("?" for _ in ids)
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT platform_content_id FROM content_items
+                WHERE platform = ? AND platform_content_id IN ({placeholders})
+                  AND ignored_at IS NOT NULL
+                """,
+                (platform, *ids),
+            ).fetchall()
+        return {str(row["platform_content_id"]) for row in rows}
 
     @staticmethod
     def _content_for_assessment_dict(row: sqlite3.Row) -> dict[str, Any]:
@@ -1458,6 +1780,12 @@ class Storage:
         suspected: int = 0,
         detailed: int = 0,
         media_items: int = 0,
+        brand_matched: int = 0,
+        detail_attempted: int = 0,
+        detail_unavailable: int = 0,
+        content_inserted: int = 0,
+        new_opinion: int = 0,
+        rediscovered: int = 0,
         error_message: str = "",
         note: str = "",
         classification_summary: dict[str, Any] | None = None,
@@ -1473,6 +1801,9 @@ class Storage:
                     scanned_count = ?, filtered_count = ?, inserted_count = ?,
                     updated_count = ?, succeeded_count = ?, failed_count = ?, error_message = ?,
                     suspected_count = ?, detailed_count = ?, media_count = ?,
+                    brand_matched_count = ?, detail_attempted_count = ?,
+                    detail_unavailable_count = ?, content_inserted_count = ?,
+                    new_opinion_count = ?, rediscovered_count = ?,
                     note = CASE WHEN ? = '' THEN note ELSE ? END,
                     classification_json = ?, model_summary_json = ?
                 WHERE id = ?
@@ -1491,6 +1822,12 @@ class Storage:
                     suspected,
                     detailed,
                     media_items,
+                    brand_matched,
+                    detail_attempted,
+                    detail_unavailable,
+                    content_inserted,
+                    new_opinion,
+                    rediscovered,
                     clean_note,
                     clean_note,
                     json.dumps(classification_summary or {}, ensure_ascii=False),
@@ -1533,6 +1870,12 @@ class Storage:
         suspected: int = 0,
         detailed: int = 0,
         media_items: int = 0,
+        brand_matched: int = 0,
+        detail_attempted: int = 0,
+        detail_unavailable: int = 0,
+        content_inserted: int = 0,
+        new_opinion: int = 0,
+        rediscovered: int = 0,
         error_status: str = "",
         error_message: str = "",
         screenshot_path: str | None = None,
@@ -1546,6 +1889,9 @@ class Storage:
                     scanned_count = ?, filtered_count = ?, inserted_count = ?,
                     updated_count = ?, error_status = ?, error_message = ?, screenshot_path = ?
                     , suspected_count = ?, detailed_count = ?, media_count = ?
+                    , brand_matched_count = ?, detail_attempted_count = ?,
+                    detail_unavailable_count = ?, content_inserted_count = ?,
+                    new_opinion_count = ?, rediscovered_count = ?
                 WHERE id = ?
                 """,
                 (
@@ -1562,6 +1908,12 @@ class Storage:
                     suspected,
                     detailed,
                     media_items,
+                    brand_matched,
+                    detail_attempted,
+                    detail_unavailable,
+                    content_inserted,
+                    new_opinion,
+                    rediscovered,
                     attempt_id,
                 ),
             )
@@ -1614,6 +1966,7 @@ class Storage:
         admitted_content_ids: Iterable[str],
         filter_reason: str = "未达到入库条件",
         filter_reasons: dict[str, str] | None = None,
+        detail_audits: dict[str, dict[str, Any]] | None = None,
     ) -> int:
         admitted = sorted({str(value) for value in admitted_content_ids})
         placeholders = ", ".join("?" for _ in admitted)
@@ -1648,6 +2001,27 @@ class Storage:
                     WHERE attempt_id = ? AND platform_content_id = ?
                     """,
                     (reasons.get(content_id, filter_reason), attempt_id, content_id),
+                )
+                updated += cursor.rowcount
+            for content_id, audit in (detail_audits or {}).items():
+                status = str(audit.get("detail_status") or "not_selected")
+                if status not in {item.value for item in DetailStatus}:
+                    status = "failed"
+                cursor = connection.execute(
+                    """
+                    UPDATE scan_candidates
+                    SET detail_status = ?, detail_checked_at = ?, detail_error = ?,
+                        triage_decision = ?
+                    WHERE attempt_id = ? AND platform_content_id = ?
+                    """,
+                    (
+                        status,
+                        audit.get("detail_checked_at"),
+                        str(audit.get("detail_error") or "")[:1000],
+                        str(audit.get("triage_decision") or "")[:100],
+                        attempt_id,
+                        str(content_id),
+                    ),
                 )
                 updated += cursor.rowcount
         return updated
@@ -2522,17 +2896,30 @@ class Storage:
     def upsert_contents(self, items: Iterable[CollectedContent]) -> UpsertStats:
         inserted = 0
         updated = 0
+        content_inserted = 0
+        new_opinion = 0
+        rediscovered = 0
+        ignored = 0
         now = datetime.now(UTC).isoformat()
         brand_ids: dict[str, int] = {}
         with self.connect() as connection:
             for item in items:
                 existing = connection.execute(
                     """
-                    SELECT id, raw_json FROM content_items
+                    SELECT id, raw_json, deleted_at, ignored_at, rediscovered_count
+                    FROM content_items
                     WHERE platform = ? AND platform_content_id = ?
                     """,
                     (item.platform.value, item.content_id),
                 ).fetchone()
+                if existing is not None and existing["ignored_at"]:
+                    ignored += 1
+                    continue
+                was_deleted = existing is not None and bool(existing["deleted_at"])
+                is_opinion = bool(
+                    isinstance(item.raw_data.get("screening"), dict)
+                    and item.raw_data["screening"].get("admitted")
+                )
                 raw_data = self._merge_raw_data(
                     str(existing["raw_json"]) if existing is not None else None,
                     item.raw_data,
@@ -2609,9 +2996,61 @@ class Storage:
                 )
                 if existing is None:
                     inserted += 1
+                    content_inserted += 1
                 else:
                     updated += 1
-        return UpsertStats(inserted=inserted, updated=updated)
+                    if was_deleted:
+                        connection.execute(
+                            """
+                            UPDATE content_items
+                            SET deleted_at = NULL, deleted_by = '', delete_reason = '',
+                                rediscovered_count = COALESCE(rediscovered_count, 0) + 1,
+                                last_rediscovered_at = ?
+                            WHERE id = ?
+                            """,
+                            (now, int(content_row["id"])),
+                        )
+                        if is_opinion:
+                            rediscovered += 1
+                            new_opinion += 1
+                            connection.execute(
+                                """
+                                UPDATE opinion_assessments
+                                SET requires_review = 1, review_status = 'pending',
+                                    reviewed_by = '', reviewed_at = NULL,
+                                    review_note = '', updated_at = ?
+                                WHERE content_item_id = ?
+                                """,
+                                (now, int(content_row["id"])),
+                            )
+                            assessment = connection.execute(
+                                """
+                                SELECT severity, rationale FROM opinion_assessments
+                                WHERE content_item_id = ?
+                                """,
+                                (int(content_row["id"]),),
+                            ).fetchone()
+                            if assessment is not None:
+                                self._upsert_notification(
+                                    connection,
+                                    kind="opinion_review",
+                                    severity=str(assessment["severity"]),
+                                    title=f"{assessment['severity']} 舆情待复核",
+                                    message=str(assessment["rationale"]),
+                                    entity_type="content_item",
+                                    entity_id=str(content_row["id"]),
+                                    now=now,
+                                )
+                if existing is None and is_opinion:
+                    new_opinion += 1
+        return UpsertStats(
+            inserted=inserted,
+            updated=updated,
+            content_inserted=content_inserted,
+            new_opinion=new_opinion,
+            rediscovered=rediscovered,
+            ignored=ignored,
+        )
 
     @staticmethod
     def _insert_brand(connection: sqlite3.Connection, name: str, now: str) -> None:

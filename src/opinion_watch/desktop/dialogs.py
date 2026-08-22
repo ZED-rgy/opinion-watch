@@ -94,9 +94,15 @@ class RunDetailDialog(QDialog):
             f"平台：{platforms or '无'}　卡片扫描：{run.get('scanned_count', 0)} 条　"
             f"入库：{run.get('collected_count', 0)} 条　过滤：{run.get('filtered_count', 0)} 条　"
             f"关联内容：{run.get('content_count', run.get('linked_content_count', 0))} 条　"
-            f"新增：{run.get('inserted_count', 0)}　更新：{run.get('updated_count', 0)}　"
+            f"品牌命中：{run.get('brand_matched_count', 0)}　"
+            f"详情尝试：{run.get('detail_attempted_count', 0)}　"
+            f"详情成功：{run.get('detailed_count', 0)}　"
+            f"详情不可访问：{run.get('detail_unavailable_count', 0)}\n"
+            f"原始内容新增：{run.get('content_inserted_count', run.get('inserted_count', 0))}　"
+            f"新增舆情：{run.get('new_opinion_count', 0)}　"
+            f"重新发现：{run.get('rediscovered_count', 0)}　更新：{run.get('updated_count', 0)}　"
             f"成功：{run.get('succeeded_count', 0)}　失败：{run.get('failed_count', 0)}\n"
-            f"疑似：{run.get('suspected_count', 0)}　详情：{run.get('detailed_count', 0)}　"
+            f"疑似：{run.get('suspected_count', 0)}　"
             f"媒体证据：{run.get('media_count', 0)}\n"
             f"{model_text}"
         )
@@ -115,6 +121,10 @@ class RunDetailDialog(QDialog):
                 "状态",
                 "耗时",
                 "卡片扫描",
+                "品牌命中",
+                "详情尝试",
+                "详情成功",
+                "不可访问",
                 "入库",
                 "过滤",
                 "疑似",
@@ -136,6 +146,10 @@ class RunDetailDialog(QDialog):
                 if attempt.get("duration_seconds") is not None
                 else "—",
                 attempt.get("scanned_count", 0),
+                attempt.get("brand_matched_count", 0),
+                attempt.get("detail_attempted_count", 0),
+                attempt.get("detailed_count", 0),
+                attempt.get("detail_unavailable_count", 0),
                 attempt.get("collected_count", 0),
                 attempt.get("filtered_count", 0),
                 attempt.get("suspected_count", 0),
@@ -147,7 +161,7 @@ class RunDetailDialog(QDialog):
             )
             for column, value in enumerate(values):
                 item = QTableWidgetItem(str(value))
-                if column == 12 and str(value) != "—":
+                if column == table.columnCount() - 1 and str(value) != "—":
                     item.setToolTip(str(value))
                 table.setItem(row, column, item)
         table.setWordWrap(False)
@@ -158,7 +172,7 @@ class RunDetailDialog(QDialog):
         for column in range(table.columnCount()):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(12, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(table.columnCount() - 1, QHeaderView.ResizeMode.Stretch)
         table.resizeRowsToContents()
         root.addWidget(table, 1)
         alerts = storage.list_alerts(run_id=int(run["id"]), unacknowledged_only=False)
