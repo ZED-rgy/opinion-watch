@@ -1,7 +1,10 @@
-"""舆情中心页：筛选、复核与详情侧栏。"""
+"""舆情中心页：筛选、复核、趋势与事件聚合。"""
 
 from __future__ import annotations
 
+import csv
+from datetime import date
+from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import Qt, QUrl, Signal
@@ -10,6 +13,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QFormLayout,
     QFrame,
     QHBoxLayout,
@@ -18,11 +22,13 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QScrollArea,
     QSplitter,
+    QStackedWidget,
     QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
+from opinion_watch.desktop.charts import SeverityTrendChart
 from opinion_watch.desktop.components import (
     EmptyState,
     TablePanel,
@@ -33,6 +39,7 @@ from opinion_watch.desktop.components import (
     checked_ids,
     make_table,
     populate,
+    selected_id,
     set_check_cell,
     set_text_cell,
     severity_item,
@@ -52,9 +59,11 @@ from opinion_watch.desktop.dialogs import (
     confirm_destructive,
     delete_scan_run_with_confirmation,
     edit_scan_run_metadata,
+    long_text_dialog,
     show_error,
 )
-from opinion_watch.desktop.theme import COLORS, repolish
+from opinion_watch.desktop.tasks import StorageTaskRunner
+from opinion_watch.desktop.theme import COLORS, SEVERITY_COLORS, repolish
 from opinion_watch.desktop.utils import format_timestamp
 from opinion_watch.models import OpinionCategory, RiskSeverity
 from opinion_watch.storage import Storage
@@ -67,7 +76,9 @@ class OpinionsPage(QWidget):
         super().__init__()
         self.storage = storage
         self.rows: dict[int, dict[str, Any]] = {}
+        self.cluster_rows: dict[int, dict[str, Any]] = {}
         self._run_filter_signature: tuple[int, ...] = ()
+        self.tasks = StorageTaskRunner(storage.database_path, self)
         self.setObjectName("page")
         root = QVBoxLayout(self)
         root.setContentsMargins(30, 26, 30, 28)
@@ -80,9 +91,36 @@ class OpinionsPage(QWidget):
         heading.addWidget(subtitle)
         header.addLayout(heading)
         header.addStretch()
+        header.addWidget(
+            button("导出 CSV", self.export_csv, icon_name="fa6s.file-csv", role="secondary")
+        )
         header.addWidget(button("刷新", self.refresh, icon_name="fa6s.rotate", role="secondary"))
         root.addLayout(header)
+        trend_card, trend_layout = surface()
+        trend_header = QHBoxLayout()
+        trend_header.addWidget(title("最近 7 天风险趋势", "sectionTitle"))
+        trend_header.addStretch()
+        legend = QLabel(
+            f'<span style="color:{COLORS["danger"]};">■</span> P1　'
+            f'<span style="color:{SEVERITY_COLORS["P2"]};">■</span> P2　'
+            f'<span style="color:{SEVERITY_COLORS["P3"]};">■</span> P3'
+        )
+        legend.setObjectName("muted")
+        trend_header.addWidget(legend)
+        trend_layout.addLayout(trend_header)
+        self.trend_chart = SeverityTrendChart(days=7)
+        trend_layout.addWidget(self.trend_chart)
+        root.addWidget(trend_card)
         card, layout = surface()
+        view_row = QHBoxLayout()
+        view_row.addWidget(QLabel("视图"))
+        self.view_mode = QComboBox()
+        self.view_mode.addItem("内容明细", "items")
+        self.view_mode.addItem("聚合事件", "clusters")
+        self.view_mode.currentIndexChanged.connect(self._switch_view)
+        view_row.addWidget(self.view_mode)
+        view_row.addStretch()
+        layout.addLayout(view_row)
         filters = QHBoxLayout()
         filters.addWidget(QLabel("巡检批次"))
         self.run_filter = QComboBox()
@@ -182,15 +220,158 @@ class OpinionsPage(QWidget):
             ),
         )
         self.detail_panel = self._build_detail_panel()
+        # 聚合事件视图：同一事件（平台+品牌+相近标题）的多条内容合并展示。
+        self.cluster_table = make_table(
+            ["ID", "平台", "品牌", "代表标题", "关联内容", "最近发现"], sortable=True
+        )
+        self.cluster_table.setColumnHidden(0, True)
+        self.cluster_table.itemDoubleClicked.connect(lambda _item: self.show_cluster_members())
+        add_context_menu(self.cluster_table, [("查看事件内容", self.show_cluster_members)])
+        self.cluster_panel = TablePanel(
+            self.cluster_table,
+            EmptyState(
+                "暂无聚合事件",
+                "当多条疑似或高风险内容指向同一事件时，会在这里自动聚合。",
+            ),
+        )
+        self.view_stack = QStackedWidget()
+        self.view_stack.addWidget(self.panel)
+        self.view_stack.addWidget(self.cluster_panel)
         split = QSplitter(Qt.Orientation.Horizontal)
         split.setObjectName("opinionSplit")
         split.setChildrenCollapsible(False)
-        split.addWidget(self.panel)
+        split.addWidget(self.view_stack)
         split.addWidget(self.detail_panel)
         split.setStretchFactor(0, 1)
         split.setStretchFactor(1, 0)
         layout.addWidget(split, 1)
         root.addWidget(card, 1)
+
+    def _switch_view(self) -> None:
+        clusters = self.view_mode.currentData() == "clusters"
+        self.view_stack.setCurrentWidget(self.cluster_panel if clusters else self.panel)
+        self.detail_panel.setVisible(not clusters and self.selected() is not None)
+        if clusters:
+            self._refresh_clusters()
+
+    def _refresh_clusters(self) -> None:
+        def load(storage: Storage) -> list[dict[str, Any]]:
+            return storage.list_event_clusters(limit=100)
+
+        def apply(rows: object) -> None:
+            clusters = rows if isinstance(rows, list) else []
+            self.cluster_rows = {int(item["id"]): item for item in clusters}
+            with populate(self.cluster_table):
+                self.cluster_table.setRowCount(len(clusters))
+                for row, item in enumerate(clusters):
+                    set_text_cell(self.cluster_table, row, 0, item["id"], tooltip=False)
+                    set_text_cell(
+                        self.cluster_table,
+                        row,
+                        1,
+                        PLATFORM_NAMES.get(str(item["platform"]), item["platform"]),
+                        tooltip=False,
+                    )
+                    set_text_cell(
+                        self.cluster_table,
+                        row,
+                        2,
+                        "、".join(str(value) for value in item.get("brand_names", [])),
+                    )
+                    set_text_cell(self.cluster_table, row, 3, item["representative_title"])
+                    set_text_cell(
+                        self.cluster_table, row, 4, f"{item['content_count']} 条", tooltip=False
+                    )
+                    set_text_cell(
+                        self.cluster_table,
+                        row,
+                        5,
+                        format_timestamp(item.get("last_seen_at")),
+                        tooltip=False,
+                    )
+            self.cluster_panel.show_count(len(clusters))
+
+        self.tasks.submit(load, apply, cancel_key="clusters")
+
+    def show_cluster_members(self) -> None:
+        cluster_id = selected_id(self.cluster_table)
+        if cluster_id is None:
+            return
+        cluster = self.cluster_rows.get(cluster_id)
+        if cluster is None:
+            return
+        members = self.storage.list_cluster_members(cluster_id)
+        lines = [
+            f"事件：{cluster['representative_title']}",
+            f"平台：{PLATFORM_NAMES.get(str(cluster['platform']), cluster['platform'])}　"
+            f"关联内容：{len(members)} 条",
+            "",
+        ]
+        for member in members:
+            lines.append(
+                f"[{member.get('severity') or '—'}] "
+                f"{str(member.get('title') or '（无标题）')[:60]}\n"
+                f"    {member.get('url')}\n"
+                f"    最近发现：{format_timestamp(member.get('last_seen_at'))}　"
+                f"复核：{REVIEW_STATUS_NAMES.get(str(member.get('review_status')), '未判定')}"
+            )
+        long_text_dialog(self, f"聚合事件 · #{cluster_id}", "\n".join(lines))
+
+    def export_csv(self) -> None:
+        """把当前筛选条件下的舆情台账导出为 CSV（Excel 可直接打开）。"""
+        if not self.rows:
+            show_toast(self, "当前没有可导出的数据")
+            return
+        default_name = f"舆情台账-{date.today().isoformat()}.csv"
+        path, _selected = QFileDialog.getSaveFileName(
+            self, "导出舆情台账", default_name, "CSV 文件 (*.csv)"
+        )
+        if not path:
+            return
+        headers = [
+            "内容ID",
+            "等级",
+            "类型",
+            "平台",
+            "品牌",
+            "标题",
+            "链接",
+            "首次发现",
+            "最近发现",
+            "判定来源",
+            "复核状态",
+            "判断依据",
+            "命中信号",
+        ]
+        try:
+            # utf-8-sig 让 Excel 正确识别中文编码。
+            with open(path, "w", newline="", encoding="utf-8-sig") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(headers)
+                for item in self.rows.values():
+                    writer.writerow(
+                        [
+                            item["content_item_id"],
+                            item["severity"],
+                            CATEGORY_NAMES.get(str(item["category"]), item["category"]),
+                            PLATFORM_NAMES.get(str(item["platform"]), item["platform"]),
+                            "、".join(str(value) for value in item["brand_names"]),
+                            item["title"] or "",
+                            item["url"] or "",
+                            format_timestamp(item.get("discovered_at")),
+                            format_timestamp(item.get("last_seen_at")),
+                            assessment_source_name(str(item["source"])),
+                            REVIEW_STATUS_NAMES.get(
+                                str(item["review_status"]), item["review_status"]
+                            ),
+                            item["rationale"] or "",
+                            "、".join(item["matched_signals"]),
+                        ]
+                    )
+        except OSError as exc:
+            show_error(self, exc)
+            return
+        show_toast(self, f"已导出 {len(self.rows)} 条到 {Path(path).name}")
 
     def _build_detail_panel(self) -> QFrame:
         panel = QFrame()
@@ -299,13 +480,40 @@ class OpinionsPage(QWidget):
             self.run_filter.blockSignals(False)
         selected_run = self.run_filter.currentData()
         run_id = int(selected_run) if selected_run not in (None, -1) else None
-        rows = self.storage.list_assessments(
-            limit=1000,
-            run_id=run_id,
-            source=self.source_filter.currentData() or None,
-            platform=self.platform_filter.currentData() or None,
-            severity=self.severity_filter.currentData() or None,
+        source = self.source_filter.currentData() or None
+        platform = self.platform_filter.currentData() or None
+        severity = self.severity_filter.currentData() or None
+
+        # 台账主查询（limit=1000，含每行多个相关子查询）在后台线程执行，
+        # 巡检写库期间界面不再卡顿。
+        def load(storage: Storage) -> list[dict[str, Any]]:
+            return storage.list_assessments(
+                limit=1000,
+                run_id=run_id,
+                source=source,
+                platform=platform,
+                severity=severity,
+            )
+
+        self.scope_label.setText("正在加载…")
+        self.tasks.submit(
+            load,
+            lambda rows: self._apply_rows(rows if isinstance(rows, list) else [], run_id),
+            on_error=lambda message: self.scope_label.setText(f"加载失败：{message[:80]}"),
+            cancel_key="assessments",
         )
+        self.tasks.submit(
+            lambda storage: storage.severity_trend(days=7),
+            lambda rows: self.trend_chart.set_data(rows if isinstance(rows, list) else []),
+            cancel_key="trend",
+        )
+        if self.view_mode.currentData() == "clusters":
+            self._refresh_clusters()
+        has_selected_run = run_id is not None
+        self.edit_run_button.setEnabled(has_selected_run)
+        self.delete_run_button.setEnabled(has_selected_run)
+
+    def _apply_rows(self, rows: list[dict[str, Any]], run_id: int | None) -> None:
         self.rows = {int(item["content_item_id"]): item for item in rows}
         self.scope_label.setText(
             f"当前显示巡检 #{run_id} 的数据，共 {len(rows)} 条"
@@ -366,9 +574,6 @@ class OpinionsPage(QWidget):
                     review_cell.setFont(font)
         self.panel.show_count(len(rows))
         self._update_detail_panel()
-        has_selected_run = run_id is not None
-        self.edit_run_button.setEnabled(has_selected_run)
-        self.delete_run_button.setEnabled(has_selected_run)
 
     def selected_run_id(self) -> int | None:
         value = self.run_filter.currentData()

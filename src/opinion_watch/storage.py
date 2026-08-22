@@ -1049,6 +1049,41 @@ class Storage:
             result.append(item)
         return result
 
+    def severity_trend(self, *, days: int = 7) -> list[dict[str, Any]]:
+        """按本地日期统计最近 N 天各等级的内容数量（按最近发现时间归档）。"""
+        days = max(1, min(days, 90))
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT date(ci.last_seen_at, 'localtime') AS day,
+                       oa.severity, COUNT(*) AS count
+                FROM opinion_assessments oa
+                JOIN content_items ci ON ci.id = oa.content_item_id
+                WHERE ci.last_seen_at >= datetime('now', ?)
+                  AND NOT (oa.source = 'rules' AND oa.category = 'irrelevant')
+                GROUP BY day, oa.severity
+                ORDER BY day
+                """,
+                (f"-{days} days",),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_cluster_members(self, cluster_id: int) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT ci.id, ci.platform, ci.title, ci.url, ci.last_seen_at,
+                       oa.severity, oa.category, oa.review_status
+                FROM event_cluster_members ecm
+                JOIN content_items ci ON ci.id = ecm.content_item_id
+                LEFT JOIN opinion_assessments oa ON oa.content_item_id = ci.id
+                WHERE ecm.cluster_id = ?
+                ORDER BY ci.last_seen_at DESC
+                """,
+                (cluster_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def link_scan_contents(
         self,
         *,
