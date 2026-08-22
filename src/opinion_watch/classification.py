@@ -97,6 +97,15 @@ _ORDINARY_NEGATIVE_SIGNALS = (
     "不推荐",
     "体验差",
 )
+_WARNING_SIGNALS = (
+    "擦亮眼睛",
+    "谨慎选择",
+    "慎选",
+    "劝退",
+    "别碰",
+    "不要选",
+    "小心被骗",
+)
 
 
 def classify_content(content: dict[str, Any]) -> AssessmentResult:
@@ -110,6 +119,7 @@ def classify_content(content: dict[str, Any]) -> AssessmentResult:
         + _COMPLAINT_SIGNALS
         + _SERVICE_SIGNALS
         + _ORDINARY_NEGATIVE_SIGNALS
+        + _WARNING_SIGNALS
     )
     if (
         brands
@@ -182,6 +192,17 @@ def classify_content(content: dict[str, Any]) -> AssessmentResult:
                 matched_signals=matched,
                 requires_review=True,
             )
+
+    warning_matches = _matched_signals(text, _WARNING_SIGNALS)
+    if warning_matches and brand_matches_card(content):
+        return AssessmentResult(
+            category=OpinionCategory.ORDINARY_GRIEVANCE,
+            severity=RiskSeverity.P3,
+            confidence=0.78,
+            rationale="品牌搜索卡片命中明确预警表达，需要打开详情核查具体事实与传播语境。",
+            matched_signals=warning_matches,
+            requires_review=True,
+        )
 
     complaint_matches = _matched_signals(text, _COMPLAINT_SIGNALS)
     service_matches = _matched_signals(text, _SERVICE_SIGNALS)
@@ -274,6 +295,19 @@ def _content_text(content: dict[str, Any]) -> str:
     if isinstance(comments, list):
         parts.extend(str(comment) for comment in comments[:100])
     return "\n".join(parts).lower()
+
+
+def brand_matches_card(content: dict[str, Any]) -> bool:
+    """Return whether a target brand is explicitly present in shallow card text."""
+    brands = [str(item).strip().lower() for item in content.get("brand_names", []) if str(item)]
+    if not brands:
+        return True
+    raw_data = content.get("raw_data")
+    raw: dict[str, Any] = raw_data if isinstance(raw_data, dict) else {}
+    card_text = "\n".join(
+        [str(content.get("title") or ""), str(raw.get("search_card_text") or "")]
+    ).lower()
+    return any(brand in card_text for brand in brands)
 
 
 def _matched_signals(text: str, signals: tuple[str, ...]) -> list[str]:

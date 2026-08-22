@@ -91,7 +91,7 @@ class RunDetailDialog(QDialog):
             f"状态：{status}　类型：{trigger}\n"
             f"开始：{format_timestamp(run.get('started_at'))}　"
             f"结束：{format_timestamp(run.get('finished_at'))}\n"
-            f"平台：{platforms or '无'}　检索：{run.get('scanned_count', 0)} 条　"
+            f"平台：{platforms or '无'}　卡片扫描：{run.get('scanned_count', 0)} 条　"
             f"入库：{run.get('collected_count', 0)} 条　过滤：{run.get('filtered_count', 0)} 条　"
             f"关联内容：{run.get('content_count', run.get('linked_content_count', 0))} 条　"
             f"新增：{run.get('inserted_count', 0)}　更新：{run.get('updated_count', 0)}　"
@@ -114,7 +114,7 @@ class RunDetailDialog(QDialog):
                 "关键词",
                 "状态",
                 "耗时",
-                "检索",
+                "卡片扫描",
                 "入库",
                 "过滤",
                 "疑似",

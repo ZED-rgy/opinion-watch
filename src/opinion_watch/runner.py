@@ -11,7 +11,12 @@ from datetime import UTC, datetime
 from typing import Any
 
 from opinion_watch.browser import BrowserSession
-from opinion_watch.classification import classify_batch, classify_content, is_suspected
+from opinion_watch.classification import (
+    brand_matches_card,
+    classify_batch,
+    classify_content,
+    is_suspected,
+)
 from opinion_watch.collectors import collector_for
 from opinion_watch.collectors.base import BaseCollector, CollectorRuntimeError
 from opinion_watch.config import Settings
@@ -130,6 +135,13 @@ def _screen_items_for_detail(
             }
         )
         suspected = is_suspected(result)
+        brand_matched = brand_matches_card(
+            {
+                "title": getattr(item, "title", ""),
+                "brand_names": [item.brand_name] if item.brand_name else [],
+                "raw_data": raw_data,
+            }
+        )
         raw_data["precheck"] = {
             "suspected": suspected,
             "category": result.category.value,
@@ -138,15 +150,98 @@ def _screen_items_for_detail(
             "matched_signals": result.matched_signals,
             "rationale": result.rationale,
             "requires_review": result.requires_review,
-            "brand_matched": not item.brand_name
-            or item.brand_name.lower()
-            in (f"{item.title}\n{raw_data.get('search_card_text', '')}").lower(),
+            "brand_matched": brand_matched,
         }
         screened_item = replace(item, raw_data=raw_data)
         screened.append(screened_item)
-        if suspected:
+        if suspected and brand_matched:
             candidates.add(item.content_id)
     return screened, candidates
+
+
+def _select_detail_candidates(
+    items: list[CollectedContent],
+    candidate_ids: set[str],
+    *,
+    detail_limit: int,
+) -> set[str]:
+    """Select suspected cards first, then the ordered two-card baseline sample."""
+    if detail_limit <= 0:
+        return set()
+    suspected_ids: list[str] = []
+    sample_ids: list[str] = []
+    for item in items:
+        if item.content_id not in candidate_ids:
+            continue
+        screening = item.raw_data.get("screening", {})
+        decision = screening.get("decision") if isinstance(screening, dict) else ""
+        if decision in {"规则疑似", "模型疑似"}:
+            suspected_ids.append(item.content_id)
+        elif decision == "保底抽查":
+            sample_ids.append(item.content_id)
+    ordered = [*suspected_ids, *sample_ids]
+    return set(ordered[:detail_limit])
+
+
+def _recheck_detail_items(
+    items: list[CollectedContent],
+    *,
+    brand: str,
+) -> tuple[list[CollectedContent], dict[str, str], int]:
+    """Reclassify opened details and keep only confirmed or unresolved risks."""
+    admitted: list[CollectedContent] = []
+    filter_reasons: dict[str, str] = {}
+    suspected_count = 0
+    for item in items:
+        raw_data = dict(item.raw_data)
+        screening = dict(raw_data.get("screening", {}))
+        decision = str(screening.get("decision") or "直接过滤")
+        detail_collected = bool(raw_data.get("detail_collected"))
+        if detail_collected:
+            result = classify_content(
+                {
+                    "title": item.title,
+                    "brand_names": [brand],
+                    "raw_data": raw_data,
+                }
+            )
+            final_suspected = is_suspected(result)
+            screening.update(
+                {
+                    "detail_recheck": True,
+                    "final_category": result.category.value,
+                    "final_severity": result.severity.value,
+                    "final_confidence": result.confidence,
+                    "final_matched_signals": result.matched_signals,
+                    "final_rationale": result.rationale,
+                    "final_suspected": final_suspected,
+                }
+            )
+            if not final_suspected:
+                filter_reasons[item.content_id] = (
+                    "保底抽查后无风险" if decision == "保底抽查" else "详情核查后无风险"
+                )
+                raw_data["screening"] = {**screening, "admitted": False}
+                continue
+            suspected_count += 1
+        elif decision in {"规则疑似", "模型疑似"}:
+            # A failed detail page must not make a brand warning disappear. Keep
+            # the card-level decision and leave the failed detail visible in audit.
+            screening.update(
+                {
+                    "detail_recheck": False,
+                    "detail_failure": True,
+                    "final_suspected": True,
+                }
+            )
+            suspected_count += 1
+        else:
+            filter_reasons[item.content_id] = "详情失败"
+            raw_data["screening"] = {**screening, "admitted": False}
+            continue
+        raw_data["screening"] = {**screening, "admitted": True}
+        admitted.append(replace(item, raw_data=raw_data))
+    return admitted, filter_reasons, suspected_count
 
 
 async def _screen_items_for_admission(
@@ -155,6 +250,7 @@ async def _screen_items_for_admission(
     *,
     brand: str,
     budget: LLMCallBudget | None = None,
+    baseline_limit: int = 0,
 ) -> tuple[list[CollectedContent], set[str], dict[str, Any]]:
     """Filter ordinary search cards before they reach the operational database."""
     screened, rule_candidates = _screen_items_for_detail(items)
@@ -201,37 +297,43 @@ async def _screen_items_for_admission(
 
     admitted: list[CollectedContent] = []
     detail_candidates: set[str] = set()
+    baseline_candidates: list[CollectedContent] = []
+    filter_reasons: dict[str, str] = {}
     for item in screened:
         key = f"{item.platform.value}:{item.content_id}"
         rule_data = item.raw_data.get("precheck", {})
         brand_matched = bool(rule_data.get("brand_matched", True))
-        rule_admitted = item.content_id in rule_candidates and brand_matched
+        rule_suspected = item.content_id in rule_candidates and brand_matched
         model_result = model_assessments.get(key)
         if model_result is None:
-            keep = rule_admitted
+            suspected = rule_suspected
             source = "rules"
-            suspected = rule_admitted
+            decision = "规则疑似" if suspected else "直接过滤"
             screening_data: dict[str, Any] = {
                 "source": source,
-                "admitted": keep,
+                "admitted": suspected,
                 "suspected": suspected,
                 "category": rule_data.get("category", "other"),
                 "severity": rule_data.get("severity", "P3"),
                 "matched_signals": rule_data.get("matched_signals", []),
                 "rationale": rule_data.get("rationale", ""),
                 "brand_matched": brand_matched,
+                "decision": decision,
             }
         else:
-            keep = model_result.category.value not in {"other", "irrelevant"}
-            keep = keep or model_result.requires_review
+            model_suspected = model_result.category.value not in {"other", "irrelevant"}
+            model_suspected = model_suspected or model_result.requires_review
             # 模型只有文本候选阶段的证据，不能把没有目标品牌精确提及的
             # 搜索噪声提升为正式舆情；这类内容仅保留在候选留痕中。
-            keep = keep and brand_matched
+            model_suspected = model_suspected and brand_matched
+            suspected = rule_suspected or model_suspected
             source = "model"
-            suspected = keep and brand_matched
+            decision = (
+                "规则疑似" if rule_suspected else "模型疑似" if model_suspected else "直接过滤"
+            )
             screening_data = {
                 "source": source,
-                "admitted": keep,
+                "admitted": suspected,
                 "suspected": suspected,
                 "category": model_result.category.value,
                 "severity": model_result.severity.value,
@@ -239,14 +341,27 @@ async def _screen_items_for_admission(
                 "matched_signals": model_result.matched_signals,
                 "rationale": model_result.rationale,
                 "brand_matched": brand_matched,
+                "decision": decision,
             }
         raw_data = {**item.raw_data, "screening": screening_data}
         item = replace(item, raw_data=raw_data)
-        if not keep:
-            continue
-        admitted.append(item)
         if suspected:
+            admitted.append(item)
             detail_candidates.add(item.content_id)
+            continue
+        if brand_matched:
+            baseline_candidates.append(item)
+            filter_reasons[item.content_id] = "品牌相关但未命中风险"
+        else:
+            filter_reasons[item.content_id] = "未出现目标品牌"
+
+    for item in baseline_candidates[: max(0, min(2, baseline_limit))]:
+        screening = dict(item.raw_data.get("screening", {}))
+        screening.update({"decision": "保底抽查", "admitted": True})
+        item = replace(item, raw_data={**item.raw_data, "screening": screening})
+        admitted.append(item)
+        detail_candidates.add(item.content_id)
+        filter_reasons.pop(item.content_id, None)
 
     return (
         admitted,
@@ -259,6 +374,13 @@ async def _screen_items_for_admission(
             "model_attempted": model_attempted,
             "model_candidates": len(payloads),
             "model_errors": model_errors,
+            "brand_matched": sum(
+                1
+                for item in screened
+                if bool(item.raw_data.get("precheck", {}).get("brand_matched"))
+            ),
+            "filter_reasons": filter_reasons,
+            "detail_priority": [item.content_id for item in admitted],
         },
     )
 
@@ -529,6 +651,8 @@ async def _run_scan_locked(
                             diagnostic_path = prefetched_diagnostics.pop(cache_key, None)
                             quality_partial = False
                             quality_message = ""
+                            detail_coverage_partial = False
+                            detail_coverage_message = ""
                             try:
                                 if isinstance(cached_search, Exception):
                                     search_items = None
@@ -638,7 +762,28 @@ async def _run_scan_locked(
                                     search_items,
                                     brand=brand,
                                     budget=llm_budget,
+                                    baseline_limit=2,
                                 )
+                                detail_ids = _select_detail_candidates(
+                                    items,
+                                    detail_candidate_ids,
+                                    detail_limit=options.detail_limit,
+                                )
+                                detail_scope: list[CollectedContent] = []
+                                for item in items:
+                                    screening = item.raw_data.get("screening", {})
+                                    decision = (
+                                        screening.get("decision")
+                                        if isinstance(screening, dict)
+                                        else ""
+                                    )
+                                    if decision == "保底抽查" and item.content_id not in detail_ids:
+                                        screening_stats["filter_reasons"][item.content_id] = (
+                                            "详情名额已由疑似项占用，未执行保底抽查"
+                                        )
+                                        continue
+                                    detail_scope.append(item)
+                                items = detail_scope
                                 if quality_partial:
                                     invalid_count = quality["total"] - len(search_items)
                                     screening_stats["scanned"] = quality["total"]
@@ -653,17 +798,27 @@ async def _run_scan_locked(
                                         message=quality_message,
                                         screenshot_path=diagnostic_path,
                                     )
-                                storage.mark_scan_candidates(
-                                    attempt_id=attempt_id,
-                                    admitted_content_ids=(item.content_id for item in items),
-                                )
                                 items = await collector.enrich_items(
                                     session.active_context,
                                     items,
                                     detail_limit=options.detail_limit,
                                     comments_limit=options.comments_limit,
-                                    detail_candidate_ids=detail_candidate_ids,
+                                    detail_candidate_ids=detail_ids,
                                     artifact_dir=settings.artifact_dir / platform.value / "media",
+                                )
+                                items, detail_filter_reasons, final_suspected_count = (
+                                    _recheck_detail_items(items, brand=brand)
+                                )
+                                screening_stats["filter_reasons"].update(detail_filter_reasons)
+                                screening_stats["admitted"] = len(items)
+                                screening_stats["filtered"] = screening_stats["scanned"] - len(
+                                    items
+                                )
+                                screening_stats["suspected"] = final_suspected_count
+                                storage.mark_scan_candidates(
+                                    attempt_id=attempt_id,
+                                    admitted_content_ids=(item.content_id for item in items),
+                                    filter_reasons=screening_stats["filter_reasons"],
                                 )
                                 stats = storage.upsert_contents(items)
                                 if screening_stats["model_errors"]:
@@ -799,6 +954,28 @@ async def _run_scan_locked(
                                 scanned_count = int(screening_stats["scanned"])
                                 filtered_count = int(screening_stats["filtered"])
                                 suspected_count = int(screening_stats["suspected"])
+                                if (
+                                    options.detail_limit > 0
+                                    and int(screening_stats.get("brand_matched", 0)) > 0
+                                    and detailed_count == 0
+                                ):
+                                    detail_coverage_partial = True
+                                    detail_coverage_message = (
+                                        f"{platform.value}/{keyword} 已命中品牌卡片，"
+                                        "但详情核查为 0 条；"
+                                        "请检查详情页加载、登录态或平台页面结构。"
+                                    )
+                                    coverage_shortfalls.append(detail_coverage_message)
+                                    storage.create_alert(
+                                        run_id=run_id,
+                                        attempt_id=attempt_id,
+                                        platform=platform.value,
+                                        keyword=keyword,
+                                        kind="zero_detail_coverage",
+                                        severity="warning",
+                                        message=detail_coverage_message,
+                                        screenshot_path=diagnostic_path,
+                                    )
                                 # Zero results can be a legitimate no-match
                                 # search. Warn when the platform returned a
                                 # partial page, which is the actionable case
@@ -846,10 +1023,15 @@ async def _run_scan_locked(
                                 totals.collected += len(items)
                                 totals.inserted += stats.inserted
                                 totals.updated += stats.updated
-                                attempt_status = "partial" if quality_partial else "succeeded"
-                                if quality_partial:
+                                attempt_status = (
+                                    "partial"
+                                    if quality_partial or detail_coverage_partial
+                                    else "succeeded"
+                                )
+                                if quality_partial or detail_coverage_partial:
                                     totals.failed += 1
-                                    coverage_shortfalls.append(quality_message)
+                                    if quality_partial:
+                                        coverage_shortfalls.append(quality_message)
                                 else:
                                     totals.succeeded += 1
                                 storage.link_scan_contents(
@@ -869,9 +1051,19 @@ async def _run_scan_locked(
                                     detailed=detailed_count,
                                     media_items=media_count,
                                     error_status=(
-                                        "data_quality_warning" if quality_partial else ""
+                                        "data_quality_warning"
+                                        if quality_partial
+                                        else "zero_detail_coverage"
+                                        if detail_coverage_partial
+                                        else ""
                                     ),
-                                    error_message=quality_message if quality_partial else "",
+                                    error_message=(
+                                        quality_message
+                                        if quality_partial
+                                        else detail_coverage_message
+                                        if detail_coverage_partial
+                                        else ""
+                                    ),
                                     screenshot_path=diagnostic_path,
                                 )
                                 print(

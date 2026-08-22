@@ -1613,10 +1613,12 @@ class Storage:
         attempt_id: int,
         admitted_content_ids: Iterable[str],
         filter_reason: str = "未达到入库条件",
+        filter_reasons: dict[str, str] | None = None,
     ) -> int:
         admitted = sorted({str(value) for value in admitted_content_ids})
         placeholders = ", ".join("?" for _ in admitted)
         updated = 0
+        reasons = {str(key): str(value) for key, value in (filter_reasons or {}).items()}
         with self.connect() as connection:
             if admitted:
                 cursor = connection.execute(
@@ -1629,15 +1631,25 @@ class Storage:
                 )
                 updated += cursor.rowcount
             filtered_clause = f"AND platform_content_id NOT IN ({placeholders})" if admitted else ""
-            cursor = connection.execute(
+            filtered_rows = connection.execute(
                 f"""
-                UPDATE scan_candidates
-                SET status = 'filtered', filter_reason = ?
+                SELECT platform_content_id
+                FROM scan_candidates
                 WHERE attempt_id = ? {filtered_clause}
                 """,
-                (filter_reason, attempt_id, *admitted),
-            )
-            updated += cursor.rowcount
+                (attempt_id, *admitted),
+            ).fetchall()
+            for row in filtered_rows:
+                content_id = str(row["platform_content_id"])
+                cursor = connection.execute(
+                    """
+                    UPDATE scan_candidates
+                    SET status = 'filtered', filter_reason = ?
+                    WHERE attempt_id = ? AND platform_content_id = ?
+                    """,
+                    (reasons.get(content_id, filter_reason), attempt_id, content_id),
+                )
+                updated += cursor.rowcount
         return updated
 
     def create_alert(
