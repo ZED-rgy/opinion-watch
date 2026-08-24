@@ -82,6 +82,7 @@ class SchedulerPage(QWidget):
         self.latest_run_id: int | None = None
         self.current_run_id: int | None = None
         self._finished_keywords = 0
+        self._pending_line = ""
         self._restore_scan_button: Any = None
         self._stop_requested = False
 
@@ -477,6 +478,7 @@ class SchedulerPage(QWidget):
         llm_enabled = bool(self.storage.get_llm_config().get("enabled"))
         self.current_run_id = None
         self._finished_keywords = 0
+        self._pending_line = ""
         self.output_buffer.clear()
         self.output.clear()
         self.output.setVisible(False)
@@ -535,6 +537,23 @@ class SchedulerPage(QWidget):
         else:
             self.process.kill()
 
+    def shutdown(self) -> None:
+        """退出应用前收掉巡检子进程。
+
+        QProcess 不是子进程组的父级守护者：直接关窗口会把 CLI 进程和它拉起的
+        Chrome 一起留在后台，scan/account 租约要等到过期才释放，下次启动会直接
+        撞上 BrowserProfileLocked。这里走和"停止巡检"一样的 terminate → 强杀
+        路径，但必须同步等待，aboutToQuit 之后没有事件循环再跑 singleShot。
+        """
+        if self.process.state() == QProcess.ProcessState.NotRunning:
+            return
+        self._stop_requested = True
+        self.timer.stop()
+        self.process.terminate()
+        if not self.process.waitForFinished(3_000):
+            self._force_stop_scan()
+            self.process.waitForFinished(2_000)
+
     def _scan_process_error(self, error: QProcess.ProcessError) -> None:
         # 启动失败时 finished 不会触发，状态会一直停在“正在检索…”。
         if error is QProcess.ProcessError.FailedToStart:
@@ -546,36 +565,48 @@ class SchedulerPage(QWidget):
         value = decode_process_output(self.process.readAllStandardOutput())
         self.output_buffer.append(value)
         self._append_output(value)
-        for line in value.splitlines():
-            event = parse_event(line)
-            if event is None:
-                continue
-            event_type = str(event.get("type") or "")
-            if event_type == "scan.started":
-                with suppress(TypeError, ValueError):
-                    self.current_run_id = int(str(event.get("run_id")))
-            elif event_type in _TERMINAL_ATTEMPT_EVENTS:
-                # 重试中的尝试不计入进度，等到终态再更新。
-                if str(event.get("status")) == "retrying":
-                    continue
-                self._finished_keywords += 1
-                platform = PLATFORM_NAMES.get(str(event.get("platform")), "")
-                keyword = str(event.get("keyword") or "")
-                self.run_status.setText(
-                    f"巡检进行中 · 已完成 {self._finished_keywords} 个关键词检索"
-                    + (f"（最新：{platform} {keyword}）" if keyword else "")
-                )
-            elif event_type == "scan.finished":
-                self.run_status.setText(
-                    "巡检已完成" if event.get("status") == "succeeded" else "巡检未完成"
-                )
-            elif event_type in {
-                "scan.session_status",
-                "scan.account_not_ready",
-                "scan.browser_error",
-            }:
-                message = str(event.get("message") or "巡检遇到问题，请查看运行详情")
-                self.run_status.setText(message[:120])
+        # readAllStandardOutput 给的是字节块，边界和行边界无关：一条事件 JSON
+        # 很容易被切成两半。直接 splitlines 会把两半都解析失败地丢掉，丢掉
+        # scan.started 就意味着 current_run_id 一直为空，结束时回退到“最近一次
+        # 运行”，可能指向别人的 run。这里把不完整的尾行留到下一块再拼。
+        chunk = self._pending_line + value
+        lines = chunk.splitlines(keepends=True)
+        self._pending_line = ""
+        if lines and not lines[-1].endswith(("\n", "\r")):
+            self._pending_line = lines.pop()
+        for line in lines:
+            self._dispatch_event(line)
+
+    def _dispatch_event(self, line: str) -> None:
+        event = parse_event(line)
+        if event is None:
+            return
+        event_type = str(event.get("type") or "")
+        if event_type == "scan.started":
+            with suppress(TypeError, ValueError):
+                self.current_run_id = int(str(event.get("run_id")))
+        elif event_type in _TERMINAL_ATTEMPT_EVENTS:
+            # 重试中的尝试不计入进度，等到终态再更新。
+            if str(event.get("status")) == "retrying":
+                return
+            self._finished_keywords += 1
+            platform = PLATFORM_NAMES.get(str(event.get("platform")), "")
+            keyword = str(event.get("keyword") or "")
+            self.run_status.setText(
+                f"巡检进行中 · 已完成 {self._finished_keywords} 个关键词检索"
+                + (f"（最新：{platform} {keyword}）" if keyword else "")
+            )
+        elif event_type == "scan.finished":
+            self.run_status.setText(
+                "巡检已完成" if event.get("status") == "succeeded" else "巡检未完成"
+            )
+        elif event_type in {
+            "scan.session_status",
+            "scan.account_not_ready",
+            "scan.browser_error",
+        }:
+            message = str(event.get("message") or "巡检遇到问题，请查看运行详情")
+            self.run_status.setText(message[:120])
 
     def read_error(self) -> None:
         value = decode_process_output(self.process.readAllStandardError())
@@ -589,6 +620,11 @@ class SchedulerPage(QWidget):
         cursor.insertText(value)
 
     def process_finished(self, exit_code: int, _status: QProcess.ExitStatus) -> None:
+        # 子进程可能在最后一行没有换行就退出了，这里补投一次，否则末尾的
+        # scan.finished 会连带 run_id 一起丢掉。
+        if self._pending_line:
+            trailing, self._pending_line = self._pending_line, ""
+            self._dispatch_event(trailing)
         was_stopped = self._stop_requested
         cancelled = False
         if was_stopped:

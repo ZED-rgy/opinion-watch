@@ -1,5 +1,8 @@
 import json
+from datetime import UTC, datetime
 from pathlib import Path
+
+import pytest
 
 from opinion_watch.classification import classify_batch
 from opinion_watch.models import CollectedContent, OpinionCategory, Platform, RiskSeverity
@@ -59,6 +62,31 @@ def test_cancel_scan_run_closes_attempts_and_releases_worker_leases(tmp_path: Pa
     with storage.connect() as connection:
         assert connection.execute("SELECT COUNT(*) FROM task_leases").fetchone()[0] == 0
     assert not storage.cancel_scan_run(run_id)
+
+
+def test_terminate_scan_run_marks_attempts_without_deleting_new_owner_lease(
+    tmp_path: Path,
+) -> None:
+    storage = make_storage(tmp_path)
+    run_id = storage.create_scan_run(
+        trigger="manual", platforms=["douyin"], brands=["速探长"], options={}
+    )
+    storage.create_scan_attempt(run_id=run_id, platform="douyin", keyword="速探长", attempt_no=1)
+    assert storage.acquire_task_lease("scan", "new-owner")
+
+    assert storage.terminate_scan_run(
+        run_id,
+        status="interrupted",
+        reason="任务租约丢失",
+    )
+
+    run = storage.get_scan_run(run_id)
+    assert run is not None
+    assert run["status"] == "interrupted"
+    assert run["attempts"][0]["status"] == "interrupted"
+    with storage.connect() as connection:
+        lease = connection.execute("SELECT owner FROM task_leases WHERE name = 'scan'").fetchone()
+    assert lease is not None and lease["owner"] == "new-owner"
 
 
 def test_platform_accounts_are_isolated_records(tmp_path: Path) -> None:
@@ -129,6 +157,26 @@ def test_content_match_uses_brand_separately_from_search_keyword(tmp_path: Path)
             """
         ).fetchone()
     assert tuple(match) == ("速探长", "速探长物流")
+
+
+def test_strict_content_upsert_does_not_create_unknown_brand(tmp_path: Path) -> None:
+    storage = make_storage(tmp_path)
+    storage.add_brand("速探长")
+    item = CollectedContent(
+        platform=Platform.DOUYIN,
+        content_id="unknown-brand",
+        url="https://example.test/unknown-brand",
+        title="未知品牌内容",
+        source_keyword="幽灵品牌",
+        brand_name="幽灵品牌",
+    )
+
+    with pytest.raises(ValueError, match="品牌不存在"):
+        storage.upsert_contents([item], allow_brand_creation=False)
+
+    assert [brand["name"] for brand in storage.list_brands()] == ["速探长"]
+    with storage.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM content_items").fetchone()[0] == 0
 
 
 def test_content_match_keeps_multiple_keywords_for_one_brand(tmp_path: Path) -> None:
@@ -303,6 +351,43 @@ def test_notifications_and_manual_assessments_support_crud_and_bulk_actions(
     assert storage.count_unread_notifications() == 0
     assert storage.delete_notifications([first, second]) == 2
 
+
+def test_notifications_can_be_filtered_by_channel(tmp_path: Path) -> None:
+    storage = make_storage(tmp_path)
+    storage.create_notification(severity="info", title="人工", message="正文")
+    storage.create_alert(kind="browser_error", severity="warning", message="浏览器异常")
+
+    assert len(storage.list_notifications(channel="manual")) == 1
+    assert len(storage.list_notifications(channel="system")) == 1
+    assert storage.list_notifications(channel="opinion") == []
+
+
+def test_notification_boundary_migration_removes_legacy_p3_opinion_broadcasts(
+    tmp_path: Path,
+) -> None:
+    storage = make_storage(tmp_path)
+    with storage.connect() as connection:
+        connection.execute("DELETE FROM schema_migrations WHERE version = 7")
+        connection.execute(
+            """
+            INSERT INTO app_notifications(
+                kind, severity, title, message, entity_type, entity_id, created_at
+            ) VALUES ('opinion_review', 'P3', '旧播报', '仅是候选', 'content_item', '1', ?)
+            """,
+            (datetime.now(UTC).isoformat(),),
+        )
+
+    storage.initialize()
+
+    assert storage.list_notifications(channel="opinion") == []
+    with storage.connect() as connection:
+        row = connection.execute(
+            "SELECT read_at FROM app_notifications WHERE title = '旧播报'"
+        ).fetchone()
+    assert row is not None
+    assert row["read_at"] is not None
+
+    storage.add_brand("示例品牌")
     content_id = storage.create_manual_assessment(
         platform=Platform.DOUYIN.value,
         title="人工录入的舆情",
@@ -812,3 +897,12 @@ def test_initialize_recovers_from_interrupted_migration(tmp_path: Path) -> None:
     with reopened.connect() as connection:
         version = connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
     assert int(version) == 2
+
+
+def test_initialize_rejects_unrecoverable_migration_gap(tmp_path: Path) -> None:
+    storage = make_storage(tmp_path)
+    with storage.connect() as connection:
+        connection.execute("DELETE FROM schema_migrations WHERE version = 4")
+
+    with pytest.raises(RuntimeError, match="缺少版本：4"):
+        Storage(tmp_path / "test.db").initialize()

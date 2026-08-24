@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
+import math
 import random
 import uuid
 from collections.abc import Sequence
@@ -10,7 +10,10 @@ from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
 
-from opinion_watch.browser import BrowserSession
+from playwright.async_api import Page
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+
+from opinion_watch.browser import BrowserProfileLocked, BrowserSession, summarize_browser_error
 from opinion_watch.classification import (
     brand_matches_card,
     classify_batch,
@@ -22,6 +25,7 @@ from opinion_watch.collectors.base import BaseCollector, CollectorRuntimeError
 from opinion_watch.config import Settings
 from opinion_watch.events import serialize_event
 from opinion_watch.llm import LLMAssessment, LLMCallBudget, classify_with_llm, screen_items_with_llm
+from opinion_watch.maintenance import run_maintenance
 from opinion_watch.models import (
     CollectedContent,
     Platform,
@@ -31,58 +35,6 @@ from opinion_watch.models import (
 )
 from opinion_watch.storage import Storage
 from opinion_watch.wecom import send_daily_report_if_due
-
-
-def _collector_search_kwargs(
-    collector: object,
-    *,
-    limit: int,
-    artifact_dir: object,
-    diagnostic_key: str,
-) -> dict[str, object]:
-    """兼容离线测试替身，同时让真实采集器获得诊断参数。"""
-    kwargs: dict[str, object] = {"limit": limit}
-    parameters = inspect.signature(collector.search).parameters  # type: ignore[attr-defined]
-    if "artifact_dir" in parameters:
-        kwargs["artifact_dir"] = artifact_dir
-    if "diagnostic_key" in parameters:
-        kwargs["diagnostic_key"] = diagnostic_key
-    return kwargs
-
-
-def _collector_search_quality(collector: object, items: list[CollectedContent]) -> dict[str, Any]:
-    quality = getattr(collector, "search_quality", None)
-    if callable(quality):
-        return quality(items)
-    return BaseCollector.search_quality(items)
-
-
-def _pop_search_diagnostic(collector: object, key: str) -> str | None:
-    pop = getattr(collector, "pop_search_diagnostic", None)
-    return pop(key) if callable(pop) else None
-
-
-def _collector_enrich_kwargs(
-    collector: object,
-    *,
-    detail_limit: int,
-    comments_limit: int,
-    detail_candidate_ids: set[str],
-    artifact_dir: object,
-    search_page: object,
-) -> dict[str, object]:
-    """Pass new detail-audit arguments without breaking offline collector fakes."""
-    kwargs: dict[str, object] = {
-        "detail_limit": detail_limit,
-        "comments_limit": comments_limit,
-        "detail_candidate_ids": detail_candidate_ids,
-    }
-    parameters = inspect.signature(collector.enrich_items).parameters  # type: ignore[attr-defined]
-    if "artifact_dir" in parameters:
-        kwargs["artifact_dir"] = artifact_dir
-    if "search_page" in parameters:
-        kwargs["search_page"] = search_page
-    return kwargs
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,14 +75,115 @@ class ScanOptions:
 _BLOCKING_STATUSES = {
     SessionStatus.LOGIN_REQUIRED,
     SessionStatus.VERIFICATION_REQUIRED,
+    SessionStatus.CAPTCHA_REQUIRED,
     SessionStatus.RATE_LIMITED,
 }
+
+_WARNING_KIND_NAMES = {
+    "zero_detail_coverage": "详情覆盖不足",
+    "coverage_shortfall": "检索结果不足",
+    "search_data_quality": "搜索卡片质量异常",
+    "zero_results": "检索结果为空",
+}
+# 可见卡片数达到目标数的这一比例即视为覆盖正常。平台首屏本就会掺入
+# "相关搜索"等非内容卡片并被采集器跳过，要求严格等于目标数会把每个
+# 关键词都变成一条告警。
+_COVERAGE_SHORTFALL_RATIO = 0.6
+_WORKER_LEASE_SECONDS = 180
+_WORKER_HEARTBEAT_SECONDS = 60
+_BASELINE_DETAIL_RATIO = 0.25
+_BASELINE_DETAIL_MAX = 10
+
+
+async def _heartbeat_lease(
+    storage: Storage,
+    name: str,
+    owner: str,
+    *,
+    cancel_task: asyncio.Task[Any] | None = None,
+    heartbeat_seconds: float = _WORKER_HEARTBEAT_SECONDS,
+) -> None:
+    """Keep a worker lease alive while allowing quick recovery after a crash."""
+    loop = asyncio.get_running_loop()
+    last_success = loop.time()
+    delay = heartbeat_seconds
+    renewal_warning_created = False
+    while True:
+        await asyncio.sleep(delay)
+        try:
+            renewed = storage.heartbeat_task_lease(name, owner, lease_seconds=_WORKER_LEASE_SECONDS)
+        except Exception as exc:
+            # SQLite 短暂写锁不等于租约已丢失，直接让心跳任务崩掉反而会让
+            # 主巡检永远继续运行。短间隔重试；距离租约到期只剩一个心跳
+            # 周期时才停止主任务，给浏览器清理留出安全余量。
+            if not renewal_warning_created:
+                with suppress(Exception):
+                    storage.create_alert(
+                        kind="lease_heartbeat_error",
+                        severity="warning",
+                        message=f"任务租约 {name} 暂时无法续期，正在重试：{exc}",
+                    )
+                renewal_warning_created = True
+            if loop.time() - last_success >= _WORKER_LEASE_SECONDS - _WORKER_HEARTBEAT_SECONDS:
+                renewed = False
+            else:
+                delay = min(5.0, max(0.01, heartbeat_seconds))
+                continue
+        if not renewed:
+            # 续租失败说明租约已经过期并被别人接手，而主流程还在照常抓取——
+            # 此刻很可能有第二个进程在同一个浏览器档案上跑。静默 return 会让
+            # 这种互斥失效完全查不出来，至少要留下一条告警。
+            # 告警写库也可能正处在锁竞争中；它失败不能阻止后面的安全取消。
+            with suppress(Exception):
+                storage.create_alert(
+                    kind="lease_lost",
+                    severity="error",
+                    message=(
+                        f"任务租约 {name} 续租失败，可能已被其他进程接管；"
+                        "本轮结果请人工确认，并检查是否有重复运行的巡检。"
+                    ),
+                )
+            # 告警本身不能恢复互斥。一旦租约已被接管，继续抓取会让两个
+            # worker 同时操作同一个持久化浏览器档案。直接取消主巡检任务，
+            # 由它的 finally 关闭浏览器并释放仍属于自己的其他租约。
+            if cancel_task is not None and not cancel_task.done():
+                cancel_task.cancel(f"lease_lost:{name}")
+            return
+        last_success = loop.time()
+        delay = heartbeat_seconds
+        renewal_warning_created = False
+
+
+async def _prepare_account_status_page(page: Page, collector: BaseCollector) -> None:
+    """在平台首页检查账号状态，避免把搜索路由遮罩误认为账号失效。
+
+    首页往往挂着推荐流和一堆第三方资源，domcontentloaded 超时是常态。
+    这个异常一旦冒泡就会被外层当成 browser_error，整个平台的全部关键词
+    直接跳过。因此只要页面已经离开 about:blank（DOM 已经渲染出可判定的
+    内容），超时就当作可接受；仍然停在空白页时才继续抛出，避免拿空白页
+    去判登录态、把账号误标成已退出。
+    """
+    if str(getattr(page, "url", "")).lower() not in {"", "about:blank"}:
+        return
+    try:
+        await page.goto(
+            collector.home_url,
+            wait_until="domcontentloaded",
+            timeout=30_000,
+        )
+    except PlaywrightTimeoutError:
+        if str(getattr(page, "url", "")).lower() in {"", "about:blank"}:
+            raise
 
 
 def _severity(status: SessionStatus) -> str:
     if status is SessionStatus.LOGIN_REQUIRED:
         return "error"
-    if status in {SessionStatus.VERIFICATION_REQUIRED, SessionStatus.RATE_LIMITED}:
+    if status in {
+        SessionStatus.VERIFICATION_REQUIRED,
+        SessionStatus.CAPTCHA_REQUIRED,
+        SessionStatus.RATE_LIMITED,
+    }:
         return "warning"
     return "error"
 
@@ -378,7 +431,21 @@ async def _screen_items_for_admission(
         else:
             filter_reasons[item.content_id] = "未出现目标品牌"
 
-    for item in baseline_candidates[: max(0, min(2, baseline_limit))]:
+    # 不能每轮都固定抽查搜索排序最前的几条，否则头部内容会被反复打开，
+    # 后面的卡片永远没有详情覆盖。按历史检查次数和最后检查时间排序：
+    # 从未检查 -> 检查次数少 -> 最久未检查 -> 当前搜索顺序。
+    history = storage.detail_sampling_history(baseline_candidates)
+    original_order = {item.content_id: index for index, item in enumerate(baseline_candidates)}
+    baseline_candidates.sort(
+        key=lambda item: (
+            int(history.get((item.platform.value, item.content_id), {}).get("check_count", 0)),
+            str(
+                history.get((item.platform.value, item.content_id), {}).get("last_checked_at") or ""
+            ),
+            original_order[item.content_id],
+        )
+    )
+    for item in baseline_candidates[: max(0, baseline_limit)]:
         screening = dict(item.raw_data.get("screening", {}))
         screening.update({"decision": "保底抽查", "admitted": True})
         item = replace(item, raw_data={**item.raw_data, "screening": screening})
@@ -408,6 +475,16 @@ async def _screen_items_for_admission(
     )
 
 
+def _baseline_detail_limit(search_result_count: int) -> int:
+    """Inspect a bounded rotating sample instead of the same two cards forever."""
+    if search_result_count <= 0:
+        return 0
+    return min(
+        _BASELINE_DETAIL_MAX,
+        max(2, math.ceil(search_result_count * _BASELINE_DETAIL_RATIO)),
+    )
+
+
 async def run_scan(
     settings: Settings,
     storage: Storage,
@@ -420,13 +497,20 @@ async def run_scan(
     options.validate()
     storage.recover_stale_scan_runs()
     owner = str(uuid.uuid4())
-    if not storage.acquire_task_lease("scan", owner):
+    if not storage.acquire_task_lease("scan", owner, lease_seconds=_WORKER_LEASE_SECONDS):
         raise RuntimeError("已有巡检任务正在运行，请等待当前任务完成。")
+    worker_task = asyncio.current_task()
+    heartbeat = asyncio.create_task(
+        _heartbeat_lease(storage, "scan", owner, cancel_task=worker_task)
+    )
     try:
         return await _run_scan_locked(
             settings, storage, platforms, owner=owner, options=options, trigger=trigger
         )
     finally:
+        heartbeat.cancel()
+        with suppress(asyncio.CancelledError):
+            await heartbeat
         storage.release_task_lease("scan", owner)
 
 
@@ -461,7 +545,10 @@ async def _run_scan_locked(
     )
     totals = ScanTotals()
     coverage_shortfalls: list[str] = []
-    llm_budget = LLMCallBudget(int(llm_config.get("max_candidates") or 20))
+    # 预留 1/3 额度给最终复判：粗筛按关键词逐批消耗，排在它后面的复判否则会
+    # 拿到 0 条额度而被静默跳过。至少留 1，保证小额度配置下复判也能跑起来。
+    _llm_limit = int(llm_config.get("max_candidates") or 20)
+    llm_budget = LLMCallBudget(_llm_limit, reserved=max(1, _llm_limit // 3) if _llm_limit else 0)
     run_warning_groups: dict[str, dict[str, Any]] = {}
 
     def record_run_warning(
@@ -504,7 +591,10 @@ async def _run_scan_locked(
 
     try:
         for platform in platforms:
-            storage.heartbeat_task_lease("scan", owner)
+            # 必须显式传租期：默认值是 6 小时，一次省略就把 _heartbeat_lease
+            # 精心维持的 180 秒租约顶成 6 小时。此后进程崩溃会让这个 run 卡在
+            # running 六小时，期间无法再启动任何巡检。
+            storage.heartbeat_task_lease("scan", owner, lease_seconds=_WORKER_LEASE_SECONDS)
             collector = collector_for(platform)
             account = storage.get_scan_account(platform.value)
             if account is None:
@@ -536,7 +626,9 @@ async def _run_scan_locked(
                 selected_account: dict[str, Any] | None = None
                 for candidate_account in ready_accounts:
                     candidate_lease_name = f"account:{int(candidate_account['id'])}"
-                    if not storage.acquire_task_lease(candidate_lease_name, owner):
+                    if not storage.acquire_task_lease(
+                        candidate_lease_name, owner, lease_seconds=_WORKER_LEASE_SECONDS
+                    ):
                         continue
                     try:
                         async with BrowserSession(
@@ -546,9 +638,25 @@ async def _run_scan_locked(
                             artifact_dir=settings.artifact_dir / platform.value,
                         ) as probe_session:
                             probe_page = await probe_session.page()
+                            await _prepare_account_status_page(probe_page, collector)
                             probe_status = await collector.session_status(
                                 probe_page, probe_session.active_context
                             )
+                    except BrowserProfileLocked as exc:
+                        # 档案被占用是瞬时竞争（用户自己开着那个 Chrome 窗口），
+                        # 不是账号登录态问题。绝不能改成 error——那会让账号从
+                        # list_scan_accounts 里掉出去，直到人工重新登录才回来。
+                        storage.create_alert(
+                            run_id=run_id,
+                            platform=platform.value,
+                            kind="account_busy",
+                            severity="warning",
+                            message=(
+                                f"{platform.value} 账号 #{candidate_account['id']} "
+                                f"的浏览器档案正在被占用，本轮跳过：{exc}"
+                            ),
+                        )
+                        continue
                     except Exception as exc:
                         storage.update_account_status(int(candidate_account["id"]), "error")
                         storage.create_alert(
@@ -582,7 +690,9 @@ async def _run_scan_locked(
                     continue
                 account = selected_account
             account_lease_name = f"account:{int(account['id'])}"
-            if not storage.acquire_task_lease(account_lease_name, owner):
+            if not storage.acquire_task_lease(
+                account_lease_name, owner, lease_seconds=_WORKER_LEASE_SECONDS
+            ):
                 totals.failed += 1
                 storage.create_alert(
                     run_id=run_id,
@@ -592,6 +702,14 @@ async def _run_scan_locked(
                     message=f"{platform.value} 账号浏览器档案正在被其他任务使用。",
                 )
                 continue
+            account_heartbeat = asyncio.create_task(
+                _heartbeat_lease(
+                    storage,
+                    account_lease_name,
+                    owner,
+                    cancel_task=asyncio.current_task(),
+                )
+            )
             try:
                 async with BrowserSession(
                     settings.account_profile_dir(platform, int(account["id"])),
@@ -600,6 +718,7 @@ async def _run_scan_locked(
                     artifact_dir=settings.artifact_dir / platform.value,
                 ) as session:
                     page = await session.page()
+                    await _prepare_account_status_page(page, collector)
                     session_status = await collector.session_status(page, session.active_context)
                     if session_status is not SessionStatus.HEALTHY:
                         totals.failed += 1
@@ -631,7 +750,7 @@ async def _run_scan_locked(
                     prefetched_search: dict[str, list[CollectedContent] | Exception] = {}
                     prefetched_started_at: dict[str, str] = {}
                     prefetched_diagnostics: dict[str, str | None] = {}
-                    prefetched_pages: dict[str, object] = {}
+                    prefetched_pages: dict[str, Page] = {}
                     if options.concurrency > 1 and len(targets) > 1:
                         # Keep one persistent profile/context per account, but use
                         # separate tabs for independent keyword searches. This is
@@ -648,7 +767,7 @@ async def _run_scan_locked(
                             ),
                             started_at_cache: dict[str, str] = prefetched_started_at,
                             diagnostics_cache: dict[str, str | None] = prefetched_diagnostics,
-                            pages_cache: dict[str, object] = prefetched_pages,
+                            pages_cache: dict[str, Page] = prefetched_pages,
                             target_platform: str = platform.value,
                             target_collector=collector,
                         ) -> None:
@@ -664,15 +783,12 @@ async def _run_scan_locked(
                                         prefetch_page,
                                         session.active_context,
                                         keyword,
-                                        **_collector_search_kwargs(
-                                            target_collector,
-                                            limit=options.limit,
-                                            artifact_dir=settings.artifact_dir / target_platform,
-                                            diagnostic_key=cache_key,
-                                        ),
+                                        limit=options.limit,
+                                        artifact_dir=settings.artifact_dir / target_platform,
+                                        diagnostic_key=cache_key,
                                     )
-                                    diagnostics_cache[cache_key] = _pop_search_diagnostic(
-                                        target_collector, cache_key
+                                    diagnostics_cache[cache_key] = (
+                                        target_collector.pop_search_diagnostic(cache_key)
                                     )
                                     # Keep the page alive: detail enrichment must click
                                     # the same live card that produced these candidates.
@@ -732,14 +848,11 @@ async def _run_scan_locked(
                                         detail_search_page,
                                         session.active_context,
                                         keyword,
-                                        **_collector_search_kwargs(
-                                            collector,
-                                            limit=options.limit,
-                                            artifact_dir=settings.artifact_dir / platform.value,
-                                            diagnostic_key=cache_key,
-                                        ),
+                                        limit=options.limit,
+                                        artifact_dir=settings.artifact_dir / platform.value,
+                                        diagnostic_key=cache_key,
                                     )
-                                    diagnostic_path = _pop_search_diagnostic(collector, cache_key)
+                                    diagnostic_path = collector.pop_search_diagnostic(cache_key)
                                 search_items = [
                                     replace(item, brand_name=brand) for item in search_items
                                 ]
@@ -755,7 +868,7 @@ async def _run_scan_locked(
                                     for item in search_items
                                     if item.content_id not in ignored_ids
                                 ]
-                                quality = _collector_search_quality(collector, search_items)
+                                quality = collector.search_quality(search_items)
                                 if quality["needs_diagnostic"] and quality["total"] > 0:
                                     diagnostic_path = diagnostic_path or next(
                                         (
@@ -772,7 +885,7 @@ async def _run_scan_locked(
                                         f"（{quality['empty_title_ratio']:.0%}），"
                                         "搜索卡片文本质量不足，已保存搜索页诊断。"
                                     )
-                                    if quality["all_titles_empty"]:
+                                    if quality["no_usable_text"]:
                                         storage.save_scan_candidates(
                                             run_id=run_id,
                                             attempt_id=attempt_id,
@@ -815,10 +928,18 @@ async def _run_scan_locked(
                                             )
                                         )
                                         break
-                                    if quality["empty_title_ratio"] >= 0.3:
+                                    if quality["degrades_run"]:
                                         quality_partial = True
+                                        # 标题为空但卡片原文尚在时，品牌匹配仍然
+                                        # 成立。只丢弃真正没有任何可判断文本的卡片，
+                                        # 否则一次标题选择器退化就会静默漏掉舆情。
                                         search_items = [
-                                            item for item in search_items if item.title.strip()
+                                            item
+                                            for item in search_items
+                                            if item.title.strip()
+                                            or str(
+                                                item.raw_data.get("search_card_text") or ""
+                                            ).strip()
                                         ]
                                 storage.save_scan_candidates(
                                     run_id=run_id,
@@ -834,7 +955,7 @@ async def _run_scan_locked(
                                     search_items,
                                     brand=brand,
                                     budget=llm_budget,
-                                    baseline_limit=2,
+                                    baseline_limit=_baseline_detail_limit(len(search_items)),
                                 )
                                 screening_stats["filter_reasons"].update(ignored_filter_reasons)
                                 detail_ids = _select_detail_candidates(
@@ -869,16 +990,11 @@ async def _run_scan_locked(
                                 enriched_items = await collector.enrich_items(
                                     session.active_context,
                                     items,
-                                    **_collector_enrich_kwargs(
-                                        collector,
-                                        detail_limit=options.detail_limit,
-                                        comments_limit=options.comments_limit,
-                                        detail_candidate_ids=detail_ids,
-                                        artifact_dir=settings.artifact_dir
-                                        / platform.value
-                                        / "media",
-                                        search_page=detail_search_page,
-                                    ),
+                                    detail_limit=options.detail_limit,
+                                    comments_limit=options.comments_limit,
+                                    detail_candidate_ids=detail_ids,
+                                    artifact_dir=settings.artifact_dir / platform.value / "media",
+                                    search_page=detail_search_page,
                                 )
                                 items, detail_filter_reasons, final_suspected_count = (
                                     _recheck_detail_items(enriched_items, brand=brand)
@@ -927,7 +1043,7 @@ async def _run_scan_locked(
                                     filter_reasons=screening_stats["filter_reasons"],
                                     detail_audits=detail_audits,
                                 )
-                                stats = storage.upsert_contents(items)
+                                stats = storage.upsert_contents(items, allow_brand_creation=False)
                                 if screening_stats["model_errors"]:
                                     storage.create_alert(
                                         run_id=run_id,
@@ -990,9 +1106,12 @@ async def _run_scan_locked(
                                     continue
 
                                 totals.failed += 1
-                                storage.update_account_status(
-                                    int(account["id"]), _account_status(exc.status)
-                                )
+                                # 搜索路由的登录遮罩、限流和页面错误不代表账号
+                                # 已退出。只有明确的登录失效才能覆盖账号状态。
+                                if exc.status is SessionStatus.LOGIN_REQUIRED:
+                                    storage.update_account_status(
+                                        int(account["id"]), _account_status(exc.status)
+                                    )
                                 storage.create_alert(
                                     run_id=run_id,
                                     attempt_id=attempt_id,
@@ -1107,7 +1226,6 @@ async def _run_scan_locked(
                                             f"{platform.value}-zero-detail",
                                         )
                                         coverage_diagnostic = str(captured) if captured else None
-                                    coverage_shortfalls.append(detail_coverage_message)
                                     record_run_warning(
                                         "zero_detail_coverage",
                                         detail_coverage_message,
@@ -1119,12 +1237,17 @@ async def _run_scan_locked(
                                 # search. Warn when the platform returned a
                                 # partial page, which is the actionable case
                                 # for coverage and loading diagnostics.
-                                if 0 < scanned_count < options.limit:
+                                #
+                                # 采集器会主动跳过"相关搜索"等噪声卡片，所以满页
+                                # 也常常只剩 16-18 条有效卡片。把目标数当硬下限会
+                                # 让每个关键词都告警一次，真正的覆盖问题反而被淹没。
+                                # 只有明显低于目标时才值得人工核查。
+                                coverage_floor = int(options.limit * _COVERAGE_SHORTFALL_RATIO)
+                                if 0 < scanned_count < coverage_floor:
                                     shortfall = (
                                         f"{platform.value}/{keyword} 实际检索 {scanned_count} 条，"
                                         f"低于目标 {options.limit} 条"
                                     )
-                                    coverage_shortfalls.append(shortfall)
                                     record_run_warning(
                                         "coverage_shortfall",
                                         "平台当前可见结果不足目标数量，已完成可见范围扫描："
@@ -1237,15 +1360,46 @@ async def _run_scan_locked(
                             await asyncio.sleep(
                                 options.brand_delay_seconds * random.uniform(0.7, 1.6)
                             )
+                    # 预取会为每个关键词开一个常驻标签页，正常路径上逐个处理、逐个关闭。
+                    # 但 platform_blocked 会直接 break，剩下的标签页没人认领，只能等
+                    # 整个上下文关闭时才回收；被限流时这恰恰是最不该继续占着资源的时刻。
+                    for leftover in prefetched_pages.values():
+                        with suppress(Exception):
+                            await leftover.close()
+                    prefetched_pages.clear()
+            except BrowserProfileLocked as exc:
+                totals.failed += 1
+                message = f"账号浏览器档案正在使用，未改动账号登录状态：{exc}"
+                storage.create_alert(
+                    run_id=run_id,
+                    platform=platform.value,
+                    kind="account_busy",
+                    severity="warning",
+                    message=message,
+                )
+                print(
+                    serialize_event(
+                        "scan.browser_error",
+                        {
+                            "run_id": run_id,
+                            "platform": platform.value,
+                            "status": "account_busy",
+                            "message": f"{platform.value}：{message}",
+                        },
+                        ensure_ascii=False,
+                    )
+                )
             except Exception as exc:
                 totals.failed += 1
-                storage.update_account_status(int(account["id"]), "error")
+                # 浏览器进程异常、Chrome 更新或机器资源问题不能证明账号已
+                # 退出登录。保留上一次可信的账号状态，避免界面误报“登录异常”。
+                message = summarize_browser_error(exc)
                 storage.create_alert(
                     run_id=run_id,
                     platform=platform.value,
                     kind="browser_error",
                     severity="error",
-                    message=str(exc),
+                    message=message,
                 )
                 print(
                     serialize_event(
@@ -1254,25 +1408,30 @@ async def _run_scan_locked(
                             "run_id": run_id,
                             "platform": platform.value,
                             "status": "browser_error",
-                            "message": str(exc),
+                            "message": f"{platform.value}：{message}",
                         },
                         ensure_ascii=False,
                     )
                 )
             finally:
+                account_heartbeat.cancel()
+                with suppress(asyncio.CancelledError):
+                    await account_heartbeat
                 storage.release_task_lease(account_lease_name, owner)
-    except asyncio.CancelledError:
-        storage.finish_scan_run(
+    except asyncio.CancelledError as exc:
+        cancellation_reason = str(exc)
+        lease_lost = cancellation_reason.startswith("lease_lost:")
+        message = (
+            f"任务租约丢失，巡检已中止（{cancellation_reason.removeprefix('lease_lost:')}）"
+            if lease_lost
+            else "任务被取消"
+        )
+        storage.terminate_scan_run(
             run_id,
-            status=ScanRunStatus.CANCELLED.value,
-            scanned=totals.scanned,
-            collected=totals.collected,
-            filtered=totals.filtered,
-            inserted=totals.inserted,
-            updated=totals.updated,
-            succeeded=totals.succeeded,
-            failed=totals.failed,
-            error_message="任务被取消",
+            status=(
+                ScanRunStatus.INTERRUPTED.value if lease_lost else ScanRunStatus.CANCELLED.value
+            ),
+            reason=message,
         )
         raise
 
@@ -1280,8 +1439,11 @@ async def _run_scan_locked(
         messages = group["messages"]
         if not messages:
             continue
-        if totals.partial > 0:
-            summary = f"本轮巡检共 {len(messages)} 项{kind}：\n" + "\n".join(
+        # 同类告警始终合并成一条。每个关键词各发一条时，播报页会被同一个
+        # 问题的多条重复消息刷屏，而合并后的摘要保留了全部明细。
+        if len(messages) > 1:
+            kind_name = _WARNING_KIND_NAMES.get(kind, kind)
+            summary = f"本轮巡检共 {len(messages)} 项{kind_name}：\n" + "\n".join(
                 f"- {message}" for message in messages
             )
             messages = [summary]
@@ -1384,6 +1546,19 @@ async def _run_scan_locked(
         classification_summary=classification_summary,
         model_summary=model_summary,
     )
+    if storage.maintenance_due("retention"):
+        try:
+            run_maintenance(storage, settings.artifact_dir)
+            storage.mark_maintenance_succeeded("retention")
+        except Exception as exc:
+            # 数据治理失败不能抹掉已经完成的巡检，但必须可见，避免磁盘在后台
+            # 无上限增长。
+            storage.create_alert(
+                run_id=run_id,
+                kind="maintenance_error",
+                severity="warning",
+                message=f"历史候选或诊断文件清理失败：{exc}",
+            )
     wecom_report_sent = False
     if trigger in {"watch", "manual"} and status in {
         ScanRunStatus.SUCCEEDED,

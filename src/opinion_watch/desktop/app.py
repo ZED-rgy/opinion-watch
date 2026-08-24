@@ -70,10 +70,14 @@ def main() -> None:
     app.setFont(QFont(FONT_FAMILY, FONT_SIZE_PT))
     app.setStyleSheet(build_stylesheet())
     runtime = create_runtime(args.runtime_dir)
+    window = MainWindow(runtime.settings, runtime.storage)
+    # 顺序有意义：aboutToQuit 按连接顺序回调。先收巡检子进程，再放桌面租约，
+    # 否则下一次启动可能在旧巡检还占着浏览器档案时就通过单实例检查。
+    app.aboutToQuit.connect(window.scheduler.shutdown)
+    app.aboutToQuit.connect(window.shutdown)
     app.aboutToQuit.connect(
         lambda: runtime.storage.release_task_lease("desktop", runtime.lease_owner)
     )
-    window = MainWindow(runtime.settings, runtime.storage)
     window.navigation.setCurrentRow(args.page)
     _start_lease_heartbeat(runtime, window)
     if not args.smoke_test:

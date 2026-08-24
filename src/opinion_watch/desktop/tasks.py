@@ -52,6 +52,7 @@ class StorageTaskRunner(QObject):
         self._worker.finished.connect(self._on_finished)
         self._worker.failed.connect(self._on_failed)
         self._request_id = 0
+        self._closing = False
         self._callbacks: dict[int, tuple[Callable[[Any], None], Callable[[str], None] | None]] = {}
         self._thread.start()
         # 应用退出时随线程一起收尾；destroyed 信号里 self 已不可用，
@@ -60,7 +61,7 @@ class StorageTaskRunner(QObject):
 
         def _stop_thread() -> None:
             thread.quit()
-            thread.wait(2_000)
+            thread.wait()
 
         self.destroyed.connect(_stop_thread)
 
@@ -73,6 +74,10 @@ class StorageTaskRunner(QObject):
         cancel_key: str | None = None,
     ) -> None:
         """提交后台任务。同 cancel_key 的旧请求结果会被丢弃。"""
+        if self._closing:
+            if on_error is not None:
+                on_error("应用正在退出，后台查询已取消")
+            return
         self._request_id += 1
         request_id = self._request_id
         if cancel_key is not None:
@@ -100,6 +105,11 @@ class StorageTaskRunner(QObject):
             entry[1](message)
 
     def shutdown(self) -> None:
+        if self._closing:
+            return
+        self._closing = True
         self._callbacks.clear()
         self._thread.quit()
-        self._thread.wait(2_000)
+        # SQLite 连接有 5 秒 busy_timeout。这里等待工作线程真正结束，不能让
+        # QApplication 在查询仍执行时销毁 QThread，后者会导致原生层崩溃。
+        self._thread.wait()

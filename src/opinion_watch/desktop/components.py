@@ -86,13 +86,21 @@ def make_table(
 
 @contextmanager
 def populate(table: QTableWidget) -> Iterator[QTableWidget]:
-    """填充期间禁用排序，避免行在写入过程中被重新排列。"""
+    """填充期间禁用排序并屏蔽信号，避免行被重排、也避免 O(行数²) 的重算。
+
+    bind_checked 挂在 itemChanged 上，而它每次都要遍历全表统计勾选状态。填充时
+    每个 setItem 都会触发一轮全表遍历，千行表格能把主线程卡住几秒。填充结束后
+    统一发一次 layoutChanged，让监听方补上最后一次刷新。
+    """
     sorting = table.isSortingEnabled()
     table.setSortingEnabled(False)
+    blocked = table.blockSignals(True)
     try:
         yield table
     finally:
+        table.blockSignals(blocked)
         table.setSortingEnabled(sorting)
+        table.model().layoutChanged.emit()
 
 
 def set_text_cell(
@@ -182,6 +190,9 @@ def bind_checked(table: QTableWidget, *widgets: QWidget) -> None:
 
     table.itemChanged.connect(lambda _item: apply())
     table.model().rowsRemoved.connect(lambda *_args: apply())
+    # populate() 填充期间屏蔽了 itemChanged，结束时补发 layoutChanged；
+    # 不接这个信号的话，重新填充后按钮会停在上一批数据的启用状态。
+    table.model().layoutChanged.connect(lambda *_args: apply())
     apply()
 
 

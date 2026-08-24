@@ -96,6 +96,7 @@ def build_daily_report(storage: Storage, report_date: str | None = None) -> str:
             LEFT JOIN content_matches cm ON cm.content_item_id = ci.id
             LEFT JOIN brands b ON b.id = cm.brand_id
             WHERE ci.last_seen_at >= ? AND ci.last_seen_at < ?
+              AND ci.deleted_at IS NULL AND ci.ignored_at IS NULL
               AND oa.severity IN ('P0', 'P1', 'P2')
             GROUP BY oa.content_item_id, oa.severity, oa.category, ci.title, ci.url
             ORDER BY CASE oa.severity

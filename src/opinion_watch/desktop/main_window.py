@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from PySide6.QtCore import QProcess, QSize, Qt
+from PySide6.QtCore import QProcess, QSize, Qt, QTimer
 from PySide6.QtGui import QColor, QKeySequence, QPainter, QShortcut
 from PySide6.QtWidgets import (
     QFrame,
@@ -173,6 +173,11 @@ class MainWindow(QMainWindow):
             refresh_shortcut.activated.connect(self.refresh_current_page)
         self.navigation.setCurrentRow(Page.SCHEDULER)
         self.update_global_status()
+        self._external_data_signature = self._data_signature()
+        self._external_refresh_timer = QTimer(self)
+        self._external_refresh_timer.setInterval(15_000)
+        self._external_refresh_timer.timeout.connect(self._poll_external_changes)
+        self._external_refresh_timer.start()
 
     def _sync_account_profile_status(self) -> None:
         for account in self.storage.list_accounts():
@@ -222,10 +227,31 @@ class MainWindow(QMainWindow):
         self.nav_items[Page.NOTIFICATIONS].setData(BADGE_ROLE, unread_count)
         self.navigation.viewport().update()
 
+    def _data_signature(self) -> tuple[int | None, int]:
+        runs = self.storage.list_scan_runs(limit=1)
+        latest_run_id = int(runs[0]["id"]) if runs else None
+        return latest_run_id, self.storage.count_unread_notifications()
+
+    def _poll_external_changes(self) -> None:
+        """Refresh when a Codex task or another process writes to SQLite."""
+        signature = self._data_signature()
+        if signature == self._external_data_signature:
+            return
+        self._external_data_signature = signature
+        self.on_data_changed()
+
     def refresh_all(self) -> None:
         """保留给外部调用（如登录窗口回调）的全量刷新入口。"""
         self.update_global_status()
         self.refresh_current_page()
+
+    def shutdown(self) -> None:
+        """Stop non-scan background work before Qt starts destroying widgets."""
+        self._external_refresh_timer.stop()
+        for window in tuple(self.browser_windows.values()):
+            window.shutdown()
+            window.close()
+        self.opinions.tasks.shutdown()
 
     def open_account_browser(self, account: dict[str, Any]) -> None:
         account_id = int(account["id"])

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from contextlib import suppress
+from typing import Any
 from urllib.parse import quote
 
 from playwright.async_api import Error as PlaywrightError
@@ -9,7 +10,7 @@ from playwright.async_api import Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from opinion_watch.collectors.base import BaseCollector
-from opinion_watch.models import AnchorCandidate, Platform
+from opinion_watch.models import AnchorCandidate, CollectedContent, Platform
 
 
 class XiaohongshuCollector(BaseCollector):
@@ -67,12 +68,79 @@ class XiaohongshuCollector(BaseCollector):
         '[class*="swiper" i]',
     )
 
+    @staticmethod
+    def search_quality(items: list[CollectedContent]) -> dict[str, Any]:
+        """Tolerate normal image-only notes without hiding selector regressions.
+
+        小红书允许正文标题为空、只在封面图中放文字。30% 空标题仍保存诊断
+        截图，但不应把整轮巡检判成 partial；接近整页丢失标题时才降级。
+        """
+        quality = BaseCollector.search_quality(items)
+        quality["degrades_run"] = bool(quality["no_usable_text"]) or (
+            float(quality["empty_title_ratio"]) >= 0.8
+        )
+        return quality
+
     def build_search_url(self, keyword: str) -> str:
         encoded = quote(keyword)
         return (
             "https://www.xiaohongshu.com/search_result"
             f"?keyword={encoded}&source=web_search_result_notes"
         )
+
+    # 卡片页脚的时间戳形态很多："08-03"、"2025-12-03"、"昨天 13:10"、
+    # "3天前"、"19小时前"、"刚刚"。作者节点经常把它们一起包进来。
+    _AUTHOR_TRAILING_TIME = re.compile(
+        r"(?:\s|^)(?:"
+        r"\d{4}-\d{2}-\d{2}|\d{2}-\d{2}"
+        r"|(?:昨天|今天|前天)(?:\s*\d{1,2}:\d{2})?"
+        r"|\d+\s*(?:分钟|小时|天|周|个月|月|年)前"
+        r"|刚刚"
+        r")(?:\s*\d{1,2}:\d{2})?\s*$"
+    )
+    # 单独成行时不构成标题的卡片元素：媒体标记、互动数、时间戳。
+    _CARD_NOISE_TOKEN = re.compile(
+        r"^(?:图文|视频|笔记|直播|关注|分享|收藏|评论|赞|点赞"
+        r"|\d+(?:\.\d+)?[万亿]?"
+        r"|\d{4}-\d{2}-\d{2}|\d{2}-\d{2}"
+        r"|(?:昨天|今天|前天)(?:\s*\d{1,2}:\d{2})?"
+        r"|\d+\s*(?:分钟|小时|天|周|个月|月|年)前"
+        r"|刚刚"
+        r"|\d{1,2}:\d{2})$"
+    )
+
+    @classmethod
+    def _normalize_author_name(cls, value: str) -> str:
+        """剥掉作者名尾部的发布时间。
+
+        小红书卡片的作者节点常常连着时间戳一起渲染，直接入库会得到
+        "boss炸雷 04-24" 这种作者名，既无法聚合同一作者，也会让标题
+        回退逻辑把整行误当成标题。
+        """
+        cleaned = " ".join(value.split()).lstrip("@").strip()
+        # 时间戳可能叠加（"昨天 13:10"），重复剥离直到稳定。
+        while True:
+            stripped = cls._AUTHOR_TRAILING_TIME.sub("", cleaned).strip()
+            if stripped == cleaned:
+                return cleaned
+            cleaned = stripped
+
+    @classmethod
+    def _is_author_echo_title(cls, title: str, author: str) -> bool:
+        """判断标题是否只是"作者名 + 时间 + 互动数"的回声。
+
+        卡片没有标题节点时，回退逻辑会取最长的一行，而图文笔记的最长行
+        往往就是作者行。这类标题不含任何正文信息，却会让空标题质量闸门
+        误判为"解析正常"，从而掩盖选择器失效。
+        """
+        title = " ".join(title.split())
+        author = " ".join(author.split())
+        if not title or not author or not title.startswith(author):
+            return False
+        remainder = title[len(author) :].strip()
+        if not remainder:
+            return True
+        return all(cls._CARD_NOISE_TOKEN.match(token) for token in remainder.split())
 
     async def _open_search_page(self, page: Page, search_url: str, keyword: str) -> None:
         """优先在首页搜索框中输入关键词搜索。
@@ -198,13 +266,25 @@ class XiaohongshuCollector(BaseCollector):
             """,
         )
         return [
-            AnchorCandidate(
-                href=str(item.get("href", "")),
-                text=str(item.get("text", "")),
-                media_kind=str(item.get("media_kind", "")),
-                author_name=str(item.get("author_name", "")),
-                raw_text=str(item.get("raw_text", "")),
+            candidate
+            for candidate in (
+                self._anchor_from_raw_item(item) for item in raw_items if item.get("href")
             )
-            for item in raw_items
-            if item.get("href")
+            if candidate is not None
         ]
+
+    def _anchor_from_raw_item(self, item: dict[str, object]) -> AnchorCandidate | None:
+        author_name = self._normalize_author_name(str(item.get("author_name", "")))
+        title = " ".join(str(item.get("text", "")).split())
+        # 标题回退到了作者行时，宁可留空也不要写入伪标题：整段卡片文本
+        # 仍然保留在 raw_text 里供品牌匹配使用，而空标题会被质量闸门
+        # 统计出来，选择器失效才不会静默通过。
+        if self._is_author_echo_title(title, author_name):
+            title = ""
+        return AnchorCandidate(
+            href=str(item.get("href", "")),
+            text=title,
+            media_kind=str(item.get("media_kind", "")),
+            author_name=author_name,
+            raw_text=str(item.get("raw_text", "")),
+        )

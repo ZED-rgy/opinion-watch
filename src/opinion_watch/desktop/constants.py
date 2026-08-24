@@ -31,6 +31,7 @@ ACCOUNT_STATUS_NAMES = {
     "ready": "可用",
     "login_required": "需要登录",
     "verification_required": "需要验证",
+    "captcha_required": "需人工完成验证",
     "rate_limited": "访问受限",
     "error": "异常",
 }

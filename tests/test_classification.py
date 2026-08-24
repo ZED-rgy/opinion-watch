@@ -62,6 +62,37 @@ def test_negative_signals_with_brand_mention_keep_high_severity() -> None:
     assert result.requires_review
 
 
+def test_search_card_risk_is_downgraded_until_detail_evidence_exists() -> None:
+    result = classify_content(
+        {
+            "title": "优速卖就是骗子公司，大家别用",
+            "brand_names": ["优速卖"],
+            "raw_data": {"search_card_text": "优速卖就是骗子公司，大家别用"},
+        }
+    )
+
+    assert result.severity is RiskSeverity.P3
+    assert result.requires_review
+    assert "尚无详情证据" in result.rationale
+
+
+def test_search_card_risk_can_be_high_after_detail_evidence() -> None:
+    result = classify_content(
+        {
+            "title": "优速卖就是骗子公司，大家别用",
+            "brand_names": ["优速卖"],
+            "raw_data": {
+                "search_card_text": "优速卖就是骗子公司，大家别用",
+                "detail_collected": True,
+                "description": "正文明确指向优速卖。",
+            },
+        }
+    )
+
+    assert result.severity is RiskSeverity.P1
+    assert result.requires_review
+
+
 def test_rule_classifier_matches_latin_brand_names_case_insensitively() -> None:
     result = classify_content(
         {

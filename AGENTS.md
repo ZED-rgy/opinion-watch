@@ -19,6 +19,7 @@ uv run opinion-watch doctor
 uv run opinion-watch login --platform douyin
 uv run opinion-watch login --platform xiaohongshu
 uv run opinion-watch scan --limit 20
+uv run opinion-watch ingest .\agent-results.jsonl
 uv run opinion-watch watch --interval-minutes 30 --max-runs 1
 uv run opinion-watch run list
 uv run opinion-watch alert list
@@ -50,11 +51,13 @@ uv run pytest
 ## 当前边界
 
 采集 POC 已通过三个品牌、两个平台的真实搜索验收。桌面基础版、品牌多关键词、
-多平台账号记录、独立 Qt 登录档案、舆情中心、人工复核、应用内播报和定时巡检
-已实现。当前自动巡检仍使用原 Playwright 平台档案，尚未直接复用账号级 Qt Profile。
-大模型辅助筛选、媒体证据、候选留痕、企微机器人日报和巡检租约已实现；事件聚类、
-系统托盘和安装包尚未实现。自动举报、申诉及下架跟踪不在当前产品范围。
+多平台账号记录、账号级独立 Playwright 登录档案、舆情中心、人工复核、应用内播报和
+定时巡检已实现。账号登录和自动巡检复用同一账号级 Playwright Profile，不复制 Cookie。
+大模型辅助筛选、媒体证据、候选留痕、企微机器人日报、巡检租约、事件聚类和系统托盘
+已实现；安装包尚未实现。自动举报、申诉及下架跟踪不在当前产品范围。
 
 巡检写入前会保留轻量搜索候选，随后进行规则/大模型筛选，仅对入选内容做详情采集和
 入库；模型调用按单轮巡检共享预算限制。SQLite 使用版本化迁移，初始化不应重置用户的
 品牌、关键词或账号状态；跨进程巡检通过数据库租约互斥，企微日报按日期原子认领以防重复发送。
+外部 Agent 通过 UTF-8 JSONL 导入候选，不能直接写 SQLite；没有详情证据的搜索候选最多
+按 P3 待调查线索处理，不得直接生成 P1/P2 舆情播报。

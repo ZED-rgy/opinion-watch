@@ -11,7 +11,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qs, unquote, urlsplit, urlunsplit
 
 from playwright.async_api import BrowserContext, Page
 from playwright.async_api import Error as PlaywrightError
@@ -81,6 +81,22 @@ class BaseCollector(ABC):
         self._search_diagnostics: dict[str, str] = {}
 
     @staticmethod
+    def _search_access_message(status: SessionStatus) -> str:
+        messages = {
+            SessionStatus.LOGIN_REQUIRED: "搜索页确认账号登录已失效，请重新登录。",
+            SessionStatus.VERIFICATION_REQUIRED: (
+                "搜索页出现登录确认或验证遮罩；已尝试关闭遮罩和备用入口，账号登录状态未改变。"
+            ),
+            SessionStatus.CAPTCHA_REQUIRED: (
+                "平台要求完成人机验证（验证码/滑块）。本轮已停止，请在浏览器中人工完成验证后重试；"
+                "系统不会尝试绕过验证。"
+            ),
+            SessionStatus.RATE_LIMITED: ("平台搜索访问暂时受限，请稍后重试；账号登录状态未改变。"),
+            SessionStatus.ERROR: "平台搜索页暂时异常，请按重试策略再次执行。",
+        }
+        return messages.get(status, f"搜索页状态异常：{status.value}")
+
+    @staticmethod
     def _human_delay_ms(base_ms: int, *, jitter: float = 0.45) -> int:
         """给固定等待加随机抖动；机械的固定节奏是风控的显著特征。"""
         low = int(base_ms * (1 - jitter))
@@ -110,13 +126,16 @@ class BaseCollector(ABC):
 
         if any(phrase in body_text for phrase in self.login_confirmation_phrases):
             return SessionStatus.VERIFICATION_REQUIRED
+        # 人机验证优先于登录墙选择器判定：验证遮罩常常复用登录弹窗的类名，
+        # 一旦被归入 VERIFICATION_REQUIRED 就会触发关闭弹窗/切换备用路由的
+        # 恢复动作，那等同于绕过验证。
+        if any(phrase in body_text for phrase in self.verification_phrases):
+            return SessionStatus.CAPTCHA_REQUIRED
         for selector in self.login_wall_selectors:
             with suppress(Exception):
                 locator = page.locator(selector).first
                 if await locator.count() and await locator.is_visible():
                     return SessionStatus.VERIFICATION_REQUIRED
-        if any(phrase in body_text for phrase in self.verification_phrases):
-            return SessionStatus.VERIFICATION_REQUIRED
         if any(phrase in body_text for phrase in self.rate_limit_phrases):
             return SessionStatus.RATE_LIMITED
         if any(phrase in body_text for phrase in self.login_required_phrases):
@@ -163,14 +182,27 @@ class BaseCollector(ABC):
         if upstream_error:
             raise CollectorRuntimeError(SessionStatus.ERROR, upstream_error)
         status = await self.session_status(page, context)
+        # 命中人机验证时立即终止：不关遮罩、不换路由，交由人工处理。
+        if status is SessionStatus.CAPTCHA_REQUIRED:
+            raise CollectorRuntimeError(status, self._search_access_message(status))
         # 登录态健康但页面盖着登录引导弹窗时（session_status 已经用 cookie
         # 区分了这种情况），先尝试关闭弹窗再继续，而不是把整个平台的本轮
         # 巡检直接判死。
         if status is SessionStatus.VERIFICATION_REQUIRED and await self._dismiss_login_modal(page):
             await page.wait_for_timeout(800)
             status = await self.session_status(page, context)
+            if status is SessionStatus.CAPTCHA_REQUIRED:
+                raise CollectorRuntimeError(status, self._search_access_message(status))
+        if status is not SessionStatus.HEALTHY and await self._recover_search_access(
+            page, context, keyword, status
+        ):
+            await page.wait_for_timeout(self._human_delay_ms(1_000))
+            upstream_error = await self._upstream_error(page)
+            if upstream_error:
+                raise CollectorRuntimeError(SessionStatus.ERROR, upstream_error)
+            status = await self.session_status(page, context)
         if status is not SessionStatus.HEALTHY:
-            raise CollectorRuntimeError(status, f"{self.platform.value} 会话状态：{status.value}")
+            raise CollectorRuntimeError(status, self._search_access_message(status))
 
         results: list[CollectedContent] = []
         seen_ids: set[str] = set()
@@ -181,7 +213,7 @@ class BaseCollector(ABC):
             if status is not SessionStatus.HEALTHY:
                 raise CollectorRuntimeError(
                     status,
-                    f"{self.platform.value} 搜索结果页状态：{status.value}",
+                    self._search_access_message(status),
                 )
 
         for _ in range(self._search_scroll_rounds):
@@ -265,13 +297,19 @@ class BaseCollector(ABC):
             for item in items
         )
         empty_title_ratio = empty_title / total if total else 0.0
+        no_usable_text = total > 0 and usable_text == 0
         return {
             "total": total,
             "empty_title": empty_title,
             "usable_text": usable_text,
             "empty_title_ratio": round(empty_title_ratio, 3),
             "needs_diagnostic": total == 0 or empty_title_ratio >= 0.3,
+            "degrades_run": no_usable_text or empty_title_ratio >= 0.3,
             "all_titles_empty": total > 0 and empty_title == total,
+            # 标题解析退化和"整页无法提取任何文本"是两回事。前者仍然留有
+            # 卡片原文可供品牌匹配，只该降级告警；只有后者才说明这一轮
+            # 检索完全没有可用证据，值得判定为数据质量失败。
+            "no_usable_text": no_usable_text,
         }
 
     def pop_search_diagnostic(self, key: str) -> str | None:
@@ -326,23 +364,67 @@ class BaseCollector(ABC):
         except PlaywrightTimeoutError as exc:
             # 页面超时时也可能已经完成跳转并渲染出可用内容。但如果地址栏仍停留在
             # 旧页面，继续抽取会把上一个关键词的结果记到当前关键词名下。
-            if page.url != search_url:
+            if not self._reached_search_page(page.url, search_url):
                 raise CollectorRuntimeError(
                     SessionStatus.ERROR,
                     f"{self.platform.value} 搜索页导航超时，未能进入目标搜索结果页。",
                 ) from exc
 
+    @staticmethod
+    def _reached_search_page(actual_url: str, search_url: str) -> bool:
+        """判断超时后浏览器是否已经停在目标搜索页。
+
+        不能用字符串全等：平台一定会改写搜索 URL（小红书追加 &type=51、
+        排序和来源参数等），全等比较会把已经渲染好的正常页面误判成导航超时。
+        判定规则是 scheme/host/path 一致，且请求里带的每个查询参数都在实际
+        URL 中原值出现——后者保证关键词没有被平台换掉，平台自己追加的额外
+        参数不影响结果。
+        """
+        actual = urlsplit(actual_url)
+        expected = urlsplit(search_url)
+        if (actual.scheme.lower(), actual.netloc.lower()) != (
+            expected.scheme.lower(),
+            expected.netloc.lower(),
+        ):
+            return False
+        # 路径里的关键词可能一侧是百分号编码、另一侧是原文，先统一解码。
+        if unquote(actual.path).rstrip("/") != unquote(expected.path).rstrip("/"):
+            return False
+        actual_query = parse_qs(actual.query)
+        return all(
+            set(values).issubset(set(actual_query.get(key, [])))
+            for key, values in parse_qs(expected.query).items()
+        )
+
+    async def _recover_search_access(
+        self,
+        page: Page,
+        context: BrowserContext,
+        keyword: str,
+        status: SessionStatus,
+    ) -> bool:
+        """Allow a platform adapter to switch away from a route-level login wall."""
+        return False
+
     async def _dismiss_login_modal(self, page: Page) -> bool:
-        """尝试关闭登录引导弹窗；成功关闭任意一个即返回 True。"""
+        """尝试关闭登录引导弹窗；确认遮罩消失才返回 True。"""
         for selector in self.login_modal_close_selectors:
             with suppress(Exception):
                 locator = page.locator(selector).first
                 if await locator.count() and await locator.is_visible():
                     await locator.click(timeout=2_000)
                     return True
-        # 通用回退：多数登录弹窗都响应 Esc。
+        # 通用回退：多数登录弹窗都响应 Esc。按下后必须复核遮罩确实消失，
+        # 否则"恒真"的返回值会让调用方误以为已经恢复，白白多跑一轮判定。
+        if not self.login_wall_selectors:
+            return False
         with suppress(Exception):
             await page.keyboard.press("Escape")
+            await page.wait_for_timeout(300)
+            for selector in self.login_wall_selectors:
+                locator = page.locator(selector).first
+                if await locator.count() and await locator.is_visible():
+                    return False
             return True
         return False
 
@@ -501,12 +583,18 @@ class BaseCollector(ABC):
                     )
                     continue
                 status = await self.session_status(detail_page, context)
+                if status is SessionStatus.CAPTCHA_REQUIRED:
+                    # 详情页命中人机验证：不做任何关闭/绕过尝试，直接中止
+                    # 本平台剩余详情采集，交由人工处理。
+                    raise CollectorRuntimeError(status, self._search_access_message(status))
                 if (
                     status is SessionStatus.VERIFICATION_REQUIRED
                     and await self._dismiss_login_modal(detail_page)
                 ):
                     await detail_page.wait_for_timeout(800)
                     status = await self.session_status(detail_page, context)
+                    if status is SessionStatus.CAPTCHA_REQUIRED:
+                        raise CollectorRuntimeError(status, self._search_access_message(status))
                 if status is SessionStatus.VERIFICATION_REQUIRED:
                     # cookie 有效但详情页仍被登录引导墙盖住：跳过这一条的
                     # 详情补充，保留浅层结果，不让整个关键词的采集作废。
@@ -642,16 +730,23 @@ class BaseCollector(ABC):
                 if await candidate.count() and await candidate.is_visible():
                     media_locator = candidate
                     break
-            if media_locator is None:
-                media_locator = page.locator("main img, main video")
             handles = []
-            with suppress(PlaywrightError):
-                tag_name = str(await media_locator.evaluate("node => node.tagName.toLowerCase()"))
-                if tag_name in {"img", "video"}:
-                    own_handle = await media_locator.element_handle()
-                    if own_handle is not None:
-                        handles.append(own_handle)
-            handles.extend(await media_locator.locator("img, video").element_handles())
+            if media_locator is None:
+                # 回退分支必须直接取这些 img/video 元素本身。原先套用容器逻辑
+                # 去 img/video 内部再找 img/video，结果恒为空，且多元素定位器
+                # 触发的 strict 违规异常被 suppress 吞掉，选择器改版后会静默
+                # 退化成"这条内容没有媒体证据"。
+                handles.extend(await page.locator("main img, main video").element_handles())
+            else:
+                with suppress(PlaywrightError):
+                    tag_name = str(
+                        await media_locator.evaluate("node => node.tagName.toLowerCase()")
+                    )
+                    if tag_name in {"img", "video"}:
+                        own_handle = await media_locator.element_handle()
+                        if own_handle is not None:
+                            handles.append(own_handle)
+                handles.extend(await media_locator.locator("img, video").element_handles())
         except PlaywrightError:
             return []
         evidence: list[dict[str, Any]] = []
@@ -723,10 +818,12 @@ class BaseCollector(ABC):
         # 带临时访问参数的卡片链接。必须点击可见节点，不能取 DOM 中的
         # 第一个链接，否则 Playwright 会一直等待隐藏锚点变为可点击。
         locator = search_page.locator(f'a[href*="{item.content_id}"]:visible').first
+        # before_url 必须在 try 之前取好，点击可能在抛异常前就已经改了路由。
+        before_url = search_page.url
         try:
             if not await locator.count():
+                # 没点到任何东西，搜索页原样未动，不需要复位。
                 return None, None, "搜索页找不到对应卡片"
-            before_url = search_page.url
             popup: Page | None = None
             try:
                 async with search_page.expect_popup(timeout=4_000) as popup_info:
@@ -736,6 +833,7 @@ class BaseCollector(ABC):
                 # 没有新窗口并不等于点击失败：小红书常在当前页改路由或打开弹层。
                 popup = None
             if popup is not None:
+                # 详情开在新窗口里，搜索页保持原样，关掉弹窗即可。
                 with suppress(Exception):
                     await popup.wait_for_load_state("domcontentloaded", timeout=10_000)
                 await popup.wait_for_timeout(500)
@@ -750,9 +848,13 @@ class BaseCollector(ABC):
             matches, identity_error = await self._detail_identity_matches(search_page, item)
             if matches:
                 return search_page, before_url, ""
-            return None, None, identity_error
+            # 关键：点击已经把搜索页路由到了别的详情页，失败时也必须把
+            # before_url 交回调用方去复位。否则搜索页永久停在错误详情页上，
+            # 该关键词剩余候选会全部以"搜索页找不到对应卡片"失败，
+            # 错因还被记成卡片问题而不是这次错配。
+            return None, before_url, identity_error
         except PlaywrightError as exc:
-            return None, None, str(exc)[:1000]
+            return None, before_url, str(exc)[:1000]
 
     async def _detail_identity_matches(
         self,

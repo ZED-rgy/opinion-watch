@@ -16,6 +16,9 @@ class SessionStatus(StrEnum):
     HEALTHY = "healthy"
     LOGIN_REQUIRED = "login_required"
     VERIFICATION_REQUIRED = "verification_required"
+    # 人机验证（滑块/验证码）与登录引导必须区分：登录引导可以尝试关闭弹窗或
+    # 走备用入口，人机验证一律直接终止本轮，不得尝试任何绕过手段。
+    CAPTCHA_REQUIRED = "captcha_required"
     RATE_LIMITED = "rate_limited"
     ERROR = "error"
 

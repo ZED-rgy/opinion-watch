@@ -14,6 +14,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
+from opinion_watch.agent_ingest import ingest_agent_jsonl
 from opinion_watch.browser import BrowserProfileLocked, BrowserSession
 from opinion_watch.classification import classify_batch
 from opinion_watch.collectors import collector_for
@@ -25,7 +26,7 @@ from opinion_watch.models import OpinionCategory, Platform, RiskSeverity, Sessio
 from opinion_watch.runner import ScanOptions, _screen_items_for_admission, run_scan
 from opinion_watch.scheduling import next_scheduled_datetime
 from opinion_watch.storage import Storage
-from opinion_watch.wecom import WeComClient
+from opinion_watch.wecom import WeComClient, send_daily_report_if_due
 
 
 def _safe_url(value: str) -> str:
@@ -38,7 +39,9 @@ def _configure_utf8_output() -> None:
     for stream in (sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)
         if reconfigure is not None:
-            reconfigure(encoding="utf-8", errors="backslashreplace")
+            # line_buffering 不能省：stdout 重定向到管道时默认是全缓冲，桌面端要
+            # 等 8KB 攒满或进程退出才收得到事件，巡检进度条整轮都不动。
+            reconfigure(encoding="utf-8", errors="backslashreplace", line_buffering=True)
 
 
 def _platform(value: str) -> Platform:
@@ -50,7 +53,7 @@ def _platform(value: str) -> Platform:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="品牌舆情监控浏览器采集 POC")
+    parser = argparse.ArgumentParser(description="品牌舆情监控与候选治理系统")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("init", help="初始化运行目录、数据库和默认品牌")
@@ -76,6 +79,10 @@ def build_parser() -> argparse.ArgumentParser:
     scan = subparsers.add_parser("scan", help="顺序扫描启用品牌")
     _add_scan_arguments(scan)
     scan.add_argument("--trigger", choices=("manual", "watch"), default="manual")
+
+    ingest = subparsers.add_parser("ingest", help="导入外部执行器发现的候选线索")
+    ingest.add_argument("path", type=Path, help="Agent 输出的 UTF-8 JSONL 文件")
+    ingest.add_argument("--source", choices=("agent",), default="agent")
 
     watch = subparsers.add_parser("watch", help="按固定间隔循环扫描")
     _add_scan_arguments(watch)
@@ -151,6 +158,11 @@ def build_parser() -> argparse.ArgumentParser:
     notification_list = notification_subparsers.add_parser("list")
     notification_list.add_argument("--limit", type=int, default=100)
     notification_list.add_argument("--all", action="store_true", help="包含已读通知")
+    notification_list.add_argument(
+        "--channel",
+        choices=("opinion", "system", "manual"),
+        help="只查看舆情提醒、系统运行或人工播报",
+    )
     notification_read = notification_subparsers.add_parser("read")
     notification_read.add_argument("notification_id", type=int)
 
@@ -271,8 +283,21 @@ async def _login(
     profile_dir, account = _account_profile(settings, storage, platform, account_id)
     lease_name = f"account:{int(account['id'])}" if account is not None else None
     owner = f"login-{uuid.uuid4()}"
-    if lease_name is not None and not storage.acquire_task_lease(lease_name, owner):
+    lease_seconds = 180
+    if lease_name is not None and not storage.acquire_task_lease(
+        lease_name, owner, lease_seconds=lease_seconds
+    ):
         raise BrowserProfileLocked("该账号浏览器档案正在被其他任务使用，请先关闭对应窗口。")
+    heartbeat: asyncio.Task[None] | None = None
+    if lease_name is not None:
+
+        async def heartbeat_login_lease() -> None:
+            while True:
+                await asyncio.sleep(60)
+                if not storage.heartbeat_task_lease(lease_name, owner, lease_seconds=lease_seconds):
+                    return
+
+        heartbeat = asyncio.create_task(heartbeat_login_lease())
     try:
         async with BrowserSession(
             profile_dir,
@@ -301,6 +326,10 @@ async def _login(
             )
             return 0 if status is SessionStatus.HEALTHY else 2
     finally:
+        if heartbeat is not None:
+            heartbeat.cancel()
+            with suppress(asyncio.CancelledError):
+                await heartbeat
         if lease_name is not None:
             storage.release_task_lease(lease_name, owner)
 
@@ -316,7 +345,9 @@ async def _check(
     profile_dir, account = _account_profile(settings, storage, platform, account_id)
     lease_name = f"account:{int(account['id'])}" if account is not None else None
     owner = f"check-{uuid.uuid4()}"
-    if lease_name is not None and not storage.acquire_task_lease(lease_name, owner):
+    if lease_name is not None and not storage.acquire_task_lease(
+        lease_name, owner, lease_seconds=180
+    ):
         raise BrowserProfileLocked("该账号浏览器档案正在被其他任务使用，请先关闭对应窗口。")
     try:
         async with BrowserSession(
@@ -396,7 +427,7 @@ async def _search_one(
             print(json.dumps(payload, ensure_ascii=False))
             return 2
 
-        stats = storage.upsert_contents(items)
+        stats = storage.upsert_contents(items, allow_brand_creation=False)
         empty_screenshot = None
         if not items:
             empty_screenshot = await session.capture_diagnostic(
@@ -687,6 +718,7 @@ def _notification_command(storage: Storage, args: argparse.Namespace) -> int:
         payload: object = storage.list_notifications(
             unread_only=not args.all,
             limit=args.limit,
+            channel=args.channel,
         )
     elif args.notification_command == "read":
         payload = {"updated": storage.mark_notification_read(args.notification_id)}
@@ -793,6 +825,25 @@ async def run(args: argparse.Namespace) -> int:
         return _notification_command(storage, args)
     if args.command == "data":
         return _data_command(settings, storage, args)
+    if args.command == "ingest":
+        payload = ingest_agent_jsonl(storage, args.path)
+        payload["wecom_report_sent"] = False
+        if bool(storage.get_wecom_config().get("enabled")):
+            try:
+                payload["wecom_report_sent"] = await send_daily_report_if_due(
+                    storage,
+                    scan_run_id=int(payload["run_id"]),
+                )
+            except Exception as exc:
+                payload["wecom_report_error"] = str(exc)
+                storage.create_alert(
+                    run_id=int(payload["run_id"]),
+                    kind="wecom_report_error",
+                    severity="error",
+                    message=f"Agent 导入后的企微日报发送失败：{exc}",
+                )
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
     if args.command == "classify":
         return _classify_command(storage, args)
     if args.command == "wecom":

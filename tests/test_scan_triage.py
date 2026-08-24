@@ -3,6 +3,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from fakes import OfflineCollector
 
 from opinion_watch.collectors.base import CollectorRuntimeError
 from opinion_watch.config import Settings
@@ -173,17 +174,19 @@ class ZeroDetailBrowserSession:
         return None
 
 
-class ZeroDetailCollector:
-    async def session_status(self, page: ZeroDetailPage, context: object) -> SessionStatus:
+class ZeroDetailCollector(OfflineCollector):
+    async def session_status(self, page: object, context: object) -> SessionStatus:
         return SessionStatus.HEALTHY
 
     async def search(
         self,
-        page: ZeroDetailPage,
+        page: object,
         context: object,
         keyword: str,
         *,
-        limit: int,
+        limit: int = 20,
+        artifact_dir: Path | None = None,
+        diagnostic_key: str | None = None,
     ) -> list[CollectedContent]:
         return [
             CollectedContent(
@@ -201,10 +204,11 @@ class ZeroDetailCollector:
         context: object,
         items: list[CollectedContent],
         *,
-        detail_limit: int,
-        comments_limit: int,
+        detail_limit: int = 5,
+        comments_limit: int = 20,
         detail_candidate_ids: set[str] | None = None,
         artifact_dir: Path | None = None,
+        search_page: object = None,
     ) -> list[CollectedContent]:
         return items
 
@@ -215,10 +219,11 @@ class CleanDetailCollector(ZeroDetailCollector):
         context: object,
         items: list[CollectedContent],
         *,
-        detail_limit: int,
-        comments_limit: int,
+        detail_limit: int = 5,
+        comments_limit: int = 20,
         detail_candidate_ids: set[str] | None = None,
         artifact_dir: Path | None = None,
+        search_page: object = None,
     ) -> list[CollectedContent]:
         return [
             replace(
@@ -237,11 +242,13 @@ class CleanDetailCollector(ZeroDetailCollector):
 class PartialSuspectCollector(ZeroDetailCollector):
     async def search(
         self,
-        page: ZeroDetailPage,
+        page: object,
         context: object,
         keyword: str,
         *,
-        limit: int,
+        limit: int = 20,
+        artifact_dir: Path | None = None,
+        diagnostic_key: str | None = None,
     ) -> list[CollectedContent]:
         items = await super().search(page, context, keyword, limit=limit)
         return [
@@ -292,15 +299,18 @@ class ConcurrentBrowserSession:
 
 class ConcurrentCollector(ZeroDetailCollector):
     def __init__(self) -> None:
+        super().__init__()
         self.detail_bindings: list[tuple[str, str]] = []
 
     async def search(
         self,
-        page: ConcurrentPage,
+        page: object,
         context: object,
         keyword: str,
         *,
-        limit: int,
+        limit: int = 20,
+        artifact_dir: Path | None = None,
+        diagnostic_key: str | None = None,
     ) -> list[CollectedContent]:
         await asyncio.sleep(0)
         return [
@@ -316,11 +326,11 @@ class ConcurrentCollector(ZeroDetailCollector):
         context: object,
         items: list[CollectedContent],
         *,
-        detail_limit: int,
-        comments_limit: int,
+        detail_limit: int = 5,
+        comments_limit: int = 20,
         detail_candidate_ids: set[str] | None = None,
         artifact_dir: Path | None = None,
-        search_page: ConcurrentPage | None = None,
+        search_page: object = None,
     ) -> list[CollectedContent]:
         assert search_page is not None
         for item in items:
@@ -345,11 +355,13 @@ class PrefetchGatewayCollector(ConcurrentCollector):
 
     async def search(
         self,
-        page: ConcurrentPage,
+        page: object,
         context: object,
         keyword: str,
         *,
-        limit: int,
+        limit: int = 20,
+        artifact_dir: Path | None = None,
+        diagnostic_key: str | None = None,
     ) -> list[CollectedContent]:
         calls = self.search_calls.get(keyword, 0) + 1
         self.search_calls[keyword] = calls
@@ -551,6 +563,8 @@ def test_partial_run_aggregates_repeated_runtime_warnings(
     warnings = [alert for alert in storage.list_alerts() if alert["kind"] == "zero_detail_coverage"]
     assert len(warnings) == 1
     assert "本轮巡检共 3 项" in warnings[0]["message"]
+    assert "详情覆盖不足" in warnings[0]["message"]
+    assert "zero_detail_coverage" not in warnings[0]["message"]
 
 
 def test_brand_match_with_zero_details_is_partial_and_alerts(
@@ -596,7 +610,7 @@ def test_brand_match_with_zero_details_is_partial_and_alerts(
     assert run["attempts"][0]["detailed_count"] == 0
 
 
-def test_partial_run_classifies_admitted_content_and_creates_notification(
+def test_partial_run_keeps_shallow_risk_as_candidate_without_notification(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     storage = Storage(tmp_path / "scan.db")
@@ -640,8 +654,9 @@ def test_partial_run_classifies_admitted_content_and_creates_notification(
     assessments = storage.list_assessments()
     assert len(assessments) == 1
     assert assessments[0]["requires_review"] is True
+    assert assessments[0]["severity"] == "P3"
     notifications = storage.list_notifications(unread_only=True)
-    assert any(item["kind"] == "opinion_review" for item in notifications)
+    assert not any(item["kind"] == "opinion_review" for item in notifications)
 
 
 def test_clean_detail_success_counts_before_filtered_from_admission(

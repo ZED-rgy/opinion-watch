@@ -502,6 +502,51 @@ def test_permanent_ignore_blocks_re_admission(tmp_path) -> None:
     assert storage.list_assessments() == []
 
 
+def test_clearing_permanent_ignore_restores_visibility(tmp_path) -> None:
+    storage = Storage(tmp_path / "test.db")
+    storage.initialize()
+    storage.upsert_contents([_item(content_id="unignore-me")])
+    with storage.connect() as connection:
+        content_id = int(connection.execute("SELECT id FROM content_items").fetchone()[0])
+
+    storage.set_permanent_ignore([content_id])
+    assert storage.clear_permanent_ignore([content_id]) == 1
+    with storage.connect() as connection:
+        row = connection.execute(
+            "SELECT ignored_at, deleted_at, deleted_by, delete_reason FROM content_items"
+            " WHERE id = ?",
+            (content_id,),
+        ).fetchone()
+    # 忽略动作自己写下的 deleted_at 必须一并清掉，否则条目对所有列表查询
+    # （统一过滤 deleted_at IS NULL）永久不可见。
+    assert row["ignored_at"] is None
+    assert row["deleted_at"] is None
+    assert row["deleted_by"] == ""
+    assert row["delete_reason"] == ""
+    assert storage.clear_permanent_ignore([content_id]) == 0
+
+
+def test_clearing_permanent_ignore_keeps_pre_existing_soft_delete(tmp_path) -> None:
+    storage = Storage(tmp_path / "test.db")
+    storage.initialize()
+    storage.upsert_contents([_item(content_id="deleted-then-ignored")])
+    with storage.connect() as connection:
+        content_id = int(connection.execute("SELECT id FROM content_items").fetchone()[0])
+
+    storage.soft_delete_opinions([content_id], deleted_by="运营", reason="用户删除")
+    storage.set_permanent_ignore([content_id])
+    storage.clear_permanent_ignore([content_id])
+    with storage.connect() as connection:
+        row = connection.execute(
+            "SELECT ignored_at, deleted_at, deleted_by FROM content_items WHERE id = ?",
+            (content_id,),
+        ).fetchone()
+    # 忽略之前就已经软删的条目，撤销忽略不应顺手把它恢复出来。
+    assert row["ignored_at"] is None
+    assert row["deleted_at"] is not None
+    assert row["deleted_by"] == "运营"
+
+
 def test_scan_attempt_audit_stats_are_stored(tmp_path) -> None:
     storage = Storage(tmp_path / "test.db")
     storage.initialize()
@@ -557,7 +602,7 @@ def test_v4_migration_repairs_existing_unavailable_detail_title(tmp_path) -> Non
         title = connection.execute("SELECT title FROM content_items").fetchone()[0]
         version = connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
     assert title == "速探长海外仓提醒"
-    assert version == 5
+    assert version == 7
 
 
 def collector_anchor(url: str):

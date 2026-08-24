@@ -1,6 +1,7 @@
 """主窗口与运行时引导用例。"""
 
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
@@ -37,6 +38,17 @@ def test_main_window_has_six_pages_and_navigates(
         assert window.stack.currentIndex() == page.value
 
 
+def test_main_window_shutdown_stops_storage_worker(
+    qtbot, desktop_storage: Storage, tmp_path: Path
+) -> None:
+    window = _make_window(desktop_storage, tmp_path)
+    qtbot.addWidget(window)
+
+    window.shutdown()
+
+    assert not window.opinions.tasks._thread.isRunning()
+
+
 def test_unread_notifications_show_in_nav_badge(
     qtbot, desktop_storage: Storage, tmp_path: Path
 ) -> None:
@@ -44,6 +56,21 @@ def test_unread_notifications_show_in_nav_badge(
     window = _make_window(desktop_storage, tmp_path)
     qtbot.addWidget(window)
     window.update_global_status()
+    assert int(window.nav_items[Page.NOTIFICATIONS].data(BADGE_ROLE)) == 1
+
+
+def test_main_window_refreshes_after_external_database_write(
+    qtbot, desktop_storage: Storage, tmp_path: Path
+) -> None:
+    window = _make_window(desktop_storage, tmp_path)
+    qtbot.addWidget(window)
+    refresh = Mock()
+    window.refresh_current_page = refresh  # type: ignore[method-assign]
+
+    desktop_storage.create_notification(severity="P2", title="后台新增", message="正文")
+    window._poll_external_changes()
+
+    refresh.assert_called_once_with()
     assert int(window.nav_items[Page.NOTIFICATIONS].data(BADGE_ROLE)) == 1
 
 

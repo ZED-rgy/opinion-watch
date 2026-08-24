@@ -111,6 +111,21 @@ _WARNING_SIGNALS = (
 def classify_content(content: dict[str, Any]) -> AssessmentResult:
     text = _content_text(content)
     brands = [str(item) for item in content.get("brand_names", [])]
+    raw_data = content.get("raw_data")
+    raw: dict[str, Any] = raw_data if isinstance(raw_data, dict) else {}
+    if raw.get("agent_relevance") == "uncertain":
+        return AssessmentResult(
+            category=OpinionCategory.OTHER,
+            severity=RiskSeverity.P3,
+            confidence=0.5,
+            rationale=(
+                "Agent 标记为品牌相关性不确定，当前仅作为候选线索进入人工抽检，"
+                "不生成高等级舆情播报。"
+            ),
+            matched_signals=[str(item) for item in raw.get("risk_signals", [])],
+            requires_review=True,
+        )
+    shallow_candidate = _is_shallow_candidate(raw)
     relevant_signals = (
         _FALSE_INFORMATION_SIGNALS
         + _DEFAMATION_SIGNALS
@@ -184,6 +199,18 @@ def classify_content(content: dict[str, Any]) -> AssessmentResult:
                     matched_signals=matched,
                     requires_review=True,
                 )
+            if shallow_candidate:
+                return AssessmentResult(
+                    category=category,
+                    severity=RiskSeverity.P3,
+                    confidence=min(confidence, 0.55),
+                    rationale=(
+                        "仅在搜索候选中命中高风险词，尚无详情证据；"
+                        "已降为 P3 待调查线索，不生成 P1 舆情播报。"
+                    ),
+                    matched_signals=matched,
+                    requires_review=True,
+                )
             return AssessmentResult(
                 category=category,
                 severity=severity,
@@ -214,6 +241,18 @@ def classify_content(content: dict[str, Any]) -> AssessmentResult:
                 confidence=0.5,
                 rationale=(
                     "命中投诉信号但可提取文本未出现品牌名称；降级为低优先级线索，待人工确认归属。"
+                ),
+                matched_signals=[*complaint_matches, *service_matches],
+                requires_review=True,
+            )
+        if shallow_candidate:
+            return AssessmentResult(
+                category=OpinionCategory.REASONABLE_CONSUMER_COMPLAINT,
+                severity=RiskSeverity.P3,
+                confidence=0.55,
+                rationale=(
+                    "搜索候选同时命中投诉和服务场景，但尚未读取详情证据；"
+                    "已降为 P3 待调查线索，不生成 P2 舆情播报。"
                 ),
                 matched_signals=[*complaint_matches, *service_matches],
                 requires_review=True,
@@ -294,7 +333,22 @@ def _content_text(content: dict[str, Any]) -> str:
     comments = raw.get("comments")
     if isinstance(comments, list):
         parts.extend(str(comment) for comment in comments[:100])
+    evidence = raw.get("evidence")
+    if isinstance(evidence, list):
+        parts.extend(str(item) for item in evidence[:100])
     return "\n".join(parts).lower()
+
+
+def has_detail_evidence(content: dict[str, Any]) -> bool:
+    raw_data = content.get("raw_data")
+    raw: dict[str, Any] = raw_data if isinstance(raw_data, dict) else {}
+    return bool(raw.get("detail_collected")) or raw.get("detail_status") == "succeeded"
+
+
+def _is_shallow_candidate(raw: dict[str, Any]) -> bool:
+    if raw.get("detail_collected") or raw.get("detail_status") == "succeeded":
+        return False
+    return raw.get("candidate_stage") == "shallow" or bool(raw.get("search_card_text"))
 
 
 def brand_matches_card(content: dict[str, Any]) -> bool:

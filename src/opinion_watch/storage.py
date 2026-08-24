@@ -6,7 +6,7 @@ import re
 import sqlite3
 import uuid
 from collections.abc import Iterable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import TracebackType
 from typing import Any, Literal
@@ -29,6 +29,29 @@ class _ManagedConnection(sqlite3.Connection):
             return super().__exit__(exc_type, exc_value, traceback)
         finally:
             self.close()
+
+
+def _is_lock_contention(error: sqlite3.OperationalError) -> bool:
+    """区分"别的进程正在写"与真正的数据库故障。
+
+    只有前者可以安全地降级成"任务已在运行"的布尔返回值；后者必须继续抛出，
+    否则会把损坏的库伪装成正常的并发竞争。
+    """
+    message = str(error).lower()
+    return "locked" in message or "busy" in message
+
+
+def _split_concat(value: object) -> list[str]:
+    """拆分 GROUP_CONCAT(..., char(31)) 的结果，去空去重且保序。
+
+    空字符串 split 出来是 ['']，直接使用会造出参与判定和展示的幽灵空值；
+    去掉 DISTINCT 换分隔符后也需要在这里补回去重。
+    """
+    unique: dict[str, None] = {}
+    for part in str(value or "").split("\x1f"):
+        if part:
+            unique.setdefault(part, None)
+    return list(unique)
 
 
 class Storage:
@@ -58,7 +81,12 @@ class Storage:
 
     def backup_to(self, backup_path: Path) -> None:
         backup_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.connect() as source, sqlite3.connect(backup_path) as destination:
+        # 目标库也必须用 _ManagedConnection：sqlite3 的 with 只提交事务不关连接，
+        # 泄漏的句柄会让 Windows 上刚备份出来的文件无法删除或覆盖。
+        with (
+            self.connect() as source,
+            sqlite3.connect(backup_path, factory=_ManagedConnection) as destination,
+        ):
             source.backup(destination)
 
     def operational_counts(self) -> dict[str, int]:
@@ -494,15 +522,53 @@ class Storage:
                 (datetime.now(UTC).isoformat(),),
             )
             return
+        if versions:
+            highest = max(versions)
+            expected = set(range(1, highest + 1))
+            if versions != expected:
+                missing = ", ".join(str(version) for version in sorted(expected - versions))
+                raise RuntimeError(
+                    f"数据库迁移记录不连续，缺少版本：{missing}；"
+                    "已停止启动以避免跳过迁移，请先从备份恢复或执行迁移修复。"
+                )
         current = connection.execute(
             "SELECT COALESCE(MAX(version), 0) FROM schema_migrations"
         ).fetchone()[0]
-        if int(current) >= 5:
+        if int(current) >= 7:
+            return
+        if int(current) == 6:
+            Storage._migrate_v7(connection)
+            connection.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (7, ?)",
+                (datetime.now(UTC).isoformat(),),
+            )
+            return
+        if int(current) == 5:
+            Storage._migrate_v6(connection)
+            connection.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (6, ?)",
+                (datetime.now(UTC).isoformat(),),
+            )
+            Storage._migrate_v7(connection)
+            connection.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (7, ?)",
+                (datetime.now(UTC).isoformat(),),
+            )
             return
         if int(current) == 4:
             Storage._migrate_v5(connection)
             connection.execute(
                 "INSERT INTO schema_migrations(version, applied_at) VALUES (5, ?)",
+                (datetime.now(UTC).isoformat(),),
+            )
+            Storage._migrate_v6(connection)
+            connection.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (6, ?)",
+                (datetime.now(UTC).isoformat(),),
+            )
+            Storage._migrate_v7(connection)
+            connection.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (7, ?)",
                 (datetime.now(UTC).isoformat(),),
             )
             return
@@ -515,6 +581,16 @@ class Storage:
             Storage._migrate_v5(connection)
             connection.execute(
                 "INSERT INTO schema_migrations(version, applied_at) VALUES (5, ?)",
+                (datetime.now(UTC).isoformat(),),
+            )
+            Storage._migrate_v6(connection)
+            connection.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (6, ?)",
+                (datetime.now(UTC).isoformat(),),
+            )
+            Storage._migrate_v7(connection)
+            connection.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (7, ?)",
                 (datetime.now(UTC).isoformat(),),
             )
             return
@@ -540,6 +616,16 @@ class Storage:
             Storage._migrate_v5(connection)
             connection.execute(
                 "INSERT INTO schema_migrations(version, applied_at) VALUES (5, ?)",
+                (datetime.now(UTC).isoformat(),),
+            )
+            Storage._migrate_v6(connection)
+            connection.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (6, ?)",
+                (datetime.now(UTC).isoformat(),),
+            )
+            Storage._migrate_v7(connection)
+            connection.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (7, ?)",
                 (datetime.now(UTC).isoformat(),),
             )
             return
@@ -701,6 +787,16 @@ class Storage:
         Storage._migrate_v5(connection)
         connection.execute(
             "INSERT INTO schema_migrations(version, applied_at) VALUES (5, ?)",
+            (datetime.now(UTC).isoformat(),),
+        )
+        Storage._migrate_v6(connection)
+        connection.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (6, ?)",
+            (datetime.now(UTC).isoformat(),),
+        )
+        Storage._migrate_v7(connection)
+        connection.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (7, ?)",
             (datetime.now(UTC).isoformat(),),
         )
 
@@ -940,6 +1036,36 @@ class Storage:
         )
 
     @staticmethod
+    def _migrate_v6(connection: sqlite3.Connection) -> None:
+        """Add bounded-retention state and its candidate cleanup index."""
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_scan_candidates_created
+            ON scan_candidates(created_at, status)
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS maintenance_state (
+                task TEXT PRIMARY KEY,
+                last_succeeded_at TEXT NOT NULL
+            )
+            """
+        )
+
+    @staticmethod
+    def _migrate_v7(connection: sqlite3.Connection) -> None:
+        """Keep low-confidence candidates out of the high-signal broadcast channel."""
+        connection.execute(
+            """
+            UPDATE app_notifications
+            SET read_at = COALESCE(read_at, ?)
+            WHERE kind = 'opinion_review' AND severity NOT IN ('P1', 'P2')
+            """,
+            (datetime.now(UTC).isoformat(),),
+        )
+
+    @staticmethod
     def _migrate_content_match_keys(connection: sqlite3.Connection) -> None:
         # DDL 在 sqlite3 里逐条自动提交，上一次迁移中途失败可能留下这张中间表；
         # 不清理的话每次启动都会因 "table already exists" 直接失败。
@@ -1108,8 +1234,12 @@ class Storage:
             )
             assessment = connection.execute(
                 """
-                SELECT content_item_id, severity, rationale, requires_review, review_status
-                FROM opinion_assessments WHERE content_item_id = ?
+                SELECT oa.content_item_id, oa.severity, oa.rationale,
+                       oa.requires_review, oa.review_status,
+                       ci.platform, ci.title
+                FROM opinion_assessments oa
+                JOIN content_items ci ON ci.id = oa.content_item_id
+                WHERE oa.content_item_id = ?
                 """,
                 (content_item_id,),
             ).fetchone()
@@ -1117,16 +1247,28 @@ class Storage:
                 assessment is not None
                 and bool(assessment["requires_review"])
                 and assessment["review_status"] == "pending"
+                and str(assessment["severity"]) in {"P1", "P2"}
             ):
+                title = str(assessment["title"] or "").strip() or "未命名舆情"
                 self._upsert_notification(
                     connection,
                     kind="opinion_review",
                     severity=str(assessment["severity"]),
-                    title=f"{assessment['severity']} 舆情待复核",
+                    title=(f"{assessment['severity']}｜{assessment['platform']}｜{title[:80]}"),
                     message=str(assessment["rationale"]),
                     entity_type="content_item",
                     entity_id=str(assessment["content_item_id"]),
                     now=now,
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE app_notifications
+                    SET read_at = COALESCE(read_at, ?)
+                    WHERE kind = 'opinion_review' AND entity_type = 'content_item'
+                      AND entity_id = ?
+                    """,
+                    (now, str(content_item_id)),
                 )
 
     def list_assessments(
@@ -1181,7 +1323,7 @@ class Storage:
                     LIMIT 1
                 ) AS latest_run_id,
                 (
-                    SELECT GROUP_CONCAT(DISTINCT src.source_keyword)
+                    SELECT GROUP_CONCAT(src.source_keyword, char(31))
                     FROM scan_run_contents src
                     WHERE src.content_item_id = ci.id
                 ) AS observed_keywords,
@@ -1227,7 +1369,7 @@ class Storage:
                         LIMIT 1
                     ) AS latest_run_id,
                     (
-                        SELECT GROUP_CONCAT(DISTINCT src.source_keyword)
+                        SELECT GROUP_CONCAT(src.source_keyword, char(31))
                         FROM scan_run_contents src
                         WHERE src.content_item_id = ci.id
                     ) AS observed_keywords,
@@ -1285,10 +1427,8 @@ class Storage:
             groups: dict[str, dict[str, Any]] = {}
             for row in rows:
                 # 与其余查询保持一致使用单元分隔符，品牌名里的逗号不会被拆开；
-                # 一个品牌多个关键词会产生重复行，这里去重。
-                brand_names = sorted(
-                    {value for value in str(row["brand_names"] or "").split("\x1f") if value}
-                )
+                # 一个品牌多个关键词会产生重复行，_split_concat 负责去重。
+                brand_names = sorted(_split_concat(row["brand_names"]))
                 title = str(row["title"] or "").strip()
                 fingerprint = self._event_cluster_fingerprint(
                     str(row["platform"]), brand_names, title
@@ -1369,6 +1509,10 @@ class Storage:
     def severity_trend(self, *, days: int = 7) -> list[dict[str, Any]]:
         """按本地日期统计最近 N 天各等级的内容数量（按最近发现时间归档）。"""
         days = max(1, min(days, 90))
+        # last_seen_at 存的是 Python isoformat（'2026-08-24T09:40:00+00:00'），而
+        # datetime('now', ...) 返回 '2026-08-17 09:40:00'。两者做字符串比较时
+        # 'T' > ' '，边界那天会被整天算进来。截断时间改在 Python 侧生成，格式一致。
+        cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
         with self.connect() as connection:
             rows = connection.execute(
                 """
@@ -1377,12 +1521,12 @@ class Storage:
                 FROM opinion_assessments oa
                 JOIN content_items ci ON ci.id = oa.content_item_id
                 WHERE ci.deleted_at IS NULL AND ci.ignored_at IS NULL
-                  AND ci.last_seen_at >= datetime('now', ?)
+                  AND ci.last_seen_at >= ?
                   AND NOT (oa.source = 'rules' AND oa.category = 'irrelevant')
                 GROUP BY day, oa.severity
                 ORDER BY day
                 """,
-                (f"-{days} days",),
+                (cutoff,),
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -1511,7 +1655,7 @@ class Storage:
             source_keyword=clean_brand,
             brand_name=clean_brand,
         )
-        self.upsert_contents([item])
+        self.upsert_contents([item], allow_brand_creation=False)
         with self.connect() as connection:
             row = connection.execute(
                 """
@@ -1679,6 +1823,14 @@ class Storage:
         return cursor.rowcount
 
     def clear_permanent_ignore(self, content_item_ids: Iterable[int]) -> int:
+        """撤销永久忽略，并还原忽略动作自己写下的删除标记。
+
+        set_permanent_ignore 会顺带写 deleted_at（列表查询一律过滤
+        deleted_at IS NULL），只清 ignored_at 会让条目永远看不见。
+        两个字段由同一次调用写入同一个时间戳，因此 deleted_at = ignored_at
+        表示删除标记来自这次忽略，可以安全清除；不相等则说明忽略之前
+        条目就已被软删，撤销忽略不应顺手把它恢复出来。
+        """
         ids = sorted({int(value) for value in content_item_ids})
         if not ids:
             return 0
@@ -1687,8 +1839,12 @@ class Storage:
             cursor = connection.execute(
                 f"""
                 UPDATE content_items
-                SET ignored_at = NULL, ignored_by = '', ignore_reason = ''
-                WHERE id IN ({placeholders})
+                SET ignored_at = NULL, ignored_by = '', ignore_reason = '',
+                    deleted_by = CASE WHEN deleted_at = ignored_at THEN '' ELSE deleted_by END,
+                    delete_reason =
+                        CASE WHEN deleted_at = ignored_at THEN '' ELSE delete_reason END,
+                    deleted_at = CASE WHEN deleted_at = ignored_at THEN NULL ELSE deleted_at END
+                WHERE id IN ({placeholders}) AND ignored_at IS NOT NULL
                 """,
                 ids,
             )
@@ -1713,7 +1869,7 @@ class Storage:
     @staticmethod
     def _content_for_assessment_dict(row: sqlite3.Row) -> dict[str, Any]:
         result = dict(row)
-        result["brand_names"] = str(result.get("brand_names") or "").split("\x1f")
+        result["brand_names"] = _split_concat(result.get("brand_names"))
         result["metrics"] = json.loads(str(result.pop("metrics_json")))
         result["raw_data"] = json.loads(str(result.pop("raw_json")))
         return result
@@ -1721,11 +1877,11 @@ class Storage:
     @staticmethod
     def _assessment_dict(row: sqlite3.Row) -> dict[str, Any]:
         result = dict(row)
-        result["brand_names"] = str(result.get("brand_names") or "").split("\x1f")
+        result["brand_names"] = _split_concat(result.get("brand_names"))
         result["matched_signals"] = json.loads(str(result.pop("matched_signals_json")))
-        result["observed_keywords"] = [
-            value for value in str(result.get("observed_keywords") or "").split(",") if value
-        ]
+        # GROUP_CONCAT(DISTINCT ...) 不接受自定义分隔符，只能用逗号，含逗号的
+        # 关键词会被切成两个。查询改成 char(31) 分隔并保留重复项，去重挪到这里。
+        result["observed_keywords"] = _split_concat(result.get("observed_keywords"))
         result["requires_review"] = bool(result["requires_review"])
         return result
 
@@ -1827,34 +1983,74 @@ class Storage:
             )
         return True
 
+    def terminate_scan_run(self, run_id: int, *, status: str, reason: str) -> bool:
+        """Close a running scan cooperatively without touching another owner's leases."""
+        if status not in {"cancelled", "interrupted"}:
+            raise ValueError("终止状态必须是 cancelled 或 interrupted")
+        now = datetime.now(UTC).isoformat()
+        clean_reason = reason.strip() or "任务已终止"
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            run = connection.execute(
+                "SELECT status FROM scan_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+            if run is None or str(run["status"]) != "running":
+                return False
+            connection.execute(
+                """
+                UPDATE scan_attempts
+                SET status = ?, finished_at = ?, error_status = ?, error_message = ?
+                WHERE run_id = ? AND status = 'running'
+                """,
+                (status, now, status, clean_reason, run_id),
+            )
+            connection.execute(
+                """
+                UPDATE scan_runs
+                SET status = ?, finished_at = ?, error_message = ?
+                WHERE id = ? AND status = 'running'
+                """,
+                (status, now, clean_reason, run_id),
+            )
+        return True
+
     def acquire_task_lease(self, name: str, owner: str, *, lease_seconds: int = 21_600) -> bool:
         now = datetime.now(UTC)
         now_iso = now.isoformat()
         expires_iso = datetime.fromtimestamp(now.timestamp() + lease_seconds, UTC).isoformat()
-        with self.connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute(
-                "SELECT owner, expires_at FROM task_leases WHERE name = ?", (name,)
-            ).fetchone()
-            if row is not None and str(row["owner"]) != owner:
-                try:
-                    expired = datetime.fromisoformat(str(row["expires_at"])) <= now
-                except ValueError:
-                    expired = True
-                if not expired:
-                    return False
-            connection.execute(
-                """
-                INSERT INTO task_leases(name, owner, acquired_at, heartbeat_at, expires_at)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(name) DO UPDATE SET
-                    owner = excluded.owner,
-                    acquired_at = excluded.acquired_at,
-                    heartbeat_at = excluded.heartbeat_at,
-                    expires_at = excluded.expires_at
-                """,
-                (name, owner, now_iso, now_iso, expires_iso),
-            )
+        try:
+            with self.connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    "SELECT owner, expires_at FROM task_leases WHERE name = ?", (name,)
+                ).fetchone()
+                if row is not None and str(row["owner"]) != owner:
+                    try:
+                        expired = datetime.fromisoformat(str(row["expires_at"])) <= now
+                    except (ValueError, TypeError):
+                        # 不可解析或不带时区的历史租约一律视为已过期，
+                        # 否则一行坏数据会永久挡住这个任务名。
+                        expired = True
+                    if not expired:
+                        return False
+                connection.execute(
+                    """
+                    INSERT INTO task_leases(name, owner, acquired_at, heartbeat_at, expires_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(name) DO UPDATE SET
+                        owner = excluded.owner,
+                        acquired_at = excluded.acquired_at,
+                        heartbeat_at = excluded.heartbeat_at,
+                        expires_at = excluded.expires_at
+                    """,
+                    (name, owner, now_iso, now_iso, expires_iso),
+                )
+        except sqlite3.OperationalError as exc:
+            # BEGIN IMMEDIATE 在别的进程持写锁时会等满 busy_timeout 再抛异常。
+            # 所有调用方都只判布尔（"任务已在运行"），异常冒泡会变成崩溃而不是提示。
+            if not _is_lock_contention(exc):
+                raise
+            return False
         return True
 
     def heartbeat_task_lease(self, name: str, owner: str, *, lease_seconds: int = 21_600) -> bool:
@@ -2096,6 +2292,121 @@ class Storage:
             )
         return len(rows)
 
+    def detail_sampling_history(
+        self, items: Iterable[CollectedContent]
+    ) -> dict[tuple[str, str], dict[str, Any]]:
+        """Return prior detail coverage used to rotate baseline sampling."""
+        grouped: dict[str, list[str]] = {}
+        for item in items:
+            grouped.setdefault(item.platform.value, []).append(item.content_id)
+        history: dict[tuple[str, str], dict[str, Any]] = {}
+        with self.connect() as connection:
+            for platform, content_ids in grouped.items():
+                unique_ids = list(dict.fromkeys(content_ids))
+                for offset in range(0, len(unique_ids), 500):
+                    chunk = unique_ids[offset : offset + 500]
+                    placeholders = ", ".join("?" for _ in chunk)
+                    rows = connection.execute(
+                        f"""
+                        SELECT platform_content_id,
+                               COUNT(detail_checked_at) AS check_count,
+                               MAX(detail_checked_at) AS last_checked_at
+                        FROM scan_candidates
+                        WHERE platform = ?
+                          AND platform_content_id IN ({placeholders})
+                          AND detail_checked_at IS NOT NULL
+                        GROUP BY platform_content_id
+                        """,
+                        (platform, *chunk),
+                    ).fetchall()
+                    for row in rows:
+                        history[(platform, str(row["platform_content_id"]))] = {
+                            "check_count": int(row["check_count"] or 0),
+                            "last_checked_at": row["last_checked_at"],
+                        }
+        return history
+
+    def prune_filtered_scan_candidates(self, *, before: datetime) -> int:
+        """Remove old rejected cards while retaining admitted audit evidence."""
+        if before.tzinfo is None:
+            raise ValueError("候选清理时间必须包含时区")
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                DELETE FROM scan_candidates
+                WHERE status = 'filtered' AND created_at < ?
+                """,
+                (before.astimezone(UTC).isoformat(),),
+            )
+        return cursor.rowcount
+
+    def maintenance_due(self, task: str, *, interval_hours: int = 24) -> bool:
+        if interval_hours < 1:
+            raise ValueError("维护间隔必须大于 0")
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT last_succeeded_at FROM maintenance_state WHERE task = ?",
+                (task,),
+            ).fetchone()
+        if row is None:
+            return True
+        try:
+            last_run = datetime.fromisoformat(str(row["last_succeeded_at"]))
+        except (TypeError, ValueError):
+            return True
+        if last_run.tzinfo is None:
+            return True
+        return last_run <= datetime.now(UTC) - timedelta(hours=interval_hours)
+
+    def mark_maintenance_succeeded(self, task: str) -> None:
+        now = datetime.now(UTC).isoformat()
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO maintenance_state(task, last_succeeded_at) VALUES (?, ?)
+                ON CONFLICT(task) DO UPDATE SET last_succeeded_at = excluded.last_succeeded_at
+                """,
+                (task, now),
+            )
+
+    def list_artifact_references(self) -> set[str]:
+        """Collect file paths still referenced by durable audit records."""
+        references: set[str] = set()
+
+        def collect(value: object) -> None:
+            if isinstance(value, str):
+                lowered = value.lower()
+                if lowered.endswith((".png", ".jpg", ".jpeg", ".webp", ".json")):
+                    references.add(value)
+            elif isinstance(value, list):
+                for item in value:
+                    collect(item)
+            elif isinstance(value, dict):
+                for item in value.values():
+                    collect(item)
+
+        with self.connect() as connection:
+            for table in ("scan_attempts", "alerts"):
+                for row in connection.execute(
+                    f"SELECT screenshot_path FROM {table} WHERE screenshot_path IS NOT NULL"
+                ):
+                    collect(row["screenshot_path"])
+            json_rows = connection.execute(
+                """
+                SELECT raw_json FROM content_items
+                UNION ALL
+                SELECT raw_json FROM scan_candidates
+                WHERE raw_json LIKE '%diagnostic_path%'
+                   OR raw_json LIKE '%\"media\"%'
+                """
+            ).fetchall()
+        for row in json_rows:
+            try:
+                collect(json.loads(str(row["raw_json"])))
+            except (json.JSONDecodeError, TypeError):
+                continue
+        return references
+
     def mark_scan_candidates(
         self,
         *,
@@ -2255,7 +2566,9 @@ class Storage:
             result["duration_seconds"] = round(
                 max(0.0, (finished_at - started_at).total_seconds()), 1
             )
-        except ValueError:
+        except (ValueError, TypeError):
+            # 历史行可能存了不带时区的 started_at，和 aware 的 now() 相减会抛
+            # TypeError。只捕 ValueError 会让整个 get_scan_run() 中断。
             result["duration_seconds"] = None
         return result
 
@@ -2313,20 +2626,38 @@ class Storage:
         *,
         unread_only: bool = False,
         limit: int = 100,
+        channel: str | None = None,
     ) -> list[dict[str, Any]]:
-        query = "SELECT * FROM app_notifications"
+        if channel not in {None, "opinion", "system", "manual"}:
+            raise ValueError("通知频道必须是 opinion、system 或 manual")
+        conditions: list[str] = ["NOT (kind = 'opinion_review' AND severity NOT IN ('P1', 'P2'))"]
+        parameters: list[object] = []
         if unread_only:
-            query += " WHERE read_at IS NULL"
+            conditions.append("read_at IS NULL")
+        if channel == "opinion":
+            conditions.append("kind = 'opinion_review'")
+        elif channel == "system":
+            conditions.append("kind = 'runtime_alert'")
+        elif channel == "manual":
+            conditions.append("kind = 'manual'")
+        query = "SELECT * FROM app_notifications"
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
         query += " ORDER BY id DESC LIMIT ?"
+        parameters.append(limit)
         with self.connect() as connection:
-            rows = connection.execute(query, (limit,)).fetchall()
+            rows = connection.execute(query, parameters).fetchall()
         return [dict(row) for row in rows]
 
     def count_unread_notifications(self) -> int:
         with self.connect() as connection:
             return int(
                 connection.execute(
-                    "SELECT COUNT(*) FROM app_notifications WHERE read_at IS NULL"
+                    """
+                    SELECT COUNT(*) FROM app_notifications
+                    WHERE read_at IS NULL
+                      AND NOT (kind = 'opinion_review' AND severity NOT IN ('P1', 'P2'))
+                    """
                 ).fetchone()[0]
             )
 
@@ -3031,7 +3362,12 @@ class Storage:
             cursor = connection.execute("DELETE FROM platform_accounts WHERE id = ?", (account_id,))
         return cursor.rowcount > 0
 
-    def upsert_contents(self, items: Iterable[CollectedContent]) -> UpsertStats:
+    def upsert_contents(
+        self,
+        items: Iterable[CollectedContent],
+        *,
+        allow_brand_creation: bool = True,
+    ) -> UpsertStats:
         inserted = 0
         updated = 0
         content_inserted = 0
@@ -3111,11 +3447,17 @@ class Storage:
                         (matched_brand,),
                     ).fetchone()
                     if brand_row is None:
-                        self._insert_brand(connection, matched_brand, now)
-                        brand_row = connection.execute(
-                            "SELECT id FROM brands WHERE name = ?",
-                            (matched_brand,),
-                        ).fetchone()
+                        if allow_brand_creation:
+                            self._insert_brand(connection, matched_brand, now)
+                            brand_row = connection.execute(
+                                "SELECT id FROM brands WHERE name = ?",
+                                (matched_brand,),
+                            ).fetchone()
+                        else:
+                            raise ValueError(
+                                f"内容关联的品牌不存在：{matched_brand}；"
+                                "请从品牌与关键词配置启动巡检，不能在入库阶段自动创建品牌。"
+                            )
                     if brand_row is None:
                         raise RuntimeError("品牌写入后无法读取主键")
                     brand_id = int(brand_row["id"])

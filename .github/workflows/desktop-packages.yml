@@ -1,0 +1,72 @@
+name: Desktop packages
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Package ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: windows
+          - os: macos-latest
+            artifact: macos
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install application dependencies
+        run: uv sync --dev --extra desktop
+
+      - name: Install PyInstaller
+        run: uv pip install --python .venv pyinstaller==6.15.0
+
+      - name: Build executable
+        run: uv run python packaging/build.py
+
+      - name: Archive Windows package
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force artifacts | Out-Null
+          Compress-Archive -Path dist/OpinionWatch -DestinationPath artifacts/OpinionWatch-windows.zip
+
+      - name: Archive macOS package
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          mkdir -p artifacts
+          if [[ -d "dist/OpinionWatch.app" ]]; then
+            ditto -c -k --sequesterRsrc --keepParent "dist/OpinionWatch.app" "artifacts/OpinionWatch-macos.zip"
+          else
+            ditto -c -k --sequesterRsrc --keepParent "dist/OpinionWatch" "artifacts/OpinionWatch-macos.zip"
+          fi
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpinionWatch-${{ matrix.artifact }}
+          path: artifacts/*.zip
+          if-no-files-found: error
+          retention-days: 30

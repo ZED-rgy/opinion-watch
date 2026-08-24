@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import subprocess
 import sys
+from contextlib import suppress
 from typing import Any
 
 from PySide6.QtCore import QProcess, Signal
@@ -133,10 +135,26 @@ class BrowserLoginWindow(QMainWindow):
         self.complete_button.setText("重新打开浏览器")
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        self.shutdown()
+        event.accept()
+
+    def shutdown(self) -> None:
+        """Close the login CLI and its Chrome process before the app exits."""
         if self.process.state() != QProcess.ProcessState.NotRunning:
             self._cancelled = True
             self.process.write(b"\n")
-            # 只等一小段时间，避免长时间冻结界面。窗口对象仍被主窗口持有，
-            # 子进程会在后台正常收尾（关闭浏览器并释放账号租约）。
+            if self.process.waitForFinished(3_000):
+                return
+            process_id = int(self.process.processId())
+            if sys.platform == "win32" and process_id > 0:
+                with suppress(Exception):
+                    subprocess.run(
+                        ["taskkill", "/PID", str(process_id), "/T", "/F"],
+                        check=False,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+            else:
+                self.process.kill()
             self.process.waitForFinished(2_000)
-        event.accept()

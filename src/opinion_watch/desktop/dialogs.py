@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from opinion_watch.browser import summarize_browser_error
 from opinion_watch.desktop.components import button, make_table, title
 from opinion_watch.desktop.constants import PLATFORM_NAMES, RUN_STATUS_NAMES
 from opinion_watch.desktop.utils import format_timestamp
@@ -39,6 +40,27 @@ def confirm_destructive(parent: QWidget, heading: str, text: str) -> bool:
         QMessageBox.StandardButton.No,
     )
     return answer == QMessageBox.StandardButton.Yes
+
+
+def _display_alert_message(alert: dict[str, Any]) -> str:
+    message = str(alert.get("message") or "").strip()
+    if str(alert.get("kind") or "") == "browser_error":
+        return summarize_browser_error(message)
+    replacements = {
+        "zero_detail_coverage": "详情覆盖不足",
+        "coverage_shortfall": "检索结果不足",
+        "douyin/": "抖音/",
+        "xiaohongshu/": "小红书/",
+    }
+    for source, target in replacements.items():
+        message = message.replace(source, target)
+    return message
+
+
+def _display_alert_line(alert: dict[str, Any]) -> str:
+    platform = PLATFORM_NAMES.get(str(alert.get("platform") or ""), "")
+    message = _display_alert_message(alert)
+    return f"{platform}：{message}" if platform else message
 
 
 def long_text_dialog(parent: QWidget, heading: str, text: str) -> None:
@@ -205,13 +227,7 @@ class RunDetailDialog(QDialog):
             alert_text = QTextEdit()
             alert_text.setObjectName("alertText")
             alert_text.setReadOnly(True)
-            alert_text.setPlainText(
-                "\n".join(
-                    f"{PLATFORM_NAMES.get(str(item.get('platform')), item.get('platform', ''))}："
-                    f"{item.get('message', '')}"
-                    for item in alerts
-                )
-            )
+            alert_text.setPlainText("\n\n".join(_display_alert_line(item) for item in alerts))
             alert_text.setMinimumHeight(74)
             alert_text.setMaximumHeight(180)
             root.addWidget(alert_text)

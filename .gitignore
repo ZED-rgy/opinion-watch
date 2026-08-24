@@ -21,3 +21,6 @@ output/playwright/
 Thumbs.db
 
 shots/
+
+build/
+dist/

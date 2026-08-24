@@ -92,7 +92,8 @@ class SettingsPage(QWidget):
         layout.addWidget(self.counts_label)
         layout.addWidget(title("企微智能机器人日报", "sectionTitle"))
         wecom_note = QLabel(
-            "日报在定时巡检当天首次成功后发送一次；手动点击立即巡检时每次成功或部分完成都会发送。"
+            "日报在当天首次成功的定时巡检或 Agent 导入后发送一次；"
+            "手动点击立即巡检时每次成功或部分完成都会发送。"
             " Secret 仅保存到 Windows 凭据管理器；"
             "群聊 ID 需要从企微智能机器人所在群聊的回调消息中获取。"
         )

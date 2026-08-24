@@ -78,12 +78,22 @@ class NotificationsPage(QWidget):
         self.delete_button = button("删除选中", self.delete_selected, role="danger")
         actions.addWidget(self.select_all_button)
         actions.addWidget(self.mark_read_button)
+        actions.addSpacing(12)
+        actions.addWidget(QLabel("类型"))
+        self.channel_filter = QComboBox()
+        self.channel_filter.addItem("全部播报", None)
+        self.channel_filter.addItem("舆情提醒", "opinion")
+        self.channel_filter.addItem("系统运行", "system")
+        self.channel_filter.addItem("人工播报", "manual")
+        self.channel_filter.currentIndexChanged.connect(self.refresh)
+        actions.addWidget(self.channel_filter)
         actions.addStretch()
         actions.addWidget(self.edit_button)
         actions.addWidget(self.delete_button)
         layout.addLayout(actions)
         self.table = make_table(
-            ["选择", "ID", "等级", "标题", "内容", "时间", "状态"], multi_select=True
+            ["选择", "ID", "类型", "等级", "标题", "内容", "时间", "状态"],
+            multi_select=True,
         )
         self.table.setColumnHidden(1, True)
         self.table.horizontalHeader().setSectionResizeMode(
@@ -108,7 +118,10 @@ class NotificationsPage(QWidget):
         root.addWidget(card, 1)
 
     def refresh(self) -> None:
-        rows = self.storage.list_notifications(limit=1000)
+        rows = self.storage.list_notifications(
+            limit=1000,
+            channel=self.channel_filter.currentData(),
+        )
         self.rows = {int(item["id"]): item for item in rows}
         with populate(self.table):
             self.table.setRowCount(len(rows))
@@ -116,20 +129,26 @@ class NotificationsPage(QWidget):
                 set_check_cell(self.table, row)
                 unread = item["read_at"] is None
                 set_text_cell(self.table, row, 1, item["id"], tooltip=False)
+                channel_name = {
+                    "opinion_review": "舆情提醒",
+                    "runtime_alert": "系统运行",
+                    "manual": "人工播报",
+                }.get(str(item["kind"]), str(item["kind"]))
+                set_text_cell(self.table, row, 2, channel_name, tooltip=False)
                 self.table.setItem(
-                    row, 2, severity_item(str(item["severity"]), str(item["severity"]))
+                    row, 3, severity_item(str(item["severity"]), str(item["severity"]))
                 )
-                title_cell = set_text_cell(self.table, row, 3, item["title"])
+                title_cell = set_text_cell(self.table, row, 4, item["title"])
                 if unread:
                     font = title_cell.font()
                     font.setBold(True)
                     title_cell.setFont(font)
-                set_text_cell(self.table, row, 4, item["message"])
+                set_text_cell(self.table, row, 5, item["message"])
                 set_text_cell(
-                    self.table, row, 5, format_timestamp(item["created_at"]), tooltip=False
+                    self.table, row, 6, format_timestamp(item["created_at"]), tooltip=False
                 )
                 status_cell = set_text_cell(
-                    self.table, row, 6, "未读" if unread else "已读", tooltip=False
+                    self.table, row, 7, "未读" if unread else "已读", tooltip=False
                 )
                 if unread:
                     status_cell.setForeground(QColor(COLORS["primary"]))
