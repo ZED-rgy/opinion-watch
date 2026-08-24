@@ -20,7 +20,9 @@ jobs:
           - os: windows-latest
             artifact: windows
           - os: macos-latest
-            artifact: macos
+            artifact: macos-arm64
+          - os: macos-13
+            artifact: macos-intel
 
     steps:
       - name: Check out source
@@ -50,7 +52,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force artifacts | Out-Null
-          Compress-Archive -Path dist/OpinionWatch -DestinationPath artifacts/OpinionWatch-windows.zip
+          Compress-Archive -Path dist/OpinionWatch -DestinationPath artifacts/OpinionWatch-${{ matrix.artifact }}.zip
 
       - name: Archive macOS package
         if: runner.os == 'macOS'
@@ -58,9 +60,9 @@ jobs:
         run: |
           mkdir -p artifacts
           if [[ -d "dist/OpinionWatch.app" ]]; then
-            ditto -c -k --sequesterRsrc --keepParent "dist/OpinionWatch.app" "artifacts/OpinionWatch-macos.zip"
+            ditto -c -k --sequesterRsrc --keepParent "dist/OpinionWatch.app" "artifacts/OpinionWatch-${{ matrix.artifact }}.zip"
           else
-            ditto -c -k --sequesterRsrc --keepParent "dist/OpinionWatch" "artifacts/OpinionWatch-macos.zip"
+            ditto -c -k --sequesterRsrc --keepParent "dist/OpinionWatch" "artifacts/OpinionWatch-${{ matrix.artifact }}.zip"
           fi
 
       - name: Publish package to private GitHub Release

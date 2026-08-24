@@ -113,7 +113,8 @@ uv run opinion-watch doctor
 ## 下载桌面包
 
 私人仓库的 Actions 页面中运行 `Desktop packages`，完成后到对应的预发布 Release
-中下载 `OpinionWatch-windows.zip` 或 `OpinionWatch-macos.zip`。首次使用时先解压并启动，
+中下载 `OpinionWatch-windows.zip`、`OpinionWatch-macos-arm64.zip` 或
+`OpinionWatch-macos-intel.zip`。首次使用时先解压并启动，
 再按正常流程初始化、登录平台账号；登录档案和数据库会保存在运行目录，不会随压缩包发布。
 
 ## 首次登录
