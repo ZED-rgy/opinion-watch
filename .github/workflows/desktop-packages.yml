@@ -21,7 +21,7 @@ jobs:
             artifact: windows
           - os: macos-latest
             artifact: macos-arm64
-          - os: macos-13
+          - os: macos-15-intel
             artifact: macos-intel
 
     steps:
