@@ -6,7 +6,6 @@ import subprocess
 import sys
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QProcess, QSize, Qt, QTime, QTimer, Signal
@@ -46,6 +45,7 @@ from opinion_watch.desktop.dialogs import (
     delete_scan_run_with_confirmation,
     edit_scan_run_metadata,
 )
+from opinion_watch.desktop.process import cli_command
 from opinion_watch.desktop.theme import repolish
 from opinion_watch.desktop.utils import decode_process_output, format_timestamp
 from opinion_watch.events import parse_event
@@ -53,16 +53,6 @@ from opinion_watch.services import ScheduleService
 from opinion_watch.storage import Storage
 
 _TERMINAL_ATTEMPT_EVENTS = {"scan.attempt_succeeded", "scan.attempt_failed", "scan.attempt_error"}
-
-
-def _windowless_python() -> str:
-    """Use pythonw for scan workers so Windows does not flash a console window."""
-    executable = Path(sys.executable)
-    if sys.platform == "win32":
-        windowless = executable.with_name("pythonw.exe")
-        if windowless.exists():
-            return str(windowless)
-    return sys.executable
 
 
 class SchedulerPage(QWidget):
@@ -487,28 +477,25 @@ class SchedulerPage(QWidget):
         self.run_status.setText(
             "正在检索抖音和小红书…" + ("（大模型复判已启用）" if llm_enabled else "（规则筛选）")
         )
-        self.process.setProgram(_windowless_python())
-        self.process.setArguments(
-            [
-                "-m",
-                "opinion_watch",
-                "scan",
-                "--mode",
-                str(self.scan_mode.currentData()),
-                "--limit",
-                "50" if self.scan_mode.currentData() == "deep" else "20",
-                "--detail-limit",
-                "50" if self.scan_mode.currentData() == "deep" else "20",
-                "--comments-limit",
-                "5",
-                "--brand-delay-seconds",
-                "5",
-                "--concurrency",
-                str(self.concurrency.value()),
-                "--trigger",
-                trigger,
-            ]
+        program, arguments = cli_command(
+            "scan",
+            "--mode",
+            str(self.scan_mode.currentData()),
+            "--limit",
+            "50" if self.scan_mode.currentData() == "deep" else "20",
+            "--detail-limit",
+            "50" if self.scan_mode.currentData() == "deep" else "20",
+            "--comments-limit",
+            "5",
+            "--brand-delay-seconds",
+            "5",
+            "--concurrency",
+            str(self.concurrency.value()),
+            "--trigger",
+            trigger,
         )
+        self.process.setProgram(program)
+        self.process.setArguments(arguments)
         self.process.start()
 
     def stop_scan(self) -> None:

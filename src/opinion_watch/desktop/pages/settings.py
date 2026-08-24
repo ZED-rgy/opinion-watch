@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import sys
 from collections.abc import Callable
 
 from PySide6.QtCore import QProcess, Qt, QUrl
@@ -29,6 +28,7 @@ from opinion_watch.credentials import CredentialStore
 from opinion_watch.desktop.autostart import set_windows_autostart, windows_autostart_enabled
 from opinion_watch.desktop.components import button, run_busy, show_toast, surface, title
 from opinion_watch.desktop.dialogs import long_text_dialog, show_error
+from opinion_watch.desktop.process import cli_command
 from opinion_watch.desktop.utils import decode_process_output
 from opinion_watch.storage import Storage
 
@@ -296,8 +296,9 @@ class SettingsPage(QWidget):
         if not self.save_wecom(show_message=False):
             return
         self._set_busy(self.wecom_test_process, self.wecom_test_button, "发送中…")
-        self.wecom_test_process.setProgram(sys.executable)
-        self.wecom_test_process.setArguments(["-m", "opinion_watch", "wecom", "test"])
+        program, arguments = cli_command("wecom", "test")
+        self.wecom_test_process.setProgram(program)
+        self.wecom_test_process.setArguments(arguments)
         self.wecom_test_process.start()
 
     def save_llm(self, *, show_message: bool = True) -> bool:
@@ -329,8 +330,9 @@ class SettingsPage(QWidget):
         if not self.save_llm(show_message=False):
             return
         self._set_busy(self.llm_test_process, self.llm_test_button, "测试中…")
-        self.llm_test_process.setProgram(sys.executable)
-        self.llm_test_process.setArguments(["-m", "opinion_watch", "llm", "test"])
+        program, arguments = cli_command("llm", "test")
+        self.llm_test_process.setProgram(program)
+        self.llm_test_process.setArguments(arguments)
         self.llm_test_process.start()
 
     def llm_test_finished(self, exit_code: int, _status: QProcess.ExitStatus) -> None:
@@ -354,10 +356,9 @@ class SettingsPage(QWidget):
         ):
             return
         self._set_busy(self.wecom_discover_process, self.wecom_discover_button, "监听中…")
-        self.wecom_discover_process.setProgram(sys.executable)
-        self.wecom_discover_process.setArguments(
-            ["-m", "opinion_watch", "wecom", "discover", "--timeout-seconds", "120"]
-        )
+        program, arguments = cli_command("wecom", "discover", "--timeout-seconds", "120")
+        self.wecom_discover_process.setProgram(program)
+        self.wecom_discover_process.setArguments(arguments)
         self.wecom_discover_process.start()
 
     def wecom_test_finished(self, exit_code: int, _status: QProcess.ExitStatus) -> None:

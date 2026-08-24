@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
 from opinion_watch.config import Settings
 from opinion_watch.desktop.components import button, title
 from opinion_watch.desktop.constants import PLATFORM_NAMES
+from opinion_watch.desktop.process import cli_command
 from opinion_watch.desktop.utils import decode_process_output, process_json_result
 from opinion_watch.models import Platform
 from opinion_watch.storage import Storage
@@ -77,18 +78,15 @@ class BrowserLoginWindow(QMainWindow):
         self.complete_button.setText("登录完成并检查")
         self.complete_button.setEnabled(True)
         self.status_label.setText("正在启动自动巡检登录档案…")
-        self.process.setProgram(sys.executable)
-        self.process.setArguments(
-            [
-                "-m",
-                "opinion_watch",
-                "login",
-                "--platform",
-                self.platform.value,
-                "--account-id",
-                str(self.account_id),
-            ]
+        program, arguments = cli_command(
+            "login",
+            "--platform",
+            self.platform.value,
+            "--account-id",
+            str(self.account_id),
         )
+        self.process.setProgram(program)
+        self.process.setArguments(arguments)
         self.process.start()
 
     def mark_ready(self) -> None:
