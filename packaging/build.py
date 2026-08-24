@@ -37,8 +37,6 @@ def main() -> None:
         "--add-data",
         f"{assets_dir}{os.pathsep}opinion_watch/assets",
         "--collect-all",
-        "PySide6",
-        "--collect-all",
         "qtawesome",
         "--collect-all",
         "playwright",
