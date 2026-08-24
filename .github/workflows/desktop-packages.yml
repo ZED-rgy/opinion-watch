@@ -7,7 +7,7 @@ on:
       - "v*"
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   package:
@@ -63,10 +63,18 @@ jobs:
             ditto -c -k --sequesterRsrc --keepParent "dist/OpinionWatch" "artifacts/OpinionWatch-macos.zip"
           fi
 
-      - name: Upload package
-        uses: actions/upload-artifact@v4
-        with:
-          name: OpinionWatch-${{ matrix.artifact }}
-          path: artifacts/*.zip
-          if-no-files-found: error
-          retention-days: 30
+      - name: Publish package to private GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          release_tag="build-${GITHUB_RUN_ID}"
+          release_title="Desktop packages - ${GITHUB_RUN_ID}"
+          if ! gh release view "$release_tag" >/dev/null 2>&1; then
+            gh release create "$release_tag" \
+              --target "$GITHUB_SHA" \
+              --prerelease \
+              --title "$release_title" \
+              --notes "Automated desktop build for ${GITHUB_SHA}."
+          fi
+          gh release upload "$release_tag" artifacts/*.zip --clobber
