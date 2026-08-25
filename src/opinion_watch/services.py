@@ -31,7 +31,7 @@ class ScheduleService:
                 str(values["last_scheduled_at"]) if values.get("last_scheduled_at") else None
             ),
             next_run_at=str(values["next_run_at"]) if values.get("next_run_at") else None,
-            missed_run_policy=str(values.get("missed_run_policy") or "run_once"),
+            missed_run_policy=str(values.get("missed_run_policy") or "skip"),
             legacy_imported=bool(values.get("legacy_imported", True)),
         )
 

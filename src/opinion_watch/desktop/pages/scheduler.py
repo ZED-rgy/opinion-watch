@@ -5,7 +5,7 @@ from __future__ import annotations
 import subprocess
 import sys
 from contextlib import suppress
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Any
 
 from PySide6.QtCore import QProcess, QSize, Qt, QTime, QTimer, Signal
@@ -407,9 +407,10 @@ class SchedulerPage(QWidget):
                 self.next_run_at = parsed_next
                 self.next_run_label.setText(self.next_run_at.strftime("%Y-%m-%d %H:%M"))
             else:
-                # A missed schedule is compensated once after restart, then the
-                # normal frequency calculation resumes after that run.
-                self.next_run_at = now + timedelta(seconds=1)
+                # Do not start a scan just because the desktop was opened after
+                # the scheduled time. A missed run waits for the next future
+                # occurrence instead of being silently replayed.
+                self.next_run_at = self._next_scheduled_datetime()
                 self.next_run_label.setText(self.next_run_at.strftime("%Y-%m-%d %H:%M"))
             self._persist_schedule(next_run_at=self.next_run_at)
             delay = max(
@@ -438,8 +439,14 @@ class SchedulerPage(QWidget):
 
     def scheduled_scan(self) -> None:
         if self.process.state() == QProcess.ProcessState.NotRunning:
+            # Advance the persisted schedule before starting the worker. If we
+            # leave the due timestamp here, process_finished() sees it as stale
+            # and starts an unintended second scan immediately afterward.
+            scheduled_at = datetime.now(UTC)
+            self.next_run_at = self._next_scheduled_datetime()
+            self.next_run_label.setText(self.next_run_at.strftime("%Y-%m-%d %H:%M"))
             self._persist_schedule(
-                last_scheduled_at=datetime.now(UTC),
+                last_scheduled_at=scheduled_at,
                 next_run_at=self.next_run_at,
             )
             self.start_scan(trigger="watch")
@@ -586,6 +593,12 @@ class SchedulerPage(QWidget):
         elif event_type == "scan.finished":
             self.run_status.setText(
                 "巡检已完成" if event.get("status") == "succeeded" else "巡检未完成"
+            )
+        elif event_type == "scan.completed":
+            self.run_status.setText(
+                "巡检已完成，正在发送企微日报…"
+                if event.get("wecom_report_pending")
+                else "巡检已完成"
             )
         elif event_type in {
             "scan.session_status",

@@ -1559,6 +1559,24 @@ async def _run_scan_locked(
                 severity="warning",
                 message=f"历史候选或诊断文件清理失败：{exc}",
             )
+    # The scan data is already committed at this point. Tell the desktop
+    # before the optional WeCom network request so a slow report delivery does
+    # not leave the UI showing “巡检中”.
+    report_pending = bool(
+        storage.get_wecom_config().get("enabled")
+        and trigger in {"watch", "manual"}
+        and status in {ScanRunStatus.SUCCEEDED, ScanRunStatus.PARTIAL}
+    )
+    scan_summary = {
+        "run_id": run_id,
+        "status": status.value,
+        **asdict(totals),
+        "mode": options.mode,
+        "classification": classification_summary,
+        "model_classification": model_summary,
+        "wecom_report_pending": report_pending,
+    }
+    print(serialize_event("scan.completed", scan_summary, ensure_ascii=False), flush=True)
     wecom_report_sent = False
     if trigger in {"watch", "manual"} and status in {
         ScanRunStatus.SUCCEEDED,
@@ -1581,15 +1599,11 @@ async def _run_scan_locked(
         serialize_event(
             "scan.finished",
             {
-                "run_id": run_id,
-                "status": status.value,
-                **asdict(totals),
-                "mode": options.mode,
-                "classification": classification_summary,
-                "model_classification": model_summary,
+                **scan_summary,
                 "wecom_report_sent": wecom_report_sent,
             },
             ensure_ascii=False,
-        )
+        ),
+        flush=True,
     )
     return 0 if status is ScanRunStatus.SUCCEEDED else 2

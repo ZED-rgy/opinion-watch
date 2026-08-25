@@ -47,4 +47,5 @@ def test_schedule_service_persists_and_calculates_from_one_config(tmp_path: Path
     )
     config = service.load()
     assert config["enabled"] is True
+    assert config["missed_run_policy"] == "skip"
     assert service.next_run(config, datetime(2026, 8, 21, 19, 0)) == datetime(2026, 8, 22, 18, 0)

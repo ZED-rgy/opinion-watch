@@ -418,7 +418,7 @@ class Storage:
                     concurrency INTEGER NOT NULL DEFAULT 1,
                     last_scheduled_at TEXT,
                     next_run_at TEXT,
-                    missed_run_policy TEXT NOT NULL DEFAULT 'run_once',
+                    missed_run_policy TEXT NOT NULL DEFAULT 'skip',
                     legacy_imported INTEGER NOT NULL DEFAULT 0,
                     updated_at TEXT NOT NULL
                 );
@@ -2776,7 +2776,7 @@ class Storage:
         concurrency: int = 1,
         last_scheduled_at: str | None = None,
         next_run_at: str | None = None,
-        missed_run_policy: str = "run_once",
+        missed_run_policy: str = "skip",
         legacy_imported: bool = True,
     ) -> None:
         if frequency not in {"daily", "weekly", "interval"}:

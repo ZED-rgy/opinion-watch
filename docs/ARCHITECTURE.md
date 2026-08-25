@@ -116,7 +116,8 @@ Agent 输入会记录 `ingest_source`、相关性、证据和详情状态。只�
 
 调度配置已进入 SQLite，不再只依赖 QSettings。桌面端负责展示和配置，调度读写和纯计算规则
 由 `opinion_watch.services.ScheduleService` 与 `opinion_watch.scheduling` 共同提供；启动时会
-恢复未来的 `next_run_at`，如果发现错过计划，则按 `run_once` 策略补跑一次，再恢复正常频次。
+恢复未来的 `next_run_at`，如果发现错过计划，则跳过本次并只安排下一次未来执行时间，避免打开桌面
+程序就意外启动巡检。CLI `watch` 也复用同一套下一次执行计算。
 CLI `watch` 也复用同一套下一次执行计算。
 
 正常桌面进程提供系统托盘菜单，可从托盘恢复主窗口或退出应用；设置页的开机启动开关只
