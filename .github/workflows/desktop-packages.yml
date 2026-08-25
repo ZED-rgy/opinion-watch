@@ -47,6 +47,30 @@ jobs:
       - name: Build executable
         run: uv run python packaging/build.py
 
+      - name: Smoke-test packaged Windows executables
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $runtime = Join-Path $env:RUNNER_TEMP "opinion-watch-package-smoke"
+          & "dist/OpinionWatch/OpinionWatch.exe" --smoke-test --runtime-dir $runtime
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & "dist/OpinionWatch/OpinionWatchCli.exe" --help
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Smoke-test packaged macOS executables
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          if [[ -x "dist/OpinionWatch.app/Contents/MacOS/OpinionWatch" ]]; then
+            gui="dist/OpinionWatch.app/Contents/MacOS/OpinionWatch"
+            cli="dist/OpinionWatch.app/Contents/MacOS/OpinionWatchCli"
+          else
+            gui="dist/OpinionWatch/OpinionWatch"
+            cli="dist/OpinionWatch/OpinionWatchCli"
+          fi
+          "$gui" --smoke-test --runtime-dir "$RUNNER_TEMP/opinion-watch-package-smoke"
+          "$cli" --help
+
       - name: Archive Windows package
         if: runner.os == 'Windows'
         shell: pwsh

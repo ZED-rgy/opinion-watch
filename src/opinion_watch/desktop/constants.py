@@ -43,6 +43,11 @@ RUN_STATUS_NAMES = {
     "failed": "失败",
     "cancelled": "已取消",
 }
+RUN_TRIGGER_NAMES = {
+    "manual": "手动巡检",
+    "watch": "定时巡检",
+    "agent": "Agent 导入",
+}
 REVIEW_STATUS_NAMES = {
     "pending": "待复核",
     "reviewed": "已复核",

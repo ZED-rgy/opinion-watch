@@ -186,6 +186,12 @@ async def send_daily_report_if_due(
     if not bool(config.get("enabled")):
         return False
 
+    scan_run = storage.get_scan_run(scan_run_id)
+    if scan_run is None:
+        raise WeComError(f"巡检记录不存在：{scan_run_id}")
+    if scan_run.get("status") not in {"succeeded", "partial"} or not scan_run.get("finished_at"):
+        raise WeComError("巡检尚未完成，不能发送企微日报")
+
     report_date = report_date_for_now()
     secret = CredentialStore.get_wecom_secret()
     if not secret:

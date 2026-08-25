@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
 
 from opinion_watch.browser import summarize_browser_error
 from opinion_watch.desktop.components import button, make_table, title
-from opinion_watch.desktop.constants import PLATFORM_NAMES, RUN_STATUS_NAMES
+from opinion_watch.desktop.constants import PLATFORM_NAMES, RUN_STATUS_NAMES, RUN_TRIGGER_NAMES
 from opinion_watch.desktop.utils import format_timestamp
 from opinion_watch.storage import Storage
 
@@ -96,7 +96,7 @@ class RunDetailDialog(QDialog):
         root.setContentsMargins(24, 22, 24, 22)
         root.setSpacing(14)
         status = RUN_STATUS_NAMES.get(str(run["status"]), str(run["status"]))
-        trigger = "定时巡检" if run.get("trigger") == "watch" else "手动巡检"
+        trigger = RUN_TRIGGER_NAMES.get(str(run.get("trigger")), str(run.get("trigger") or "未知"))
         platforms = "、".join(
             PLATFORM_NAMES.get(str(item), str(item)) for item in run.get("platforms", [])
         )

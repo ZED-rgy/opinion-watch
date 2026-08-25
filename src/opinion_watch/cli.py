@@ -3,10 +3,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 import uuid
 from collections.abc import Sequence
 from contextlib import suppress
+from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -19,11 +21,19 @@ from opinion_watch.browser import BrowserProfileLocked, BrowserSession
 from opinion_watch.classification import classify_batch
 from opinion_watch.collectors import collector_for
 from opinion_watch.collectors.base import CollectorRuntimeError
-from opinion_watch.config import DEFAULT_BRANDS, Settings
+from opinion_watch.config import (
+    DEFAULT_BRANDS,
+    RUNTIME_ENV_VAR,
+    Settings,
+    legacy_runtime_dirs,
+    stable_runtime_dir,
+)
 from opinion_watch.credentials import CredentialStore
 from opinion_watch.llm import LLMClient, LLMSettings
+from opinion_watch.maintenance import prune_browser_caches
 from opinion_watch.models import OpinionCategory, Platform, RiskSeverity, SessionStatus
 from opinion_watch.runner import ScanOptions, _screen_items_for_admission, run_scan
+from opinion_watch.runtime_migration import migrate_runtime
 from opinion_watch.scheduling import next_scheduled_datetime
 from opinion_watch.storage import Storage
 from opinion_watch.wecom import WeComClient, send_daily_report_if_due
@@ -169,6 +179,21 @@ def build_parser() -> argparse.ArgumentParser:
     data = subparsers.add_parser("data", help="运行数据检查与清理")
     data_subparsers = data.add_subparsers(dest="data_command", required=True)
     data_subparsers.add_parser("status")
+    data_subparsers.add_parser("runtime", help="显示当前、稳定和旧版运行目录")
+    data_subparsers.add_parser("backup", help="立即备份当前 SQLite 数据库")
+    data_migrate = data_subparsers.add_parser(
+        "migrate-runtime", help="把一套旧运行目录安全迁移到用户级稳定目录"
+    )
+    data_migrate.add_argument("--from-dir", type=Path, required=True)
+    data_migrate.add_argument(
+        "--confirm",
+        required=True,
+        help="必须明确传入 MIGRATE；不会覆盖已经存在的目标运行目录",
+    )
+    data_prune_cache = data_subparsers.add_parser(
+        "prune-browser-cache", help="在所有浏览器关闭后清理可丢弃的 Chrome 缓存"
+    )
+    data_prune_cache.add_argument("--confirm", required=True, help="必须明确传入 PRUNE_CACHE")
     data_reset = data_subparsers.add_parser("reset")
     data_reset.add_argument(
         "--confirm",
@@ -730,7 +755,40 @@ def _notification_command(storage: Storage, args: argparse.Namespace) -> int:
 
 def _data_command(settings: Settings, storage: Storage, args: argparse.Namespace) -> int:
     if args.data_command == "status":
-        payload: object = {"counts": storage.operational_counts()}
+        payload: object = {
+            "runtime_dir": str(settings.runtime_dir),
+            "database": str(settings.database_path),
+            "counts": storage.operational_counts(),
+            "quality_last_30_runs": storage.collection_quality_summary(run_limit=30),
+        }
+    elif args.data_command == "runtime":
+        stable = stable_runtime_dir()
+        payload = {
+            "active": str(settings.runtime_dir),
+            "stable": str(stable),
+            "using_stable": settings.runtime_dir.resolve() == stable,
+            "stable_exists": (stable / "opinion-watch.db").is_file(),
+            "legacy_candidates": [
+                {
+                    "path": str(path),
+                    "database_exists": (path / "opinion-watch.db").is_file(),
+                }
+                for path in legacy_runtime_dirs()
+            ],
+        }
+    elif args.data_command == "migrate-runtime":
+        if args.confirm != "MIGRATE":
+            raise ValueError("迁移运行目录必须明确传入 --confirm MIGRATE")
+        payload = migrate_runtime(args.from_dir, stable_runtime_dir())
+    elif args.data_command == "backup":
+        stamp = datetime.now().astimezone().strftime("%Y%m%dT%H%M%S%z")
+        backup_path = settings.runtime_dir / "backups" / f"manual-{stamp}.db"
+        storage.backup_to(backup_path)
+        payload = {"backup": str(backup_path)}
+    elif args.data_command == "prune-browser-cache":
+        if args.confirm != "PRUNE_CACHE":
+            raise ValueError("清理浏览器缓存必须明确传入 --confirm PRUNE_CACHE")
+        payload = asdict(prune_browser_caches(storage, settings.runtime_dir))
     elif args.data_command == "reset":
         if args.confirm != "RESET":
             raise ValueError("清理运行数据必须明确传入 --confirm RESET")
@@ -790,6 +848,8 @@ def _classify_command(storage: Storage, args: argparse.Namespace) -> int:
 
 
 async def run(args: argparse.Namespace) -> int:
+    if args.command == "data" and args.data_command == "migrate-runtime":
+        os.environ[RUNTIME_ENV_VAR] = str(args.from_dir.resolve())
     settings = Settings.from_environment()
     settings.ensure_directories()
     storage = Storage(settings.database_path)

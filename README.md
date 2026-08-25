@@ -97,7 +97,14 @@ uv run opinion-watch-desktop --smoke-test
 
 ```powershell
 uv run opinion-watch data status
+uv run opinion-watch data backup
 uv run opinion-watch data reset --confirm RESET
+```
+
+完全退出桌面程序和专用 Chrome 后，可以显式清理不包含登录态的浏览器缓存：
+
+```powershell
+uv run opinion-watch data prune-browser-cache --confirm PRUNE_CACHE
 ```
 
 ## 安装
@@ -108,14 +115,34 @@ uv run opinion-watch init
 uv run opinion-watch doctor
 ```
 
-初始化会创建 `runtime/`，并写入三个初始品牌。浏览器档案、数据库和诊断截图均已加入 `.gitignore`。
+默认运行数据保存在当前用户的固定目录：Windows 为
+`%LOCALAPPDATA%\OpinionWatch\runtime`，macOS 为
+`~/Library/Application Support/OpinionWatch/runtime`。源码、桌面包和相邻的 CLI 子程序
+共用这一位置；设置 `OPINION_WATCH_RUNTIME_DIR` 或桌面参数 `--runtime-dir` 可以显式覆盖。
+若固定目录尚未建立，程序会继续兼容当前目录下已有的旧 `runtime/`，不会突然打开空库。
+浏览器档案、数据库和诊断截图均不得提交到 Git。
 
 ## 下载桌面包
 
 私人仓库的 Actions 页面中运行 `Desktop packages`，完成后到对应的预发布 Release
 中下载 `OpinionWatch-windows.zip`、`OpinionWatch-macos-arm64.zip` 或
 `OpinionWatch-macos-intel.zip`。首次使用时先解压并启动，
-再按正常流程初始化、登录平台账号；登录档案和数据库会保存在运行目录，不会随压缩包发布。
+再按正常流程初始化、登录平台账号；登录档案和数据库保存在用户级固定运行目录，不会
+随压缩包发布，也不会因为把新版本解压到另一个目录而自动产生第二套数据。
+
+从旧源码目录或旧解压包迁移时，先完全退出桌面程序和所有专用 Chrome，再执行：
+
+```powershell
+uv run opinion-watch data runtime
+uv run opinion-watch data migrate-runtime --from-dir "旧目录\runtime" --confirm MIGRATE
+```
+
+在解压版目录中执行时，可用 `OpinionWatchCli.exe`（macOS 为 `OpinionWatchCli`）替代
+`uv run opinion-watch`。
+
+迁移不会覆盖已经存在的固定目录；执行前会备份来源数据库，并跳过 Chrome Cache、
+Code Cache、GPUCache 等可丢弃缓存。若已经存在两套不同业务数据库，应先选择主库，
+不要直接互相覆盖。
 
 ## 首次登录
 
@@ -283,6 +310,10 @@ uv run opinion-watch watch --interval-minutes 30 --max-runs 1 --mode quick
 
 `watch` 不会并发启动下一轮，当前轮次结束后才开始计算等待时间。它是前台进程；
 终端关闭后任务会停止。生产环境后续应由 Windows 服务、任务计划程序或容器托管。
+
+如果已经使用 Codex Agent 每日定时采集，建议桌面端关闭自动定时，只保留“立即巡检”
+作为人工补采入口；同一时段不要同时配置 Agent 和程序自身的自动采集。两种入口通过
+同一数据库任务租约互斥，Agent 导入完成后同样执行分类、事件聚类、通知和日报。
 
 桌面端“自动巡检”页面支持设置每日执行时间、每周执行日，或切换为按分钟间隔。
 “巡检动态”和“舆情中心”的巡检批次支持编辑标题/备注和删除批次。删除批次只清理

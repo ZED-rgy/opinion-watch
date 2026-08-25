@@ -108,6 +108,10 @@ Python 应用服务
 统一输出候选记录，由 `opinion-watch ingest` 校验后进入现有巡检批次和候选台账。外部
 执行器不直接写 SQLite，也不直接发送企微消息或覆盖人工结论。
 
+导入入口会校验 HTTPS、平台域名、内容 ID 和详情证据字段，并与浏览器巡检共用 `scan`
+任务租约。导入完成后统一执行规则分类、事件聚类、应用通知和按日企微日报；桌面运行
+记录使用独立的 `agent` 来源展示，不再归为手动巡检。
+
 Agent 输入会记录 `ingest_source`、相关性、证据和详情状态。只包含搜索卡片的浅层候选
 即使命中高风险词，也只能按 P3 待调查线索处理；P1/P2 舆情提醒必须具备详情证据。
 内容仍按“平台 + 内容 ID”去重，没有平台 ID 时使用规范化 URL 生成稳定 ID。
@@ -118,10 +122,22 @@ Agent 输入会记录 `ingest_source`、相关性、证据和详情状态。只�
 由 `opinion_watch.services.ScheduleService` 与 `opinion_watch.scheduling` 共同提供；启动时会
 恢复未来的 `next_run_at`，如果发现错过计划，则跳过本次并只安排下一次未来执行时间，避免打开桌面
 程序就意外启动巡检。CLI `watch` 也复用同一套下一次执行计算。
-CLI `watch` 也复用同一套下一次执行计算。
+
+## 运行数据目录
+
+数据库、账号级 Playwright 档案和 Agent 收件箱默认保存在用户级固定目录。Windows 使用
+`%LOCALAPPDATA%\OpinionWatch\runtime`，macOS 使用
+`~/Library/Application Support/OpinionWatch/runtime`。环境变量
+`OPINION_WATCH_RUNTIME_DIR` 和桌面 `--runtime-dir` 可显式覆盖；固定目录尚不存在时，
+仍兼容当前工作目录或旧解压包旁边已经存在的 `runtime`。
+
+旧目录迁移采用“来源数据库在线备份 + 登录档案复制 + 原子目录切换”，拒绝覆盖已有目标，
+并跳过 Cache、Code Cache、GPUCache 等可重新生成的数据。两套已经发生分叉的业务库不能
+自动互相覆盖，必须先选择主库并单独处理差异数据。
 
 正常桌面进程提供系统托盘菜单，可从托盘恢复主窗口或退出应用；设置页的开机启动开关只
-修改当前 Windows 用户的启动项，默认关闭。安装包不在当前源码阶段自动生成。
+修改当前 Windows 用户的启动项，默认关闭。GitHub Actions 当前生成 Windows 与 macOS
+压缩包，但还没有带签名、升级和卸载能力的正式安装器。
 
 ## 通知扩展
 

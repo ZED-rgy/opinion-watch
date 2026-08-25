@@ -65,6 +65,7 @@ def test_agent_import_uses_candidate_audit_and_only_notifies_detailed_risk(
     assert result["admitted"] == 2
     assert result["filtered"] == 1
     assert result["detailed"] == 1
+    assert result["event_clusters"] >= 1
     with storage.connect() as connection:
         assert connection.execute("SELECT COUNT(*) FROM content_items").fetchone()[0] == 2
         rows = connection.execute(
@@ -86,6 +87,7 @@ def test_agent_import_uses_candidate_audit_and_only_notifies_detailed_risk(
     assert len(notifications) == 1
     assert notifications[0]["severity"] == "P1"
     assert "速探长被质疑虚假宣传" in notifications[0]["title"]
+    assert storage.list_event_clusters()
 
 
 def test_agent_import_is_idempotent_for_content_and_validates_before_writes(
@@ -198,6 +200,51 @@ def test_agent_jsonl_rejects_non_https_urls(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="HTTPS"):
         load_agent_jsonl(source)
+
+
+def test_agent_jsonl_rejects_platform_domain_mismatch_and_non_boolean_detail(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "invalid-agent.jsonl"
+    base: dict[str, object] = {
+        "platform": "douyin",
+        "brand": "速探长",
+        "url": "https://www.xiaohongshu.com/explore/123",
+        "title": "速探长",
+    }
+    _write_jsonl(source, [base])
+    with pytest.raises(ValueError, match="域名与平台"):
+        load_agent_jsonl(source)
+
+    base["url"] = "https://www.douyin.com/video/123"
+    base["detail_collected"] = "false"
+    _write_jsonl(source, [base])
+    with pytest.raises(ValueError, match="必须是布尔值"):
+        load_agent_jsonl(source)
+
+
+def test_agent_import_respects_scan_lease(tmp_path: Path) -> None:
+    storage = Storage(tmp_path / "test.db")
+    storage.initialize()
+    storage.add_brand("速探长")
+    source = tmp_path / "agent-results.jsonl"
+    _write_jsonl(
+        source,
+        [
+            {
+                "platform": "douyin",
+                "brand": "速探长",
+                "url": "https://www.douyin.com/video/lease-test",
+                "title": "速探长服务体验",
+            }
+        ],
+    )
+    assert storage.acquire_task_lease("scan", "another-worker", lease_seconds=60)
+
+    with pytest.raises(RuntimeError, match="已有巡检"):
+        ingest_agent_jsonl(storage, source)
+
+    assert storage.list_scan_runs() == []
 
 
 def test_ingest_cli_accepts_agent_jsonl_path() -> None:

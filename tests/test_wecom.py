@@ -2,11 +2,13 @@ import asyncio
 import json
 from pathlib import Path
 
+import pytest
+
 from opinion_watch.credentials import CredentialStore
 from opinion_watch.models import CollectedContent, Platform
-from opinion_watch.report import build_daily_report
+from opinion_watch.report import build_daily_report, report_date_for_now
 from opinion_watch.storage import Storage
-from opinion_watch.wecom import WeComClient, send_daily_report_if_due
+from opinion_watch.wecom import WeComClient, WeComError, send_daily_report_if_due
 
 
 def make_storage(tmp_path: Path) -> Storage:
@@ -137,6 +139,7 @@ def test_daily_report_is_sent_once_per_day(tmp_path: Path, monkeypatch: object) 
     run_id = storage.create_scan_run(
         trigger="watch", platforms=["douyin"], brands=["速探长"], options={}
     )
+    storage.finish_scan_run(run_id, status="succeeded", collected=0)
     calls: list[str] = []
 
     async def fake_send(self: WeComClient, chat_id: str, content: str) -> None:
@@ -156,6 +159,7 @@ def test_manual_scan_can_send_daily_report(tmp_path: Path, monkeypatch: object) 
     run_id = storage.create_scan_run(
         trigger="manual", platforms=["douyin"], brands=["速探长"], options={}
     )
+    storage.finish_scan_run(run_id, status="succeeded", collected=0)
     calls: list[str] = []
 
     async def fake_send(self: WeComClient, chat_id: str, content: str) -> None:
@@ -176,6 +180,7 @@ def test_manual_reports_send_every_time_without_consuming_scheduled_slot(
     run_id = storage.create_scan_run(
         trigger="manual", platforms=["douyin"], brands=["速探长"], options={}
     )
+    storage.finish_scan_run(run_id, status="succeeded", collected=0)
     calls: list[str] = []
 
     async def fake_send(self: WeComClient, chat_id: str, content: str) -> None:
@@ -188,6 +193,27 @@ def test_manual_reports_send_every_time_without_consuming_scheduled_slot(
     assert asyncio.run(send_daily_report_if_due(storage, scan_run_id=run_id, force=True))
     assert asyncio.run(send_daily_report_if_due(storage, scan_run_id=run_id))
     assert calls == ["chat", "chat", "chat"]
+
+
+def test_daily_report_rejects_running_scan(tmp_path: Path, monkeypatch: object) -> None:
+    storage = make_storage(tmp_path)
+    storage.save_wecom_config(enabled=True, bot_id="bot", chat_id="chat")
+    run_id = storage.create_scan_run(
+        trigger="watch", platforms=["douyin"], brands=["速探长"], options={}
+    )
+    calls: list[str] = []
+
+    async def fake_send(self: WeComClient, chat_id: str, content: str) -> None:
+        calls.append(chat_id)
+
+    monkeypatch.setattr(CredentialStore, "get_wecom_secret", classmethod(lambda cls: "secret"))
+    monkeypatch.setattr(WeComClient, "send_markdown", fake_send)
+
+    with pytest.raises(WeComError, match="巡检尚未完成"):
+        asyncio.run(send_daily_report_if_due(storage, scan_run_id=run_id))
+
+    assert calls == []
+    assert storage.get_daily_report(report_date_for_now()) is None
 
 
 def test_daily_report_claim_prevents_duplicate_senders(tmp_path: Path) -> None:

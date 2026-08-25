@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+import uuid
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -14,6 +16,11 @@ from opinion_watch.models import CollectedContent, Platform, ScanTotals
 from opinion_watch.storage import Storage
 
 _RELEVANCE_VALUES = {"relevant", "uncertain", "irrelevant"}
+_PLATFORM_HOSTS = {
+    Platform.DOUYIN: ("douyin.com", "iesdouyin.com"),
+    Platform.XIAOHONGSHU: ("xiaohongshu.com", "xhslink.com"),
+}
+_CONTENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,17 +30,23 @@ class AgentCandidate:
     detail_collected: bool
 
 
-def _canonical_url(value: object) -> str:
+def _canonical_url(platform: Platform, value: object) -> str:
     text = str(value or "").strip()
     parts = urlsplit(text)
     if parts.scheme.lower() != "https" or not parts.netloc:
         raise ValueError("候选 url 必须是完整的 HTTPS 地址")
+    hostname = (parts.hostname or "").lower()
+    allowed_hosts = _PLATFORM_HOSTS[platform]
+    if not any(hostname == host or hostname.endswith(f".{host}") for host in allowed_hosts):
+        raise ValueError(f"候选 url 域名与平台 {platform.value} 不匹配")
     return urlunsplit(("https", parts.netloc.lower(), parts.path, "", ""))
 
 
 def _content_id(platform: Platform, value: object, url: str) -> str:
     explicit = str(value or "").strip()
     if explicit:
+        if not _CONTENT_ID_PATTERN.fullmatch(explicit):
+            raise ValueError("platform_content_id 只能包含字母、数字、下划线和连字符")
         return explicit
     digest = hashlib.sha256(f"{platform.value}:{url}".encode()).hexdigest()[:32]
     return f"agent-{digest}"
@@ -58,11 +71,14 @@ def _parse_record(record: object, *, line_number: int) -> AgentCandidate:
     if not brand:
         raise ValueError(f"第 {line_number} 行缺少 brand")
     keyword = str(record.get("keyword") or brand).strip()
-    url = _canonical_url(record.get("url"))
+    url = _canonical_url(platform, record.get("url"))
     relevance = str(record.get("relevance") or "uncertain").strip().lower()
     if relevance not in _RELEVANCE_VALUES:
         raise ValueError(f"第 {line_number} 行 relevance 必须是 relevant、uncertain 或 irrelevant")
-    detail_collected = bool(record.get("detail_collected", False))
+    detail_value = record.get("detail_collected", False)
+    if not isinstance(detail_value, bool):
+        raise ValueError(f"第 {line_number} 行 detail_collected 必须是布尔值")
+    detail_collected = detail_value
     description = str(record.get("description") or record.get("snippet") or "").strip()
     title = str(record.get("title") or "").strip() or description[:200]
     if not title:
@@ -140,7 +156,7 @@ def load_agent_jsonl(path: Path) -> list[AgentCandidate]:
     return candidates
 
 
-def ingest_agent_jsonl(storage: Storage, path: Path) -> dict[str, Any]:
+def _ingest_agent_jsonl_locked(storage: Storage, path: Path) -> dict[str, Any]:
     """Import one validated Agent result file through the normal audit pipeline."""
     candidates = load_agent_jsonl(path)
     configured_brands = {str(item["name"]) for item in storage.list_brands()}
@@ -250,6 +266,7 @@ def ingest_agent_jsonl(storage: Storage, path: Path) -> dict[str, Any]:
             force=True,
             run_id=run_id,
         )
+        classification["event_clusters"] = storage.rebuild_event_clusters()
         totals.suspected = int(classification.get("requires_review", 0))
         storage.finish_scan_run(
             run_id,
@@ -307,4 +324,16 @@ def ingest_agent_jsonl(storage: Storage, path: Path) -> dict[str, Any]:
         "requires_review": totals.suspected,
         "inserted": totals.inserted,
         "updated": totals.updated,
+        "event_clusters": int(classification.get("event_clusters", 0)),
     }
+
+
+def ingest_agent_jsonl(storage: Storage, path: Path) -> dict[str, Any]:
+    """Import one Agent file while excluding concurrent browser scans and imports."""
+    owner = f"agent-ingest:{uuid.uuid4()}"
+    if not storage.acquire_task_lease("scan", owner, lease_seconds=900):
+        raise RuntimeError("已有巡检或 Agent 导入正在运行，请稍后重试")
+    try:
+        return _ingest_agent_jsonl_locked(storage, path)
+    finally:
+        storage.release_task_lease("scan", owner)

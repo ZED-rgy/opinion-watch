@@ -15,6 +15,32 @@ def make_storage(tmp_path: Path) -> Storage:
     return storage
 
 
+def test_collection_quality_summary_uses_completed_runs(tmp_path: Path) -> None:
+    storage = make_storage(tmp_path)
+    first = storage.create_scan_run(
+        trigger="watch", platforms=["douyin"], brands=["速探长"], options={}
+    )
+    storage.finish_scan_run(
+        first,
+        status="succeeded",
+        scanned=100,
+        filtered=90,
+        collected=10,
+        detail_attempted=8,
+        detailed=6,
+        new_opinion=2,
+    )
+    storage.create_scan_run(trigger="watch", platforms=["douyin"], brands=["速探长"], options={})
+
+    summary = storage.collection_quality_summary()
+
+    assert summary["runs"] == 1
+    assert summary["scanned"] == 100
+    assert summary["filter_rate"] == 0.9
+    assert summary["detail_success_rate"] == 0.75
+    assert summary["new_opinion"] == 2
+
+
 def test_brand_crud(tmp_path: Path) -> None:
     storage = make_storage(tmp_path)
     storage.add_brand("速探长")

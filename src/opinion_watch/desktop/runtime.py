@@ -34,7 +34,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--runtime-dir",
         type=Path,
-        help="运行数据目录；开机自启时用于固定数据库位置，默认取环境变量或当前目录下 runtime",
+        help="运行数据目录；默认取环境变量、用户级固定目录或兼容的旧 runtime",
     )
     return parser
 

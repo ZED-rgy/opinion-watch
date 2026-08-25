@@ -39,6 +39,7 @@ from opinion_watch.desktop.constants import (
     ACCOUNT_STATUS_NAMES,
     PLATFORM_NAMES,
     RUN_STATUS_NAMES,
+    RUN_TRIGGER_NAMES,
 )
 from opinion_watch.desktop.dialogs import (
     RunDetailDialog,
@@ -757,7 +758,9 @@ class SchedulerPage(QWidget):
             platforms_text = "、".join(
                 PLATFORM_NAMES.get(str(value), str(value)) for value in run.get("platforms", [])
             )
-            trigger = "定时" if run.get("trigger") == "watch" else "手动"
+            trigger = RUN_TRIGGER_NAMES.get(
+                str(run.get("trigger")), str(run.get("trigger") or "未知来源")
+            )
             run_title = str(run.get("title") or f"巡检记录 #{run['id']}")
             text = (
                 f"{run_title}  ·  #{run['id']}  {RUN_STATUS_NAMES.get(status, status)}  ·  {when}\n"

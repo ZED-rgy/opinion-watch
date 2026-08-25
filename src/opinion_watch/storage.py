@@ -96,6 +96,51 @@ class Storage:
                 for table in self._OPERATIONAL_TABLES
             }
 
+    def collection_quality_summary(self, *, run_limit: int = 30) -> dict[str, int | float]:
+        if not 1 <= run_limit <= 1000:
+            raise ValueError("run_limit 必须在 1 到 1000 之间")
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS runs,
+                       COALESCE(SUM(scanned_count), 0) AS scanned,
+                       COALESCE(SUM(filtered_count), 0) AS filtered,
+                       COALESCE(SUM(collected_count), 0) AS collected,
+                       COALESCE(SUM(brand_matched_count), 0) AS brand_matched,
+                       COALESCE(SUM(detail_attempted_count), 0) AS detail_attempted,
+                       COALESCE(SUM(detailed_count), 0) AS detailed,
+                       COALESCE(SUM(new_opinion_count), 0) AS new_opinion
+                FROM (
+                    SELECT scanned_count, filtered_count, collected_count,
+                           brand_matched_count, detail_attempted_count,
+                           detailed_count, new_opinion_count
+                    FROM scan_runs
+                    WHERE status IN ('succeeded', 'partial')
+                    ORDER BY id DESC
+                    LIMIT ?
+                )
+                """,
+                (run_limit,),
+            ).fetchone()
+        fields = (
+            "runs",
+            "scanned",
+            "filtered",
+            "collected",
+            "brand_matched",
+            "detail_attempted",
+            "detailed",
+            "new_opinion",
+        )
+        summary = {key: int(row[key] or 0) for key in fields}
+        scanned = summary["scanned"]
+        attempted = summary["detail_attempted"]
+        return {
+            **summary,
+            "filter_rate": round(summary["filtered"] / scanned, 4) if scanned else 0.0,
+            "detail_success_rate": round(summary["detailed"] / attempted, 4) if attempted else 0.0,
+        }
+
     def reset_operational_data(self) -> dict[str, int]:
         before = self.operational_counts()
         delete_order = (

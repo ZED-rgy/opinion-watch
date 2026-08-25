@@ -23,13 +23,13 @@ from PySide6.QtWidgets import (
 )
 
 from opinion_watch import __version__
-from opinion_watch.config import Settings
+from opinion_watch.config import Settings, stable_runtime_dir
 from opinion_watch.credentials import CredentialStore
 from opinion_watch.desktop.autostart import set_windows_autostart, windows_autostart_enabled
 from opinion_watch.desktop.components import button, run_busy, show_toast, surface, title
 from opinion_watch.desktop.dialogs import long_text_dialog, show_error
 from opinion_watch.desktop.process import cli_command
-from opinion_watch.desktop.utils import decode_process_output
+from opinion_watch.desktop.utils import decode_process_output, format_timestamp
 from opinion_watch.storage import Storage
 
 
@@ -90,6 +90,21 @@ class SettingsPage(QWidget):
         self.counts_label = QLabel()
         self.counts_label.setWordWrap(True)
         layout.addWidget(self.counts_label)
+        self.runtime_path_label = QLabel()
+        self.runtime_path_label.setWordWrap(True)
+        self.runtime_path_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.runtime_path_label.setObjectName("muted")
+        layout.addWidget(self.runtime_path_label)
+        self.ingestion_status_label = QLabel()
+        self.ingestion_status_label.setWordWrap(True)
+        self.ingestion_status_label.setObjectName("muted")
+        layout.addWidget(self.ingestion_status_label)
+        self.quality_status_label = QLabel()
+        self.quality_status_label.setWordWrap(True)
+        self.quality_status_label.setObjectName("muted")
+        layout.addWidget(self.quality_status_label)
         layout.addWidget(title("企微智能机器人日报", "sectionTitle"))
         wecom_note = QLabel(
             "日报在当天首次成功的定时巡检或 Agent 导入后发送一次；"
@@ -211,6 +226,33 @@ class SettingsPage(QWidget):
         self.counts_label.setText(
             f"当前业务数据：舆情内容 {counts['content_items']} 条 · "
             f"巡检记录 {counts['scan_runs']} 次 · 应用播报 {counts['app_notifications']} 条"
+        )
+        stable = stable_runtime_dir()
+        runtime_mode = (
+            "固定共享目录"
+            if self.settings.runtime_dir.resolve() == stable
+            else "兼容旧目录；建议迁移到固定共享目录"
+        )
+        self.runtime_path_label.setText(
+            f"当前运行目录：{self.settings.runtime_dir.resolve()}（{runtime_mode}）"
+        )
+        latest_by_trigger: dict[str, dict[str, object]] = {}
+        for run in self.storage.list_scan_runs(limit=100):
+            latest_by_trigger.setdefault(str(run.get("trigger") or ""), run)
+        agent_run = latest_by_trigger.get("agent")
+        program_run = latest_by_trigger.get("watch") or latest_by_trigger.get("manual")
+        self.ingestion_status_label.setText(
+            "最近数据入口：Agent "
+            + (format_timestamp(agent_run.get("started_at")) if agent_run else "暂无记录")
+            + " · 程序采集 "
+            + (format_timestamp(program_run.get("started_at")) if program_run else "暂无记录")
+        )
+        quality = self.storage.collection_quality_summary(run_limit=30)
+        self.quality_status_label.setText(
+            f"最近 {quality['runs']} 轮质量：扫描 {quality['scanned']} 条 · "
+            f"过滤率 {float(quality['filter_rate']):.1%} · "
+            f"详情成功率 {float(quality['detail_success_rate']):.1%} · "
+            f"新增舆情 {quality['new_opinion']} 条"
         )
         if not self._config_loaded:
             self._load_config()

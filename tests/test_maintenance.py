@@ -2,7 +2,9 @@ import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from opinion_watch.maintenance import run_maintenance
+import pytest
+
+from opinion_watch.maintenance import prune_browser_caches, run_maintenance
 from opinion_watch.models import CollectedContent, Platform
 from opinion_watch.storage import Storage
 
@@ -83,3 +85,26 @@ def test_maintenance_due_is_recorded_only_after_success(tmp_path: Path) -> None:
             ((datetime.now(UTC) - timedelta(days=2)).isoformat(),),
         )
     assert storage.maintenance_due("retention")
+
+
+def test_browser_cache_cleanup_preserves_profile_state_and_respects_leases(tmp_path: Path) -> None:
+    runtime = tmp_path / "runtime"
+    storage = Storage(runtime / "opinion-watch.db")
+    storage.initialize()
+    profile = runtime / "browser-profiles" / "douyin" / "1" / "Default"
+    cache = profile / "Cache" / "Cache_Data"
+    cache.mkdir(parents=True)
+    (cache / "data.bin").write_bytes(b"cache-data")
+    (profile / "Cookies").write_bytes(b"login-state")
+
+    stats = prune_browser_caches(storage, runtime)
+
+    assert stats.directories_deleted == 1
+    assert stats.files_deleted == 1
+    assert stats.bytes_deleted == len(b"cache-data")
+    assert not (profile / "Cache").exists()
+    assert (profile / "Cookies").read_bytes() == b"login-state"
+
+    assert storage.acquire_task_lease("desktop", "desktop-owner", lease_seconds=60)
+    with pytest.raises(RuntimeError, match="活动任务"):
+        prune_browser_caches(storage, runtime)

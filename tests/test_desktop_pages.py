@@ -1,6 +1,7 @@
 """桌面页面构建与刷新用例（离屏 Qt）。"""
 
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -117,6 +118,76 @@ def test_scheduler_stop_button_starts_hidden(qtbot, desktop_storage: Storage) ->
     qtbot.addWidget(page)
     assert not page.stop_button.isVisible()
     assert not page.stop_button.isEnabled()
+
+
+def test_scheduler_labels_agent_import_as_agent(qtbot, desktop_storage: Storage) -> None:
+    run_id = desktop_storage.create_scan_run(
+        trigger="agent",
+        platforms=["douyin"],
+        brands=["速探长"],
+        options={"source": "agent-jsonl"},
+        title="Agent 候选导入",
+    )
+    desktop_storage.finish_scan_run(run_id, status="succeeded", collected=1)
+    page = SchedulerPage(desktop_storage)
+    qtbot.addWidget(page)
+
+    page.refresh()
+
+    assert page.timeline.count() == 1
+    assert "Agent 导入" in page.timeline.item(0).text()
+
+
+def test_enabling_daily_schedule_waits_for_next_future_occurrence(
+    qtbot, desktop_storage: Storage
+) -> None:
+    now = datetime.now().astimezone()
+    desktop_storage.save_schedule_config(
+        enabled=True,
+        frequency="daily",
+        schedule_time=now.strftime("%H:%M"),
+        weekday=0,
+        interval_minutes=60,
+        scan_mode="quick",
+        concurrency=1,
+        next_run_at=(now - timedelta(minutes=5)).isoformat(),
+        legacy_imported=True,
+    )
+
+    page = SchedulerPage(desktop_storage)
+    qtbot.addWidget(page)
+
+    saved = desktop_storage.get_schedule_config()
+    next_run = datetime.fromisoformat(str(saved["next_run_at"]))
+    assert next_run > now + timedelta(hours=23)
+    assert page.timer.isActive()
+    assert page.timer.remainingTime() > 23 * 60 * 60 * 1000
+    assert page.process.state() == QProcess.ProcessState.NotRunning
+
+
+def test_scheduled_scan_advances_next_run_before_starting_worker(
+    qtbot, desktop_storage: Storage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    page = SchedulerPage(desktop_storage)
+    qtbot.addWidget(page)
+    stale = datetime.now().astimezone() - timedelta(minutes=1)
+    future = datetime.now().astimezone() + timedelta(days=1)
+    page.next_run_at = stale
+    observed: list[tuple[str, str | None]] = []
+
+    monkeypatch.setattr(page, "_next_scheduled_datetime", lambda: future)
+
+    def fake_start_scan(*, trigger: str = "manual") -> None:
+        observed.append((trigger, desktop_storage.get_schedule_config().get("next_run_at")))
+
+    monkeypatch.setattr(page, "start_scan", fake_start_scan)
+
+    page.scheduled_scan()
+
+    assert observed == [("watch", future.isoformat())]
+    config = desktop_storage.get_schedule_config()
+    assert config["next_run_at"] == future.isoformat()
+    assert datetime.fromisoformat(str(config["last_scheduled_at"])).tzinfo == UTC
 
 
 class _ChunkedProcess:
